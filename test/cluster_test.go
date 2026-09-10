@@ -371,6 +371,9 @@ func TestCluster_FullLifecycle(t *testing.T) {
 	// 清理远程目录
 	_ = cli.Delete("node-alpha", remoteDirAlpha, true)
 	_ = cli.Delete("node-beta", remoteDirBeta, true)
+
+	cancel()
+	time.Sleep(100 * time.Millisecond)
 }
 
 // TestCluster_ConcurrencyStress_NoDeadlock 验证多协程高频并发读写不挂死、无死锁与句柄安全
@@ -482,6 +485,11 @@ func TestCluster_ConcurrencyStress_NoDeadlock(t *testing.T) {
 	if !found {
 		t.Fatalf("stress-node not online in cluster: %+v", nodes)
 	}
+
+	// 等待所有后台被 kill 的进程完全退出并释放 Windows 日志文件锁
+	time.Sleep(400 * time.Millisecond)
+	cancel()
+	time.Sleep(100 * time.Millisecond)
 }
 
 // TestCluster_FaultInjection_InterruptedUpload 故障注入：文件传输中途网络中断防孤儿垃圾文件泄漏
