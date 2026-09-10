@@ -1,0 +1,308 @@
+package cmd
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+
+	"cworker/pkg/client"
+	"cworker/pkg/pathutil"
+	"cworker/pkg/protocol"
+)
+
+func TestCmd_Cp_SafeBaseName(t *testing.T) {
+	cases := []struct {
+		input    string
+		expected string
+	}{
+		{"D:/folder/file.txt", "file.txt"},
+		{"D:\\folder\\file.txt", "file.txt"},
+		{"D:/folder/sub/", "sub"},
+		{"D:\\folder\\sub\\", "sub"},
+		{"file.txt", "file.txt"},
+		{"D:", ""},
+		{"D:/", ""},
+		{".", ""},
+		{"..", ""},
+		{"/.", ""},
+		{"/..", ""},
+		{"D:/..", ""},
+		{"D:/.", ""},
+		{"", ""},
+		{"/d/project/", "project"},
+		{"/d/project", "project"},
+		{"/d/", ""},
+		{"/d", ""},
+		{"/var/log/app.log", "app.log"},
+		{"app.log", "app.log"},
+	}
+
+	for _, tc := range cases {
+		if got := pathutil.SafeBaseName(tc.input); got != tc.expected {
+			t.Errorf("safeBaseName(%q) = %q; want %q", tc.input, got, tc.expected)
+		}
+	}
+}
+
+func TestCmd_Cp_JoinRemote(t *testing.T) {
+	if res := pathutil.JoinRemotePath("D:/base", "sub/file.txt"); res != "D:/base/sub/file.txt" {
+		t.Fatalf("expected D:/base/sub/file.txt, got %s", res)
+	}
+	if res := pathutil.JoinRemotePath("D:\\base\\", "/sub/file.txt"); res != "D:/base/sub/file.txt" {
+		t.Fatalf("expected D:/base/sub/file.txt, got %s", res)
+	}
+	if res := pathutil.JoinRemotePath("", "file.txt"); res != "file.txt" {
+		t.Fatalf("expected file.txt, got %s", res)
+	}
+	if res := pathutil.JoinRemotePath("D:/base", ""); res != "D:/base" {
+		t.Fatalf("expected D:/base, got %s", res)
+	}
+	if res := pathutil.JoinRemotePath("/", "file.txt"); res != "/file.txt" {
+		t.Fatalf("expected /file.txt, got %s", res)
+	}
+}
+
+func TestCmd_Cp_BothLocalError(t *testing.T) {
+	err := cpCmd.RunE(cpCmd, []string{"./fileA.txt", "./fileB.txt"})
+	if err == nil || !strings.Contains(err.Error(), "both source and destination are local paths") {
+		t.Fatalf("expected both local paths error, got: %v", err)
+	}
+}
+
+func TestCmd_Cp_DirectoryWithoutRecursiveFlag(t *testing.T) {
+	tempDir := t.TempDir()
+	srcDir := filepath.Join(tempDir, "local_src")
+	_ = os.MkdirAll(srcDir, 0755)
+
+	cpCmd.Flags().Set("recursive", "false")
+
+	err := cpCmd.RunE(cpCmd, []string{srcDir, "mock-node:D:/remote_target"})
+	if err == nil {
+		t.Fatal("expected error when copying directory without -r")
+	}
+	if !strings.Contains(err.Error(), "omitting directory") || !strings.Contains(err.Error(), "use -r") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+}
+
+func setupMockWorkerServer(t *testing.T) (*httptest.Server, *sync.Map, *sync.Map) {
+	uploadedFiles := &sync.Map{}
+	createdDirs := &sync.Map{}
+
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		pathParam := r.URL.Query().Get("path")
+		switch r.URL.Path {
+		case "/api/v1/fs/ls":
+			if strings.Contains(pathParam, "remote_dir") || strings.Contains(pathParam, "dst_dir") {
+				list := []protocol.FileInfo{
+					{Name: "file1.txt", Path: "file1.txt", IsDir: false, Size: 11},
+					{Name: "empty_sub", Path: "empty_sub", IsDir: true},
+				}
+				_ = json.NewEncoder(rw).Encode(list)
+				return
+			}
+			// 模拟单文件
+			http.Error(rw, "path is a file, not a directory", http.StatusBadRequest)
+		case "/api/v1/fs/upload":
+			h := sha256.New()
+			body, _ := io.ReadAll(io.TeeReader(r.Body, h))
+			hashHex := hex.EncodeToString(h.Sum(nil))
+			uploadedFiles.Store(pathParam, string(body))
+			rw.Header().Set("X-File-SHA256", hashHex)
+			rw.WriteHeader(http.StatusOK)
+			_, _ = rw.Write([]byte("OK"))
+		case "/api/v1/fs/download":
+			content := "hello-from-remote"
+			h := sha256.Sum256([]byte(content))
+			hashHex := hex.EncodeToString(h[:])
+			rw.Header().Set("X-File-Size", fmt.Sprintf("%d", len(content)))
+			rw.Header().Set("Trailer", "X-File-SHA256")
+			rw.WriteHeader(http.StatusOK)
+			_, _ = rw.Write([]byte(content))
+			rw.Header().Set("X-File-SHA256", hashHex)
+		case "/api/v1/fs/md":
+			createdDirs.Store(pathParam, true)
+			rw.WriteHeader(http.StatusOK)
+			_, _ = rw.Write([]byte("CREATED"))
+		default:
+			http.NotFound(rw, r)
+		}
+	}))
+
+	return server, uploadedFiles, createdDirs
+}
+
+func TestCmd_Cp_ExecutionFlows(t *testing.T) {
+	tempProfile := t.TempDir()
+	t.Setenv("USERPROFILE", tempProfile)
+
+	server, uploadedFiles, createdDirs := setupMockWorkerServer(t)
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+
+	// 配置 mock-node 和 mock-dst 节点
+	cli := client.NewClient()
+	_ = cli.SaveKnownNode(protocol.KnownNode{
+		Name:   "mock-node",
+		Target: u.Host,
+	})
+	_ = cli.SaveKnownNode(protocol.KnownNode{
+		Name:   "mock-dst",
+		Target: u.Host,
+	})
+
+	// 1. 本地到远端单文件上传
+	localSrcFile := filepath.Join(tempProfile, "single_upload.txt")
+	_ = os.WriteFile(localSrcFile, []byte("single-file-upload-data"), 0644)
+
+	cpCmd.Flags().Set("recursive", "false")
+	cpCmd.Flags().Set("concurrency", "4")
+	err := cpCmd.RunE(cpCmd, []string{localSrcFile, "mock-node:D:/remote_file.txt"})
+	if err != nil {
+		t.Fatalf("local to remote single file failed: %v", err)
+	}
+	if val, ok := uploadedFiles.Load("D:/remote_file.txt"); !ok || val != "single-file-upload-data" {
+		t.Fatalf("uploaded file mismatch: %v", val)
+	}
+
+	// 2. 本地到远端文件夹上传 (-r)
+	localDir := filepath.Join(tempProfile, "upload_dir")
+	_ = os.MkdirAll(filepath.Join(localDir, "sub_empty"), 0755)
+	_ = os.WriteFile(filepath.Join(localDir, "fileA.txt"), []byte("dataA"), 0644)
+
+	cpCmd.Flags().Set("recursive", "true")
+	cpCmd.Flags().Set("concurrency", "2")
+	err = cpCmd.RunE(cpCmd, []string{localDir, "mock-node:D:/uploaded_target"})
+	if err != nil {
+		t.Fatalf("local to remote directory upload failed: %v", err)
+	}
+	if _, ok := createdDirs.Load("D:/uploaded_target/sub_empty"); !ok {
+		t.Fatal("expected empty subdirectory created on remote")
+	}
+	if val, ok := uploadedFiles.Load("D:/uploaded_target/fileA.txt"); !ok || val != "dataA" {
+		t.Fatalf("uploaded dir file mismatch: %v", val)
+	}
+
+	// 3. 远端到本地单文件下载
+	localDstFile := filepath.Join(tempProfile, "downloaded.txt")
+	cpCmd.Flags().Set("recursive", "false")
+	err = cpCmd.RunE(cpCmd, []string{"mock-node:D:/remote_file.txt", localDstFile})
+	if err != nil {
+		t.Fatalf("remote to local single file download failed: %v", err)
+	}
+	downloadedData, err := os.ReadFile(localDstFile)
+	if err != nil || string(downloadedData) != "hello-from-remote" {
+		t.Fatalf("downloaded data mismatch: %s, err: %v", string(downloadedData), err)
+	}
+
+	// 4. 远端到本地文件夹下载 (-r)
+	localDstDir := filepath.Join(tempProfile, "download_target")
+	cpCmd.Flags().Set("recursive", "true")
+	err = cpCmd.RunE(cpCmd, []string{"mock-node:D:/remote_dir", localDstDir})
+	if err != nil {
+		t.Fatalf("remote to local directory download failed: %v", err)
+	}
+	if fi, err := os.Stat(filepath.Join(localDstDir, "empty_sub")); err != nil || !fi.IsDir() {
+		t.Fatalf("expected empty_sub created locally: %v", err)
+	}
+	dlFileContent, err := os.ReadFile(filepath.Join(localDstDir, "file1.txt"))
+	if err != nil || string(dlFileContent) != "hello-from-remote" {
+		t.Fatalf("downloaded dir file content mismatch: %s, err: %v", string(dlFileContent), err)
+	}
+
+	// 5. 远端目录下载缺少 -r 标志应拦截
+	cpCmd.Flags().Set("recursive", "false")
+	err = cpCmd.RunE(cpCmd, []string{"mock-node:D:/remote_dir", localDstDir})
+	if err == nil {
+		t.Fatal("expected omitting directory error for remote dir without -r")
+	}
+	if !strings.Contains(err.Error(), "omitting directory") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+
+	// 6. 远端到远端单文件拷贝
+	err = cpCmd.RunE(cpCmd, []string{"mock-node:D:/remote_file.txt", "mock-dst:D:/relay_dest.txt"})
+	if err != nil {
+		t.Fatalf("remote to remote single file relay failed: %v", err)
+	}
+	if val, ok := uploadedFiles.Load("D:/relay_dest.txt"); !ok || val != "hello-from-remote" {
+		t.Fatalf("relay dest file mismatch: %v", val)
+	}
+
+	// 7. 远端到远端文件夹中继 (-r)
+	cpCmd.Flags().Set("recursive", "true")
+	cpCmd.Flags().Set("concurrency", "4")
+	err = cpCmd.RunE(cpCmd, []string{"mock-node:D:/remote_dir", "mock-dst:D:/relay_target_dir"})
+	if err != nil {
+		t.Fatalf("remote to remote directory relay failed: %v", err)
+	}
+	if _, ok := createdDirs.Load("D:/relay_target_dir/empty_sub"); !ok {
+		t.Fatal("expected empty_sub created on relay destination")
+	}
+	if val, ok := uploadedFiles.Load("D:/relay_target_dir/file1.txt"); !ok || val != "hello-from-remote" {
+		t.Fatalf("relay target dir file mismatch: %v", val)
+	}
+}
+
+func TestCmd_Cp_DownloadFile_FailureDoesNotDestroyExistingFile(t *testing.T) {
+	tempProfile := t.TempDir()
+	t.Setenv("USERPROFILE", tempProfile)
+
+	// 创建一个失败的远端下载服务器（500 错误）
+	failServer := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		http.Error(rw, "internal worker error", http.StatusInternalServerError)
+	}))
+	defer failServer.Close()
+
+	u, _ := url.Parse(failServer.URL)
+	cli := client.NewClient()
+	_ = cli.SaveKnownNode(protocol.KnownNode{
+		Name:   "fail-node",
+		Target: u.Host,
+	})
+
+	localTarget := filepath.Join(tempProfile, "important_local_file.txt")
+	originalContent := "original-local-valuable-content"
+	if err := os.WriteFile(localTarget, []byte(originalContent), 0644); err != nil {
+		t.Fatalf("write local target failed: %v", err)
+	}
+
+	// 触发单文件下载，由于远端报错，下载失败
+	cpCmd.Flags().Set("recursive", "false")
+	err := cpCmd.RunE(cpCmd, []string{"fail-node:D:/remote_broken.txt", localTarget})
+	if err == nil {
+		t.Fatal("expected download error from fail-node, got nil")
+	}
+
+	// 校验本地已有目标文件未被截断或删除，依然完好无损
+	currentBytes, err := os.ReadFile(localTarget)
+	if err != nil {
+		t.Fatalf("local target file was deleted: %v", err)
+	}
+	if string(currentBytes) != originalContent {
+		t.Fatalf("local file was modified or corrupted! expected %q, got %q", originalContent, string(currentBytes))
+	}
+
+	// 校验临时文件已被清理
+	entries, err := os.ReadDir(tempProfile)
+	if err != nil {
+		t.Fatalf("readdir failed: %v", err)
+	}
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".cwtemp-") {
+			t.Fatalf("temporary download file was leaked: %s", e.Name())
+		}
+	}
+}
+

@@ -1,0 +1,1314 @@
+package client
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"cworker/pkg/pathutil"
+	"cworker/pkg/protocol"
+	"nhooyr.io/websocket"
+)
+
+func TestClient_KnownNodesLedger(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "cw_client_test_*")
+	if err != nil {
+		t.Fatalf("create temp dir failed: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	cli := NewClient()
+	cli.dataDir = tempDir
+
+	// 1. 测试空账本加载
+	nodes, err := cli.LoadKnownNodes()
+	if err != nil {
+		t.Fatalf("load empty ledger failed: %v", err)
+	}
+	if len(nodes) != 0 {
+		t.Fatalf("expected 0 nodes, got %d", len(nodes))
+	}
+
+	// 2. 写入两个已知节点
+	node1 := protocol.KnownNode{
+		Name:   "node-1",
+		Target: "192.168.1.10:19000",
+		Token:  "token-111",
+	}
+	node2 := protocol.KnownNode{
+		Name:   "node-2",
+		Target: "node-2.tailnet.ts.net:19000",
+		Token:  "token-222",
+	}
+
+	if err := cli.SaveKnownNode(node1); err != nil {
+		t.Fatalf("save node1 failed: %v", err)
+	}
+	if err := cli.SaveKnownNode(node2); err != nil {
+		t.Fatalf("save node2 failed: %v", err)
+	}
+
+	// 3. 重新加载验证
+	loaded, err := cli.LoadKnownNodes()
+	if err != nil {
+		t.Fatalf("reload ledger failed: %v", err)
+	}
+	if len(loaded) != 2 {
+		t.Fatalf("expected 2 nodes, got %d", len(loaded))
+	}
+	if loaded["node-1"].Token != "token-111" {
+		t.Fatalf("expected token-111, got %s", loaded["node-1"].Token)
+	}
+	if loaded["node-2"].Target != "node-2.tailnet.ts.net:19000" {
+		t.Fatalf("expected target matching, got %s", loaded["node-2"].Target)
+	}
+
+	// 4. 测试删除节点
+	if err := cli.RemoveKnownNode("node-1"); err != nil {
+		t.Fatalf("remove node-1 failed: %v", err)
+	}
+	loadedAfterRemove, err := cli.LoadKnownNodes()
+	if err != nil {
+		t.Fatalf("reload after remove failed: %v", err)
+	}
+	if len(loadedAfterRemove) != 1 {
+		t.Fatalf("expected 1 node after remove, got %d", len(loadedAfterRemove))
+	}
+
+	// 5. 验证 nodes.json 物理文件存在
+	jsonPath := filepath.Join(tempDir, "nodes.json")
+	if _, err := os.Stat(jsonPath); err != nil {
+		t.Fatalf("nodes.json file not created on disk: %v", err)
+	}
+}
+
+func TestClient_ResolveWorker(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "cw_client_resolve_*")
+	if err != nil {
+		t.Fatalf("create temp dir failed: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	cli := NewClient()
+	cli.dataDir = tempDir
+
+	// 测试从账本解析
+	_ = cli.SaveKnownNode(protocol.KnownNode{
+		Name:   "alpha",
+		Target: "127.0.0.1:19000",
+		Token:  "secret-alpha",
+	})
+
+	rt, err := cli.ResolveWorker("alpha", "")
+	if err != nil {
+		t.Fatalf("resolve worker 'alpha' failed: %v", err)
+	}
+	if rt.Token != "secret-alpha" {
+		t.Fatalf("expected secret-alpha token, got %s", rt.Token)
+	}
+	if rt.BaseURL != "http://127.0.0.1:19000" {
+		t.Fatalf("expected http://127.0.0.1:19000, got %s", rt.BaseURL)
+	}
+
+	// 测试显式传入 Token 覆盖
+	rt2, err := cli.ResolveWorker("alpha", "override-token")
+	if err != nil {
+		t.Fatalf("resolve with override failed: %v", err)
+	}
+	if rt2.Token != "override-token" {
+		t.Fatalf("expected override-token, got %s", rt2.Token)
+	}
+}
+
+func TestClient_Operations(t *testing.T) {
+	// 启动 Mock Worker HTTP 服务器
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		// 验证 Bearer Token
+		if r.Header.Get("Authorization") != "Bearer mock-token" {
+			http.Error(rw, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		path := r.URL.Path
+		switch {
+		case path == "/api/v1/health":
+			_ = json.NewEncoder(rw).Encode(protocol.NodeInfo{
+				Name:    "mock-node",
+				Address: "127.0.0.1:19000",
+				Status:  protocol.NodeStatusOnline,
+			})
+		case path == "/api/v1/fs/upload":
+			h := sha256.New()
+			_, _ = io.Copy(h, r.Body)
+			hashHex := hex.EncodeToString(h.Sum(nil))
+			rw.Header().Set("X-File-SHA256", hashHex)
+			rw.WriteHeader(http.StatusOK)
+			_, _ = rw.Write([]byte(hashHex))
+		case path == "/api/v1/fs/download":
+			data := []byte("mock-download-data")
+			h := sha256.Sum256(data)
+			rw.Header().Set("X-File-SHA256", hex.EncodeToString(h[:]))
+			rw.WriteHeader(http.StatusOK)
+			_, _ = rw.Write(data)
+		case path == "/api/v1/fs/ls":
+			_ = json.NewEncoder(rw).Encode([]protocol.FileInfo{
+				{Name: "file.txt", Size: 42, IsDir: false, ModTime: time.Now()},
+			})
+		case path == "/api/v1/fs/md":
+			rw.WriteHeader(http.StatusOK)
+			_, _ = rw.Write([]byte("CREATED"))
+		case path == "/api/v1/fs/rm":
+			rw.WriteHeader(http.StatusOK)
+			_, _ = rw.Write([]byte("DELETED"))
+		case path == "/api/v1/jobs/run":
+			_ = json.NewEncoder(rw).Encode(protocol.JobInfo{
+				ID:      "job-test-1",
+				Node:    "mock-node",
+				Command: "echo 1",
+				Status:  protocol.JobStatusRunning,
+			})
+		case path == "/api/v1/jobs/ps":
+			_ = json.NewEncoder(rw).Encode([]protocol.JobInfo{
+				{ID: "job-test-1", Command: "echo 1", Status: protocol.JobStatusRunning},
+			})
+		case path == "/api/v1/jobs/kill":
+			_ = json.NewEncoder(rw).Encode(protocol.JobInfo{
+				ID:     "job-test-1",
+				Status: protocol.JobStatusStopped,
+			})
+		case path == "/api/v1/jobs/logs":
+			rw.WriteHeader(http.StatusOK)
+			_, _ = rw.Write([]byte("log line 1\nlog line 2"))
+		default:
+			http.NotFound(rw, r)
+		}
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	targetHostPort := u.Host
+
+	tempDir, err := os.MkdirTemp("", "cw_client_ops_*")
+	if err != nil {
+		t.Fatalf("create temp dir failed: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	cli := NewClient()
+	cli.dataDir = tempDir
+
+	_ = cli.SaveKnownNode(protocol.KnownNode{
+		Name:   "mock-node",
+		Target: targetHostPort,
+		Token:  "mock-token",
+	})
+
+	// 1. 测试 ListNodes
+	nodes, err := cli.ListNodes()
+	if err != nil || len(nodes) != 1 {
+		t.Fatalf("ListNodes failed: len=%d, err=%v", len(nodes), err)
+	}
+	if nodes[0].Status != protocol.NodeStatusOnline {
+		t.Fatalf("expected node online, got %s", nodes[0].Status)
+	}
+
+	// 2. 测试 UploadFile
+	err = cli.UploadFile("mock-node", "dest.txt", strings.NewReader("upload content"))
+	if err != nil {
+		t.Fatalf("UploadFile failed: %v", err)
+	}
+
+	// 3. 测试 DownloadFile
+	var downloadBuf bytes.Buffer
+	err = cli.DownloadFile("mock-node", "dest.txt", &downloadBuf)
+	if err != nil || downloadBuf.String() != "mock-download-data" {
+		t.Fatalf("DownloadFile failed: %v, got %s", err, downloadBuf.String())
+	}
+
+	// 4. 测试 ListDir
+	files, err := cli.ListDir("mock-node", ".")
+	if err != nil || len(files) != 1 {
+		t.Fatalf("ListDir failed: len=%d, err=%v", len(files), err)
+	}
+
+	// 5. 测试 MakeDir
+	err = cli.MakeDir("mock-node", "new_dir")
+	if err != nil {
+		t.Fatalf("MakeDir failed: %v", err)
+	}
+
+	// 6. 测试 Delete
+	err = cli.Delete("mock-node", "new_dir", true)
+	if err != nil {
+		t.Fatalf("Delete failed: %v", err)
+	}
+
+	// 7. 测试 RelayCopy
+	err = cli.RelayCopy("mock-node", "src.txt", "mock-node", "dst.txt")
+	if err != nil {
+		t.Fatalf("RelayCopy failed: %v", err)
+	}
+
+	// 8. 测试 RunJob
+	job, err := cli.RunJob(protocol.RunJobRequest{
+		Node:    "mock-node",
+		Command: "echo 1",
+	}, "")
+	if err != nil || job.ID != "job-test-1" {
+		t.Fatalf("RunJob failed: %v", err)
+	}
+
+	// 9. 测试 ListJobs
+	jobs, err := cli.ListJobs()
+	if err != nil || len(jobs) != 1 {
+		t.Fatalf("ListJobs failed: len=%d, err=%v", len(jobs), err)
+	}
+
+	// 10. 测试 KillJob
+	killedJob, err := cli.KillJob("job-test-1")
+	if err != nil || killedJob.Status != protocol.JobStatusStopped {
+		t.Fatalf("KillJob failed: %v", err)
+	}
+
+	// 11. 测试 GetLogs
+	logs, err := cli.GetLogs("job-test-1", 10)
+	if err != nil || !strings.Contains(logs, "log line 1") {
+		t.Fatalf("GetLogs failed: %v, logs=%s", err, logs)
+	}
+}
+
+func TestClient_StreamLogs(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/jobs/ps" {
+			_ = json.NewEncoder(rw).Encode([]protocol.JobInfo{
+				{ID: "stream-job-id", Command: "test", Status: protocol.JobStatusRunning},
+			})
+			return
+		}
+		if r.URL.Path == "/api/v1/jobs/stream" {
+			conn, err := websocket.Accept(rw, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+			if err != nil {
+				return
+			}
+			defer conn.Close(websocket.StatusNormalClosure, "")
+			_ = conn.Write(r.Context(), websocket.MessageText, []byte("streamed_client_log_chunk\n"))
+			return
+		}
+		http.NotFound(rw, r)
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	tempDir, err := os.MkdirTemp("", "cw_client_stream_*")
+	if err != nil {
+		t.Fatalf("create temp dir failed: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	cli := NewClient()
+	cli.dataDir = tempDir
+	_ = cli.SaveKnownNode(protocol.KnownNode{
+		Name:   "stream-node",
+		Target: u.Host,
+		Token:  "test-token",
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	var buf bytes.Buffer
+	err = cli.StreamLogs(ctx, "stream-job-id", &buf)
+	if err != nil && err != context.DeadlineExceeded && err != context.Canceled {
+		t.Fatalf("StreamLogs returned unexpected error: %v", err)
+	}
+	if !strings.Contains(buf.String(), "streamed_client_log_chunk") {
+		t.Fatalf("expected streamed chunk, got: %s", buf.String())
+	}
+}
+
+func TestClient_ResolveWorker_IPv6(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "cw_client_ipv6_*")
+	if err != nil {
+		t.Fatalf("create temp dir failed: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	cli := NewClient()
+	cli.dataDir = tempDir
+
+	// 1. IPv6 带中括号和端口
+	rt1, err := cli.ResolveWorker("[2001:db8::1]:19000", "")
+	if err != nil {
+		t.Fatalf("resolve IPv6 with port failed: %v", err)
+	}
+	if rt1.BaseURL != "http://[2001:db8::1]:19000" {
+		t.Fatalf("expected http://[2001:db8::1]:19000, got %s", rt1.BaseURL)
+	}
+
+	// 2. 纯 IP 自动补充 19000
+	rt2, err := cli.ResolveWorker("192.168.1.88", "")
+	if err != nil {
+		t.Fatalf("resolve pure IPv4 failed: %v", err)
+	}
+	if rt2.BaseURL != "http://192.168.1.88:19000" {
+		t.Fatalf("expected http://192.168.1.88:19000, got %s", rt2.BaseURL)
+	}
+}
+
+func TestClient_ListNodes_OfflineNode(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "cw_client_offline_*")
+	if err != nil {
+		t.Fatalf("create temp dir failed: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	cli := NewClient()
+	cli.dataDir = tempDir
+
+	// 记录一个不可达的高位端口节点
+	_ = cli.SaveKnownNode(protocol.KnownNode{
+		Name:   "offline-box",
+		Target: "127.0.0.1:59998",
+		Token:  "token",
+	})
+
+	nodes, err := cli.ListNodes()
+	if err != nil {
+		t.Fatalf("ListNodes should not fail when node is offline: %v", err)
+	}
+	if len(nodes) != 1 {
+		t.Fatalf("expected 1 node, got %d", len(nodes))
+	}
+	if nodes[0].Status != protocol.NodeStatusOffline {
+		t.Fatalf("expected node status OFFLINE, got %s", nodes[0].Status)
+	}
+}
+
+// TestClient_ListNodes_ProxyImmunity 验证 ListNodes 严格免疫系统外部 HTTP_PROXY 环境变量干扰
+func TestClient_ListNodes_ProxyImmunity(t *testing.T) {
+	// 强行注入无法访问的黑洞代理地址
+	t.Setenv("HTTP_PROXY", "http://127.0.0.1:59999")
+	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:59999")
+
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			rw.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(rw).Encode(protocol.NodeInfo{
+				Name:    "proxy-immune-node",
+				Address: "127.0.0.1:19000",
+				Status:  protocol.NodeStatusOnline,
+			})
+			return
+		}
+		http.NotFound(rw, r)
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	cli := NewClient()
+	cli.dataDir = t.TempDir()
+
+	_ = cli.SaveKnownNode(protocol.KnownNode{
+		Name:   "proxy-immune-node",
+		Target: u.Host,
+	})
+
+	nodes, err := cli.ListNodes()
+	if err != nil {
+		t.Fatalf("ListNodes failed under HTTP_PROXY: %v", err)
+	}
+	if len(nodes) != 1 || nodes[0].Status != protocol.NodeStatusOnline {
+		t.Fatalf("expected node to be ONLINE ignoring HTTP_PROXY, got: %+v", nodes)
+	}
+}
+
+// TestClient_ListNodes_TimeoutFailsafe 验证目标节点假死时，1500ms 短超时即时熔断且不阻塞全局
+func TestClient_ListNodes_TimeoutFailsafe(t *testing.T) {
+	// 模拟挂起延迟 3 秒的假死节点（监听 r.Context().Done() 以便在客户端超时取消后快速释放连接）
+	slowServer := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(3 * time.Second):
+			_ = json.NewEncoder(rw).Encode(protocol.NodeInfo{
+				Name:   "slow-node",
+				Status: protocol.NodeStatusOnline,
+			})
+		case <-r.Context().Done():
+			return
+		}
+	}))
+	defer slowServer.Close()
+
+	u, _ := url.Parse(slowServer.URL)
+	cli := NewClient()
+	cli.dataDir = t.TempDir()
+
+	_ = cli.SaveKnownNode(protocol.KnownNode{
+		Name:   "slow-node",
+		Target: u.Host,
+	})
+
+	start := time.Now()
+	nodes, err := cli.ListNodes()
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("ListNodes unexpected error on timeout: %v", err)
+	}
+	if len(nodes) != 1 || nodes[0].Status != protocol.NodeStatusOffline {
+		t.Fatalf("expected slow node to be marked OFFLINE on timeout, got: %+v", nodes)
+	}
+	// 耗时应在 1500ms 左右，大幅小于服务端的 3 秒延迟
+	if elapsed > 2500*time.Millisecond {
+		t.Fatalf("ListNodes timeout took too long: %v (expected ~1500ms)", elapsed)
+	}
+}
+
+func TestClient_ErrorResponses(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		http.Error(rw, "simulated error", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	tempDir, err := os.MkdirTemp("", "cw_client_err_*")
+	if err != nil {
+		t.Fatalf("create temp dir failed: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	cli := NewClient()
+	cli.dataDir = tempDir
+	_ = cli.SaveKnownNode(protocol.KnownNode{
+		Name:   "err-node",
+		Target: u.Host,
+	})
+
+	// 各接口应正确捕获非 200 返回值错误
+	if err := cli.UploadFile("err-node", "a.txt", strings.NewReader("")); err == nil {
+		t.Fatal("expected error on 500 in UploadFile")
+	}
+	var buf bytes.Buffer
+	if err := cli.DownloadFile("err-node", "a.txt", &buf); err == nil {
+		t.Fatal("expected error on 500 in DownloadFile")
+	}
+	if _, err := cli.ListDir("err-node", "."); err == nil {
+		t.Fatal("expected error on 500 in ListDir")
+	}
+	if err := cli.MakeDir("err-node", "sub"); err == nil {
+		t.Fatal("expected error on 500 in MakeDir")
+	}
+	if err := cli.Delete("err-node", "sub", false); err == nil {
+		t.Fatal("expected error on 500 in Delete")
+	}
+	if _, err := cli.RunJob(protocol.RunJobRequest{Node: "err-node", Command: "echo 1"}, ""); err == nil {
+		t.Fatal("expected error on 500 in RunJob")
+	}
+	if _, err := cli.KillJob("fake-job"); err == nil {
+		t.Fatal("expected error on 500 in KillJob")
+	}
+	if _, err := cli.GetLogs("fake-job", 10); err == nil {
+		t.Fatal("expected error on 500 in GetLogs")
+	}
+}
+
+func TestClient_DownloadFile_Sha256Mismatch(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		rw.Header().Set("X-File-SHA256", "0000000000000000000000000000000000000000000000000000000000000000")
+		rw.WriteHeader(http.StatusOK)
+		_, _ = rw.Write([]byte("some data that does not match dummy hash"))
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	cli := NewClient()
+	cli.dataDir = t.TempDir()
+	_ = cli.SaveKnownNode(protocol.KnownNode{
+		Name:   "hash-node",
+		Target: u.Host,
+	})
+
+	var buf bytes.Buffer
+	err := cli.DownloadFile("hash-node", "file.txt", &buf)
+	if err == nil || !strings.Contains(err.Error(), "sha256 checksum mismatch") {
+		t.Fatalf("expected sha256 checksum mismatch error, got: %v", err)
+	}
+}
+
+func TestClient_UploadDir_SuccessAndPreserveEmptyDirs(t *testing.T) {
+	var mu sync.Mutex
+	createdDirs := make(map[string]bool)
+	uploadedFiles := make(map[string]string)
+
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		pQuery := r.URL.Query().Get("path")
+		switch path {
+		case "/api/v1/fs/md":
+			mu.Lock()
+			createdDirs[pQuery] = true
+			mu.Unlock()
+			rw.WriteHeader(http.StatusOK)
+			_, _ = rw.Write([]byte("CREATED"))
+		case "/api/v1/fs/upload":
+			h := sha256.New()
+			body, _ := io.ReadAll(io.TeeReader(r.Body, h))
+			hashHex := hex.EncodeToString(h.Sum(nil))
+			mu.Lock()
+			uploadedFiles[pQuery] = string(body)
+			mu.Unlock()
+			rw.Header().Set("X-File-SHA256", hashHex)
+			rw.WriteHeader(http.StatusOK)
+			_, _ = rw.Write([]byte("OK"))
+		default:
+			http.NotFound(rw, r)
+		}
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	cli := NewClient()
+	cli.dataDir = t.TempDir()
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "upload-node", Target: u.Host})
+
+	// 构建本地复杂嵌套测试目录
+	localRoot := t.TempDir()
+	_ = os.WriteFile(filepath.Join(localRoot, "root_file.txt"), []byte("root content"), 0644)
+	subDir := filepath.Join(localRoot, "sub")
+	_ = os.MkdirAll(subDir, 0755)
+	_ = os.WriteFile(filepath.Join(subDir, "sub_file.txt"), []byte("sub content"), 0644)
+	emptySub := filepath.Join(subDir, "empty_sub")
+	_ = os.MkdirAll(emptySub, 0755)
+	emptyRoot := filepath.Join(localRoot, "empty_root")
+	_ = os.MkdirAll(emptyRoot, 0755)
+
+	tracker := NewProgressTracker(2, int64(len("root content")+len("sub content")))
+	tracker.SetTTY(false)
+
+	err := cli.UploadDir(context.Background(), "upload-node", "D:/remote_target", localRoot, 4, tracker)
+	if err != nil {
+		t.Fatalf("UploadDir failed: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// 验证空目录与普通目录全部在远端预建
+	if !createdDirs["D:/remote_target"] {
+		t.Fatal("expected remote root dir created")
+	}
+	if !createdDirs["D:/remote_target/sub"] {
+		t.Fatal("expected sub dir created")
+	}
+	if !createdDirs["D:/remote_target/sub/empty_sub"] {
+		t.Fatal("expected empty_sub dir preserved")
+	}
+	if !createdDirs["D:/remote_target/empty_root"] {
+		t.Fatal("expected empty_root dir preserved")
+	}
+
+	// 验证文件上传路径与内容
+	if uploadedFiles["D:/remote_target/root_file.txt"] != "root content" {
+		t.Fatalf("root_file.txt content mismatch: %s", uploadedFiles["D:/remote_target/root_file.txt"])
+	}
+	if uploadedFiles["D:/remote_target/sub/sub_file.txt"] != "sub content" {
+		t.Fatalf("sub_file.txt content mismatch: %s", uploadedFiles["D:/remote_target/sub/sub_file.txt"])
+	}
+}
+
+func TestClient_UploadDir_EarlyCancelOnError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		if path == "/api/v1/fs/md" {
+			rw.WriteHeader(http.StatusOK)
+			return
+		}
+		if path == "/api/v1/fs/upload" {
+			http.Error(rw, "disk full", http.StatusInternalServerError)
+			return
+		}
+		http.NotFound(rw, r)
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	cli := NewClient()
+	cli.dataDir = t.TempDir()
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "err-upload-node", Target: u.Host})
+
+	localRoot := t.TempDir()
+	_ = os.WriteFile(filepath.Join(localRoot, "file1.txt"), []byte("content1"), 0644)
+	_ = os.WriteFile(filepath.Join(localRoot, "file2.txt"), []byte("content2"), 0644)
+
+	err := cli.UploadDir(context.Background(), "err-upload-node", "D:/target", localRoot, 2, nil)
+	if err == nil || !strings.Contains(err.Error(), "upload") {
+		t.Fatalf("expected upload failure error, got %v", err)
+	}
+}
+
+func TestClient_DownloadDir_Success(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		switch path {
+		case "/api/v1/fs/ls":
+			list := []protocol.FileInfo{
+				{Name: "file1.txt", Path: "file1.txt", IsDir: false, Size: 6},
+				{Name: "sub", Path: "sub", IsDir: true},
+				{Name: "file2.txt", Path: "sub/file2.txt", IsDir: false, Size: 6},
+				{Name: "empty_dir", Path: "empty_dir", IsDir: true},
+			}
+			_ = json.NewEncoder(rw).Encode(list)
+		case "/api/v1/fs/download":
+			pQuery := r.URL.Query().Get("path")
+			var content string
+			if strings.HasSuffix(pQuery, "file1.txt") {
+				content = "data_1"
+			} else if strings.HasSuffix(pQuery, "file2.txt") {
+				content = "data_2"
+			}
+			h := sha256.Sum256([]byte(content))
+			hashHex := hex.EncodeToString(h[:])
+			rw.Header().Set("X-File-Size", fmt.Sprintf("%d", len(content)))
+			rw.Header().Set("X-File-SHA256", hashHex)
+			rw.WriteHeader(http.StatusOK)
+			_, _ = rw.Write([]byte(content))
+		default:
+			http.NotFound(rw, r)
+		}
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	cli := NewClient()
+	cli.dataDir = t.TempDir()
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "dl-node", Target: u.Host})
+
+	localDest := t.TempDir()
+	tracker := NewProgressTracker(2, 12)
+	tracker.SetTTY(false)
+
+	err := cli.DownloadDir(context.Background(), "dl-node", "D:/remote_source", localDest, 4, tracker)
+	if err != nil {
+		t.Fatalf("DownloadDir failed: %v", err)
+	}
+
+	// 验证下载文件内容与空目录
+	c1, err := os.ReadFile(filepath.Join(localDest, "file1.txt"))
+	if err != nil || string(c1) != "data_1" {
+		t.Fatalf("file1.txt content mismatch: %s, err: %v", string(c1), err)
+	}
+
+	c2, err := os.ReadFile(filepath.Join(localDest, "sub", "file2.txt"))
+	if err != nil || string(c2) != "data_2" {
+		t.Fatalf("sub/file2.txt content mismatch: %s, err: %v", string(c2), err)
+	}
+
+	emptyFi, err := os.Stat(filepath.Join(localDest, "empty_dir"))
+	if err != nil || !emptyFi.IsDir() {
+		t.Fatalf("empty_dir was not preserved: %v", err)
+	}
+}
+
+func TestClient_DownloadDir_EarlyCancelOnError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		if path == "/api/v1/fs/ls" {
+			list := []protocol.FileInfo{
+				{Name: "f1.txt", Path: "f1.txt", IsDir: false, Size: 10},
+			}
+			_ = json.NewEncoder(rw).Encode(list)
+			return
+		}
+		if path == "/api/v1/fs/download" {
+			http.Error(rw, "corrupt block", http.StatusInternalServerError)
+			return
+		}
+		http.NotFound(rw, r)
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	cli := NewClient()
+	cli.dataDir = t.TempDir()
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "err-dl-node", Target: u.Host})
+
+	localDest := t.TempDir()
+	err := cli.DownloadDir(context.Background(), "err-dl-node", "D:/remote", localDest, 2, nil)
+	if err == nil || !strings.Contains(err.Error(), "download") {
+		t.Fatalf("expected download failure error, got %v", err)
+	}
+}
+
+func TestClient_DownloadDir_FailureDoesNotDestroyExistingFile(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		if path == "/api/v1/fs/ls" {
+			list := []protocol.FileInfo{
+				{Name: "critical.txt", Path: "critical.txt", IsDir: false, Size: 10},
+			}
+			_ = json.NewEncoder(rw).Encode(list)
+			return
+		}
+		if path == "/api/v1/fs/download" {
+			http.Error(rw, "remote download exploded", http.StatusInternalServerError)
+			return
+		}
+		http.NotFound(rw, r)
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	cli := NewClient()
+	cli.dataDir = t.TempDir()
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "err-dl-node2", Target: u.Host})
+
+	localDest := t.TempDir()
+	targetFile := filepath.Join(localDest, "critical.txt")
+	originalContent := "original-local-critical-content"
+	if err := os.WriteFile(targetFile, []byte(originalContent), 0644); err != nil {
+		t.Fatalf("write original file failed: %v", err)
+	}
+
+	err := cli.DownloadDir(context.Background(), "err-dl-node2", "D:/remote", localDest, 2, nil)
+	if err == nil {
+		t.Fatal("expected error from DownloadDir, got nil")
+	}
+
+	// 校验目标文件未被截断或删除，依然完好
+	content, err := os.ReadFile(targetFile)
+	if err != nil {
+		t.Fatalf("target file was deleted: %v", err)
+	}
+	if string(content) != originalContent {
+		t.Fatalf("target file content altered! expected %q, got %q", originalContent, string(content))
+	}
+
+	// 校验临时文件已被清理
+	entries, err := os.ReadDir(localDest)
+	if err != nil {
+		t.Fatalf("readdir failed: %v", err)
+	}
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".cwtemp-") {
+			t.Fatalf("temporary download file was leaked: %s", e.Name())
+		}
+	}
+}
+
+func TestClient_RelayCopyDir_Success(t *testing.T) {
+	var mu sync.Mutex
+	dstCreatedDirs := make(map[string]bool)
+	dstFiles := make(map[string]string)
+
+	// 1. 源端 Mock Worker
+	srcServer := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		switch path {
+		case "/api/v1/fs/ls":
+			list := []protocol.FileInfo{
+				{Name: "fileA.txt", Path: "fileA.txt", IsDir: false, Size: 9},
+				{Name: "empty_folder", Path: "empty_folder", IsDir: true},
+			}
+			_ = json.NewEncoder(rw).Encode(list)
+		case "/api/v1/fs/download":
+			content := "data-from-src"
+			h := sha256.Sum256([]byte(content))
+			rw.Header().Set("X-File-Size", fmt.Sprintf("%d", len(content)))
+			rw.Header().Set("X-File-SHA256", hex.EncodeToString(h[:]))
+			rw.WriteHeader(http.StatusOK)
+			_, _ = rw.Write([]byte(content))
+		default:
+			http.NotFound(rw, r)
+		}
+	}))
+	defer srcServer.Close()
+
+	// 2. 目的端 Mock Worker
+	dstServer := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		pQuery := r.URL.Query().Get("path")
+		switch path {
+		case "/api/v1/fs/md":
+			mu.Lock()
+			dstCreatedDirs[pQuery] = true
+			mu.Unlock()
+			rw.WriteHeader(http.StatusOK)
+			_, _ = rw.Write([]byte("CREATED"))
+		case "/api/v1/fs/upload":
+			h := sha256.New()
+			body, _ := io.ReadAll(io.TeeReader(r.Body, h))
+			hashHex := hex.EncodeToString(h.Sum(nil))
+			mu.Lock()
+			dstFiles[pQuery] = string(body)
+			mu.Unlock()
+			rw.Header().Set("X-File-SHA256", hashHex)
+			rw.WriteHeader(http.StatusOK)
+			_, _ = rw.Write([]byte("OK"))
+		default:
+			http.NotFound(rw, r)
+		}
+	}))
+	defer dstServer.Close()
+
+	uSrc, _ := url.Parse(srcServer.URL)
+	uDst, _ := url.Parse(dstServer.URL)
+
+	cli := NewClient()
+	cli.dataDir = t.TempDir()
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "relay-src", Target: uSrc.Host})
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "relay-dst", Target: uDst.Host})
+
+	tracker := NewProgressTracker(1, 13)
+	tracker.SetTTY(false)
+
+	err := cli.RelayCopyDir(context.Background(), "relay-src", "D:/src_dir", "relay-dst", "D:/dst_dir", 2, tracker)
+	if err != nil {
+		t.Fatalf("RelayCopyDir failed: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if !dstCreatedDirs["D:/dst_dir"] {
+		t.Fatal("expected dst base dir created")
+	}
+	if !dstCreatedDirs["D:/dst_dir/empty_folder"] {
+		t.Fatal("expected dst empty_folder created")
+	}
+	if dstFiles["D:/dst_dir/fileA.txt"] != "data-from-src" {
+		t.Fatalf("fileA.txt content mismatch: %s", dstFiles["D:/dst_dir/fileA.txt"])
+	}
+}
+
+func TestClient_DownloadDir_Security_PathTraversal(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/fs/ls" {
+			list := []protocol.FileInfo{
+				{Name: "evil.txt", Path: "../../evil.txt", IsDir: false, Size: 10},
+			}
+			_ = json.NewEncoder(rw).Encode(list)
+			return
+		}
+		http.NotFound(rw, r)
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	cli := NewClient()
+	cli.dataDir = t.TempDir()
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "rogue-worker", Target: u.Host})
+
+	targetDir := t.TempDir()
+	err := cli.DownloadDir(context.Background(), "rogue-worker", "D:/data", targetDir, 2, nil)
+	if err == nil {
+		t.Fatal("expected security path traversal error, got nil")
+	}
+	if !strings.Contains(err.Error(), "security") && !strings.Contains(err.Error(), "path traversal") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+
+	// 确认未在父级逃逸创建文件
+	parentEvil := filepath.Join(targetDir, "..", "evil.txt")
+	if _, statErr := os.Stat(parentEvil); !os.IsNotExist(statErr) {
+		t.Fatalf("evil.txt was written outside target dir: %s", parentEvil)
+	}
+}
+
+func TestClient_RelayCopyDir_Security_PathTraversal(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/fs/ls" {
+			list := []protocol.FileInfo{
+				{Name: "evil.txt", Path: "../escaped/evil.txt", IsDir: false, Size: 10},
+			}
+			_ = json.NewEncoder(rw).Encode(list)
+			return
+		}
+		http.NotFound(rw, r)
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	cli := NewClient()
+	cli.dataDir = t.TempDir()
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "rogue-src", Target: u.Host})
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "dst-node", Target: u.Host})
+
+	err := cli.RelayCopyDir(context.Background(), "rogue-src", "D:/src", "dst-node", "D:/dst", 2, nil)
+	if err == nil {
+		t.Fatal("expected security error on relay copy dir, got nil")
+	}
+	if !strings.Contains(err.Error(), "security") && !strings.Contains(err.Error(), "path traversal") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+}
+
+func TestClient_DirOperations_ContextCanceled(t *testing.T) {
+	cli := NewClient()
+	cli.dataDir = t.TempDir()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // 预先取消
+
+	// 1. UploadDir 面对已取消 context 必须显式报错而不是吞掉返回 nil
+	err := cli.UploadDir(ctx, "any-node", "D:/remote", t.TempDir(), 2, nil)
+	if err == nil {
+		t.Fatal("expected error on cancelled ctx in UploadDir, got nil")
+	}
+
+	// 2. DownloadDir 面对已取消 context 必须显式报错
+	err = cli.DownloadDir(ctx, "any-node", "D:/remote", t.TempDir(), 2, nil)
+	if err == nil {
+		t.Fatal("expected error on cancelled ctx in DownloadDir, got nil")
+	}
+
+	// 3. RelayCopyDir 面对已取消 context 必须显式报错
+	err = cli.RelayCopyDir(ctx, "src-node", "D:/src", "dst-node", "D:/dst", 2, nil)
+	if err == nil {
+		t.Fatal("expected error on cancelled ctx in RelayCopyDir, got nil")
+	}
+}
+
+func TestClient_GetLogs_ErrorPropagation(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/jobs/ps":
+			jobs := []protocol.JobInfo{
+				{ID: "job-exist-err", Status: protocol.JobStatusFailed},
+			}
+			rw.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(rw).Encode(jobs)
+		case "/api/v1/jobs/logs":
+			http.Error(rw, "log file corrupted", http.StatusInternalServerError)
+		default:
+			http.NotFound(rw, r)
+		}
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	cli := NewClient()
+	cli.dataDir = t.TempDir()
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "err-node", Target: u.Host})
+
+	_, err := cli.GetLogs("job-exist-err", 50)
+	if err == nil {
+		t.Fatal("expected error when server returns 500 on GetLogs, got nil")
+	}
+	if !strings.Contains(err.Error(), "get logs failed (500)") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+}
+
+func TestClient_SSOT_LocalhostFallback(t *testing.T) {
+	tempDir := t.TempDir()
+	cli := NewClient()
+	cli.dataDir = tempDir
+
+	// 当账本为空时，getEffectiveKnownNodes 自动注入本机配置
+	nodes, err := cli.getEffectiveKnownNodes()
+	if err != nil {
+		t.Fatalf("getEffectiveKnownNodes failed: %v", err)
+	}
+	if len(nodes) != 1 {
+		t.Fatalf("expected exactly 1 node (localhost), got %d", len(nodes))
+	}
+	hostname, _ := os.Hostname()
+	kn, ok := nodes[strings.ToLower(hostname)]
+	if !ok {
+		t.Fatalf("expected entry for hostname %q, got: %+v", hostname, nodes)
+	}
+	if kn.Target != "127.0.0.1:19000" {
+		t.Fatalf("expected target 127.0.0.1:19000, got: %s", kn.Target)
+	}
+}
+
+func TestClient_UploadFile_Sha256Mismatch_Rollback(t *testing.T) {
+	var deleteCalled atomic.Bool
+	var deletePath string
+	var deleteLock sync.Mutex
+
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/v1/fs/rm") {
+			deleteLock.Lock()
+			deleteCalled.Store(true)
+			deletePath = r.URL.Query().Get("path")
+			deleteLock.Unlock()
+			rw.WriteHeader(http.StatusOK)
+			_, _ = rw.Write([]byte("DELETED"))
+			return
+		}
+
+		if strings.HasPrefix(r.URL.Path, "/api/v1/fs/upload") {
+			// 故意返回错误的 SHA-256 头部模拟传输篡改/校验不匹配
+			rw.Header().Set("X-File-SHA256", "wrong_hash_11223344556677889900aabbccddeeff")
+			rw.WriteHeader(http.StatusOK)
+			_, _ = rw.Write([]byte("OK"))
+			return
+		}
+
+		rw.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	cli := NewClient()
+	cli.dataDir = t.TempDir()
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "rollback-node", Target: u.Host})
+
+	err := cli.UploadFile("rollback-node", "D:/test/dest.txt", strings.NewReader("sample payload"))
+	if err == nil {
+		t.Fatal("expected error on sha256 mismatch, got nil")
+	}
+	if !strings.Contains(err.Error(), "sha256 checksum mismatch") || !strings.Contains(err.Error(), "remote file deleted") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+
+	if !deleteCalled.Load() {
+		t.Fatal("expected Delete to be called to rollback remote file, but it was not called")
+	}
+	deleteLock.Lock()
+	if deletePath != "D:/test/dest.txt" {
+		t.Fatalf("expected delete path D:/test/dest.txt, got %s", deletePath)
+	}
+	deleteLock.Unlock()
+
+	// 再次测试服务端完全未返回 X-File-SHA256 头部的情况
+	deleteCalled.Store(false)
+	serverNoHash := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/v1/fs/rm") {
+			deleteCalled.Store(true)
+			rw.WriteHeader(http.StatusOK)
+			_, _ = rw.Write([]byte("DELETED"))
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/v1/fs/upload") {
+			// 不返回 X-File-SHA256 头部
+			rw.WriteHeader(http.StatusOK)
+			_, _ = rw.Write([]byte("OK"))
+			return
+		}
+	}))
+	defer serverNoHash.Close()
+
+	uNoHash, _ := url.Parse(serverNoHash.URL)
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "nohash-node", Target: uNoHash.Host})
+	errNoHash := cli.UploadFile("nohash-node", "D:/test/nohash.txt", strings.NewReader("payload"))
+	if errNoHash == nil || !strings.Contains(errNoHash.Error(), "did not return X-File-SHA256 header") {
+		t.Fatalf("expected missing header rollback error, got: %v", errNoHash)
+	}
+	if !deleteCalled.Load() {
+		t.Fatal("expected Delete to be called when worker omits X-File-SHA256 header")
+	}
+}
+
+func TestClient_RelayCopy_Sha256Mismatch_Rollback(t *testing.T) {
+	content := "relay_payload_data"
+	h := sha256.New()
+	h.Write([]byte(content))
+	realHash := hex.EncodeToString(h.Sum(nil))
+
+	var deleteCalled atomic.Bool
+
+	// 1. 模拟目标节点返回错误 Hash
+	srcServer := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		rw.Header().Set("X-File-Size", fmt.Sprintf("%d", len(content)))
+		rw.Header().Set("X-File-SHA256", realHash)
+		rw.WriteHeader(http.StatusOK)
+		_, _ = rw.Write([]byte(content))
+	}))
+	defer srcServer.Close()
+
+	dstServerWrongHash := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/v1/fs/rm") {
+			deleteCalled.Store(true)
+			rw.WriteHeader(http.StatusOK)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/v1/fs/upload") {
+			rw.Header().Set("X-File-SHA256", "tampered_dst_hash")
+			rw.WriteHeader(http.StatusOK)
+			return
+		}
+	}))
+	defer dstServerWrongHash.Close()
+
+	cli := NewClient()
+	cli.dataDir = t.TempDir()
+
+	srcURL, _ := url.Parse(srcServer.URL)
+	dstURL, _ := url.Parse(dstServerWrongHash.URL)
+
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "src-node", Target: srcURL.Host})
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "dst-node", Target: dstURL.Host})
+
+	err := cli.RelayCopy("src-node", "src.txt", "dst-node", "dst.txt")
+	if err == nil || !strings.Contains(err.Error(), "dst file rolled back") {
+		t.Fatalf("expected relay copy mismatch rollback error, got: %v", err)
+	}
+	if !deleteCalled.Load() {
+		t.Fatal("expected Delete to be called on dst worker when dst hash mismatches")
+	}
+
+	// 2. 模拟源节点返回错误 Hash
+	deleteCalled.Store(false)
+	srcServerWrongHash := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		rw.Header().Set("X-File-Size", fmt.Sprintf("%d", len(content)))
+		rw.Header().Set("X-File-SHA256", "wrong_src_hash")
+		rw.WriteHeader(http.StatusOK)
+		_, _ = rw.Write([]byte(content))
+	}))
+	defer srcServerWrongHash.Close()
+
+	dstServerGood := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/v1/fs/rm") {
+			deleteCalled.Store(true)
+			rw.WriteHeader(http.StatusOK)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/v1/fs/upload") {
+			rw.Header().Set("X-File-SHA256", realHash)
+			rw.WriteHeader(http.StatusOK)
+			return
+		}
+	}))
+	defer dstServerGood.Close()
+
+	srcWrongURL, _ := url.Parse(srcServerWrongHash.URL)
+	dstGoodURL, _ := url.Parse(dstServerGood.URL)
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "src-wrong", Target: srcWrongURL.Host})
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "dst-good", Target: dstGoodURL.Host})
+
+	err = cli.RelayCopy("src-wrong", "src.txt", "dst-good", "dst.txt")
+	if err == nil || !strings.Contains(err.Error(), "dst file rolled back") {
+		t.Fatalf("expected relay copy src mismatch rollback error, got: %v", err)
+	}
+	if !deleteCalled.Load() {
+		t.Fatal("expected Delete to be called on dst worker when src hash mismatches")
+	}
+}
+
+func TestClient_LoadKnownNodes_CorruptedJson(t *testing.T) {
+	tempDir := t.TempDir()
+	cli := NewClient()
+	cli.dataDir = tempDir
+
+	nodesFile := filepath.Join(tempDir, "nodes.json")
+	// 写入损坏的非合法 JSON
+	if err := os.WriteFile(nodesFile, []byte("{corrupted-json-data:"), 0644); err != nil {
+		t.Fatalf("write corrupted json failed: %v", err)
+	}
+
+	// 验证加载返回错误且不发生 panic
+	nodes, err := cli.LoadKnownNodes()
+	if err == nil {
+		t.Fatal("expected error on corrupted nodes.json, got nil")
+	}
+	if nodes != nil {
+		t.Fatalf("expected nil nodes on corruption, got: %v", nodes)
+	}
+
+	// 验证 getEffectiveKnownNodes 在账本损坏时向上透传错误
+	effNodes, effErr := cli.getEffectiveKnownNodes()
+	if effErr == nil {
+		t.Fatal("expected error on getEffectiveKnownNodes with corrupted ledger")
+	}
+	if effNodes != nil {
+		t.Fatalf("expected nil effNodes, got: %v", effNodes)
+	}
+}
+
+func TestClient_JoinRemotePath_EdgeCases(t *testing.T) {
+	cases := []struct {
+		base     string
+		rel      string
+		expected string
+	}{
+		{"D:/folder", "sub/file.txt", "D:/folder/sub/file.txt"},
+		{"D:\\folder\\", "\\sub\\file.txt", "D:/folder/sub/file.txt"},
+		{"", "rel/file.txt", "rel/file.txt"},
+		{"/", "rel/file.txt", "/rel/file.txt"},
+		{"/var/data", "", "/var/data"},
+		{"", "", ""},
+		{"/", "", "/"},
+	}
+
+	for _, tc := range cases {
+		got := pathutil.JoinRemotePath(tc.base, tc.rel)
+		if got != tc.expected {
+			t.Errorf("pathutil.JoinRemotePath(%q, %q) = %q, want %q", tc.base, tc.rel, got, tc.expected)
+		}
+	}
+}
+
+// TestClient_RunJob_AutoMemorizeToken 验证显式传入 Token 且派发成功后自动记忆持久化入本地账本
+func TestClient_RunJob_AutoMemorizeToken(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer auto-remember-token-xyz" {
+			http.Error(rw, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if r.URL.Path == "/api/v1/jobs/run" {
+			rw.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(rw).Encode(protocol.JobInfo{
+				ID:     "job-auto-remember",
+				Node:   "new-auto-node",
+				Status: protocol.JobStatusRunning,
+			})
+			return
+		}
+		http.NotFound(rw, r)
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	cli := NewClient()
+	cli.dataDir = t.TempDir()
+
+	// 此时账本中尚未存在该节点
+	nodesBefore, _ := cli.LoadKnownNodes()
+	if _, ok := nodesBefore["new-auto-node"]; ok {
+		t.Fatal("node should not exist in ledger before run")
+	}
+
+	// 派发任务并显式传入 Token
+	job, err := cli.RunJob(protocol.RunJobRequest{
+		Node:    u.Host,
+		Name:    "test-task",
+		Command: "echo ok",
+	}, "auto-remember-token-xyz")
+	if err != nil {
+		t.Fatalf("RunJob failed: %v", err)
+	}
+	if job.ID != "job-auto-remember" {
+		t.Fatalf("unexpected job info: %+v", job)
+	}
+
+	// 验证账本中已自动持久化记忆该节点与 Token
+	nodesAfter, err := cli.LoadKnownNodes()
+	if err != nil {
+		t.Fatalf("LoadKnownNodes failed: %v", err)
+	}
+	kn, ok := nodesAfter[strings.ToLower(u.Host)]
+	if !ok {
+		t.Fatalf("expected node %q to be memorized in ledger, got: %+v", u.Host, nodesAfter)
+	}
+	if kn.Token != "auto-remember-token-xyz" {
+		t.Fatalf("expected memorized token 'auto-remember-token-xyz', got: %q", kn.Token)
+	}
+}
+
+
+

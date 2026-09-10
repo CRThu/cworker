@@ -1,0 +1,10 @@
+# Build output
+/bin/
+*.exe
+
+# Local data & test artifacts
+/.cworker/
+test_data*/
+test_fs*
+*.log
+*.out

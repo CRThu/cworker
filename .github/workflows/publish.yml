@@ -1,0 +1,21 @@
+name: Publish Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+      - run: go build -ldflags="-s -w" -o bin/cw.exe .
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: bin/cw.exe
