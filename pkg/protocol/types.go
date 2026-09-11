@@ -85,6 +85,18 @@ type KillJobRequest struct {
 	JobID string `json:"job_id"`
 }
 
+// CleanJobsRequest 任务与日志清理请求
+type CleanJobsRequest struct {
+	Days int  `json:"days"` // 清理早于多少天的终态任务；0 配合 All 使用
+	All  bool `json:"all"`  // 是否清空所有已终态任务
+}
+
+// CleanJobsResponse 任务与日志清理响应
+type CleanJobsResponse struct {
+	CleanedCount int   `json:"cleaned_count"` // 清理的任务数
+	FreedBytes   int64 `json:"freed_bytes"`   // 释放的磁盘日志大小 (字节)
+}
+
 // KnownNode 客户端本地记忆账本中的节点条目 (Target 包含 host[:port] 与可选的认证 Token)
 type KnownNode struct {
 	Name   string `json:"name"`

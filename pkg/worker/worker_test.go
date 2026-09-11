@@ -1077,3 +1077,210 @@ func TestWorker_TailFile_LargeChunks(t *testing.T) {
 	}
 }
 
+func TestWorker_CleanJobs(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "cw_worker_clean_test_*")
+	if err != nil {
+		t.Fatalf("create temp dir failed: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	w := &Worker{
+		cfg: Config{
+			Name:    "test-node",
+			Port:    19001,
+			DataDir: tempDir,
+		},
+		jobs: make(map[string]*process.ManagedJob),
+	}
+
+	// 1. 无效请求 (既不是 all，days 也是 0) -> 400
+	badBody, _ := json.Marshal(protocol.CleanJobsRequest{Days: 0, All: false})
+	badReq := httptest.NewRequest(http.MethodPost, "/api/v1/jobs/clean", bytes.NewReader(badBody))
+	badRec := httptest.NewRecorder()
+	w.handleCleanJobs(badRec, badReq)
+	if badRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d", badRec.Code)
+	}
+
+	// 2. 派发一个短任务并等待结束
+	runBody, _ := json.Marshal(protocol.RunJobRequest{
+		Name:    "echo-job",
+		Command: "cmd.exe /c echo clean_test_ok",
+	})
+	runReq := httptest.NewRequest(http.MethodPost, "/api/v1/jobs/run", bytes.NewReader(runBody))
+	runRec := httptest.NewRecorder()
+	w.handleRunJob(runRec, runReq)
+	if runRec.Code != http.StatusOK {
+		t.Fatalf("handleRunJob failed: %d", runRec.Code)
+	}
+	var jobInfo protocol.JobInfo
+	_ = json.NewDecoder(runRec.Body).Decode(&jobInfo)
+
+	time.Sleep(400 * time.Millisecond)
+
+	// 确保磁盘目录存在
+	jobDir := filepath.Join(tempDir, "jobs", jobInfo.ID)
+	if _, err := os.Stat(jobDir); os.IsNotExist(err) {
+		t.Fatalf("expected job dir to exist: %s", jobDir)
+	}
+
+	// 3. 执行 All 清理
+	cleanBody, _ := json.Marshal(protocol.CleanJobsRequest{All: true})
+	cleanReq := httptest.NewRequest(http.MethodPost, "/api/v1/jobs/clean", bytes.NewReader(cleanBody))
+	cleanRec := httptest.NewRecorder()
+	w.handleCleanJobs(cleanRec, cleanReq)
+	if cleanRec.Code != http.StatusOK {
+		t.Fatalf("handleCleanJobs failed: %d", cleanRec.Code)
+	}
+
+	var cleanResp protocol.CleanJobsResponse
+	_ = json.NewDecoder(cleanRec.Body).Decode(&cleanResp)
+	if cleanResp.CleanedCount != 1 {
+		t.Fatalf("expected 1 cleaned job, got %d", cleanResp.CleanedCount)
+	}
+
+	// 验证内存已删除
+	w.mu.RLock()
+	_, exists := w.jobs[jobInfo.ID]
+	w.mu.RUnlock()
+	if exists {
+		t.Fatal("expected job to be deleted from memory map")
+	}
+
+	// 验证磁盘目录已删除
+	if _, err := os.Stat(jobDir); !os.IsNotExist(err) {
+		t.Fatal("expected job disk directory to be removed")
+	}
+}
+
+func TestWorker_CleanJobs_ProtectionAndRetention(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "cw_worker_clean_retention_*")
+	if err != nil {
+		t.Fatalf("create temp dir failed: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	w := &Worker{
+		cfg: Config{
+			Name:    "test-node",
+			Port:    19002,
+			DataDir: tempDir,
+		},
+		jobs: make(map[string]*process.ManagedJob),
+	}
+
+	// 1. 派发一个长期运行的活跃任务 (RUNNING)
+	runBody, _ := json.Marshal(protocol.RunJobRequest{
+		Name:    "running-task",
+		Command: "ping 127.0.0.1 -n 30",
+	})
+	runReq := httptest.NewRequest(http.MethodPost, "/api/v1/jobs/run", bytes.NewReader(runBody))
+	runRec := httptest.NewRecorder()
+	w.handleRunJob(runRec, runReq)
+	if runRec.Code != http.StatusOK {
+		t.Fatalf("handleRunJob failed: %d", runRec.Code)
+	}
+	var runningJob protocol.JobInfo
+	_ = json.NewDecoder(runRec.Body).Decode(&runningJob)
+
+	// 确保运行任务退出时一定被终止
+	defer func() {
+		killBody, _ := json.Marshal(protocol.KillJobRequest{JobID: runningJob.ID})
+		killReq := httptest.NewRequest(http.MethodPost, "/api/v1/jobs/kill", bytes.NewReader(killBody))
+		killRec := httptest.NewRecorder()
+		w.handleKillJob(killRec, killReq)
+	}()
+
+	// 2. 派发一个立即结束的任务 (近期任务)
+	runBody2, _ := json.Marshal(protocol.RunJobRequest{
+		Name:    "recent-task",
+		Command: "cmd.exe /c echo recent_done",
+	})
+	runReq2 := httptest.NewRequest(http.MethodPost, "/api/v1/jobs/run", bytes.NewReader(runBody2))
+	runRec2 := httptest.NewRecorder()
+	w.handleRunJob(runRec2, runReq2)
+	var recentJob protocol.JobInfo
+	_ = json.NewDecoder(runRec2.Body).Decode(&recentJob)
+
+	// 等待 recentJob 执行完成
+	time.Sleep(400 * time.Millisecond)
+
+	// 3. 执行 days=7 清理 (保留最近 7 天任务)
+	cleanBody7, _ := json.Marshal(protocol.CleanJobsRequest{Days: 7})
+	cleanReq7 := httptest.NewRequest(http.MethodPost, "/api/v1/jobs/clean", bytes.NewReader(cleanBody7))
+	cleanRec7 := httptest.NewRecorder()
+	w.handleCleanJobs(cleanRec7, cleanReq7)
+	if cleanRec7.Code != http.StatusOK {
+		t.Fatalf("clean days=7 failed: %d", cleanRec7.Code)
+	}
+	var resp7 protocol.CleanJobsResponse
+	_ = json.NewDecoder(cleanRec7.Body).Decode(&resp7)
+	if resp7.CleanedCount != 0 {
+		t.Fatalf("expected 0 cleaned jobs under days=7, got %d", resp7.CleanedCount)
+	}
+
+	// 4. 执行 all=true 清理 -> 必须清理 recent-task，但绝对严禁清理 running-task！
+	cleanBodyAll, _ := json.Marshal(protocol.CleanJobsRequest{All: true})
+	cleanReqAll := httptest.NewRequest(http.MethodPost, "/api/v1/jobs/clean", bytes.NewReader(cleanBodyAll))
+	cleanRecAll := httptest.NewRecorder()
+	w.handleCleanJobs(cleanRecAll, cleanReqAll)
+	if cleanRecAll.Code != http.StatusOK {
+		t.Fatalf("clean all failed: %d", cleanRecAll.Code)
+	}
+	var respAll protocol.CleanJobsResponse
+	_ = json.NewDecoder(cleanRecAll.Body).Decode(&respAll)
+	if respAll.CleanedCount != 1 {
+		t.Fatalf("expected 1 cleaned job (recent-task), got %d", respAll.CleanedCount)
+	}
+
+	// 验证 running 任务严格受到保护
+	w.mu.RLock()
+	activeJob, exists := w.jobs[runningJob.ID]
+	w.mu.RUnlock()
+	if !exists {
+		t.Fatal("CRITICAL: running job was evicted from memory!")
+	}
+	if activeJob.GetInfo().Status != protocol.JobStatusRunning {
+		t.Fatalf("running job status mutated unexpectedly: %s", activeJob.GetInfo().Status)
+	}
+	runningDir := filepath.Join(tempDir, "jobs", runningJob.ID)
+	if _, err := os.Stat(runningDir); os.IsNotExist(err) {
+		t.Fatal("CRITICAL: running job disk directory was deleted!")
+	}
+}
+
+func TestWorker_RefreshToken(t *testing.T) {
+	tempDir := t.TempDir()
+
+	// 1. 初始化生成一个 Token
+	t1, err := LoadOrCreateToken(tempDir)
+	if err != nil {
+		t.Fatalf("LoadOrCreateToken failed: %v", err)
+	}
+	if len(t1) != 64 {
+		t.Fatalf("expected 64-char hex token, got %d chars: %s", len(t1), t1)
+	}
+
+	// 2. 轮换刷新 Token
+	t2, err := RefreshToken(tempDir)
+	if err != nil {
+		t.Fatalf("RefreshToken failed: %v", err)
+	}
+	if len(t2) != 64 {
+		t.Fatalf("expected 64-char hex refreshed token, got %d chars", len(t2))
+	}
+	if t1 == t2 {
+		t.Fatal("refreshed token must be distinct from original token")
+	}
+
+	// 3. 再次加载验证落盘一致性
+	loaded, err := LoadOrCreateToken(tempDir)
+	if err != nil {
+		t.Fatalf("LoadOrCreateToken after refresh failed: %v", err)
+	}
+	if loaded != t2 {
+		t.Fatalf("expected loaded token %s, got %s", t2, loaded)
+	}
+}
+
+

@@ -8,3 +8,5 @@ test_data*/
 test_fs*
 *.log
 *.out
+coverage*
+*.html

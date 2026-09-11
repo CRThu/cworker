@@ -162,6 +162,7 @@ func (w *Worker) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/v1/jobs/run", w.authMiddleware(w.handleRunJob))
 	mux.HandleFunc("/api/v1/jobs/kill", w.authMiddleware(w.handleKillJob))
 	mux.HandleFunc("/api/v1/jobs/ps", w.authMiddleware(w.handleListJobs))
+	mux.HandleFunc("/api/v1/jobs/clean", w.authMiddleware(w.handleCleanJobs))
 	mux.HandleFunc("/api/v1/jobs/logs", w.authMiddleware(w.handleGetLogs))
 	mux.HandleFunc("/api/v1/jobs/stream", w.authMiddleware(w.handleStreamLogs))
 
@@ -341,6 +342,78 @@ func (w *Worker) handleListJobs(rw http.ResponseWriter, r *http.Request) {
 
 	rw.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(rw).Encode(list)
+}
+
+func (w *Worker) handleCleanJobs(rw http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(rw, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req protocol.CleanJobsRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(rw, "bad request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if !req.All && req.Days <= 0 {
+		http.Error(rw, "bad request: either all must be true or days must be greater than 0", http.StatusBadRequest)
+		return
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	cleanedCount := 0
+	var freedBytes int64
+
+	now := time.Now()
+	for jobID, job := range w.jobs {
+		info := job.GetInfo()
+		// 严禁清理正在运行中的任务
+		if info.Status == protocol.JobStatusRunning {
+			continue
+		}
+
+		shouldClean := false
+		if req.All {
+			shouldClean = true
+		} else if req.Days > 0 && info.EndTime != nil {
+			if now.Sub(*info.EndTime) >= time.Duration(req.Days)*24*time.Hour {
+				shouldClean = true
+			}
+		}
+
+		if shouldClean {
+			delete(w.jobs, jobID)
+			cleanedCount++
+
+			// 同步删除磁盘上的 jobs/<jobID> 日志文件夹
+			jobDir := filepath.Join(w.cfg.DataDir, "jobs", jobID)
+			freedBytes += getDirSize(jobDir)
+			_ = os.RemoveAll(jobDir)
+		}
+	}
+
+	resp := protocol.CleanJobsResponse{
+		CleanedCount: cleanedCount,
+		FreedBytes:   freedBytes,
+	}
+
+	rw.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(rw).Encode(resp)
+}
+
+// getDirSize 统计指定目录下的所有文件总大小 (字节)
+func getDirSize(path string) int64 {
+	var size int64
+	_ = filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+		if err == nil && info != nil && !info.IsDir() {
+			size += info.Size()
+		}
+		return nil
+	})
+	return size
 }
 
 // isValidJobID 校验任务 ID 是否合法，阻断路径遍历与特殊字符注入

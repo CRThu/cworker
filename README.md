@@ -157,9 +157,11 @@ cw kill job-58a90e40
 | 命令 | 说明 |
 | :--- | :--- |
 | `cw run [-n node] [--dir dir] [--name name] [--token xxx] <cmd>` | 异步派发新任务并立即返回 `job-<hex>` 句柄；若携带 `--token` 则在鉴权成功后自动记忆更新至本地账本 |
-| `cw ps` | 并发拉取全网所有已知节点的任务运行状态、资源占用与命令 |
-| `cw logs <job_id> [-f] [-n lines]` | 查看任务日志；带 `-f` 实时跟随，`-n` 截取末尾行数（默认 100） |
+| `cw ps [-n node] [--all] [--limit <n>]` | 拉取全网或指定节点的任务运行状态与资源占用；RUNNING 任务优先置顶，默认展示最近 20 条，老任务自动截断省略，`--all` 展开全部 |
+| `cw clean <--days <n> \| --all> [-n node] [-y]` | 显式清理已结束任务记录与磁盘 `output.log`；支持按天数筛选或全量清理已完成任务；严格保护 RUNNING 任务不受影响 |
 | `cw kill <job_id>` | 终止任务并销毁整棵子进程树（基于 Win32 Job Object） |
+| `cw logs <job_id> [-f] [-n lines]` | 查看任务日志；带 `-f` 实时跟随，`-n` 截取末尾行数（默认 100） |
+| `cw update [-y] [--check] [--force] [--proxy <url>] [--mirror <url>]` | 从官方 GitHub Releases (`crthu/cworker`) 手动拉包自升级；自动感知系统代理与环境变量；有 RUNNING 活跃任务时严格报错拦截（除非 `--force`）；原地 Rename-Replace 无锁替换并重启服务 |
 | `cw version` / `cw -v` | 查看当前软件版本号、构建日期与 Go 运行环境 |
 
 ### 3. 跨机与本地文件治理
@@ -220,7 +222,7 @@ cworker/
 │   ├── logstream/        # WebSocket 广播式日志流分发
 │   ├── pathutil/         # Windows 物理路径与 node:path 强类型智能归一化
 │   └── protocol/         # 核心通信协议契约 (SSOT)
-├── skills/cworker/       # AI Agent 本地技能定义
+├── .agents/skills/cworker/ # AI Agent 技能定义
 ├── test/                 # 集群全拓扑、高并发与故障注入原生集成测试套件
 └── build.bat             # 一键单二进制编译与端到端集成测试脚本
 ```
@@ -260,7 +262,7 @@ build.bat all
 
 仓库本地内置了供 AI Agent（如 Claude Code、OpenCode、Cursor、Codex、Antigravity 等）直接使用的技能定义与调用约束：
 
-* 📘 **技能定义**：[`skills/cworker/SKILL.md`](skills/cworker/SKILL.md)（与 [`.agents/skills/cworker/SKILL.md`](.agents/skills/cworker/SKILL.md) 保持一致）
+* 📘 **技能定义**：[`.agents/skills/cworker/SKILL.md`](.agents/skills/cworker/SKILL.md)
 * 📜 **调用约束与避坑准则**：[AGENTS.md](AGENTS.md)（含任务异步轮询规范、`cw rm -r -y` 高危防交互死锁说明）
 
 ---

@@ -1555,6 +1555,137 @@ func TestClient_LocalOperations(t *testing.T) {
 	}
 }
 
+func TestClient_CleanJobs(t *testing.T) {
+	var requestedClean protocol.CleanJobsRequest
+	var requestCount int
+	var mu sync.Mutex
+
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requestCount++
+		mu.Unlock()
+
+		if r.URL.Path != "/api/v1/jobs/clean" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer valid-token" {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		_ = json.NewDecoder(r.Body).Decode(&requestedClean)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(protocol.CleanJobsResponse{
+			CleanedCount: 2,
+			FreedBytes:   2048,
+		})
+	}))
+	defer mockServer.Close()
+
+	tempDir := t.TempDir()
+	cli := NewClient()
+	cli.dataDir = tempDir
+	_ = cli.SaveKnownNode(protocol.KnownNode{
+		Name:   "node-clean",
+		Target: strings.TrimPrefix(mockServer.URL, "http://"),
+		Token:  "valid-token",
+	})
+
+	// 1. 定向节点成功清理
+	resp, err := cli.CleanJobs("node-clean", 3, false)
+	if err != nil {
+		t.Fatalf("CleanJobs targeted failed: %v", err)
+	}
+	if requestedClean.Days != 3 || requestedClean.All != false {
+		t.Fatalf("unexpected request payload: %+v", requestedClean)
+	}
+	if nodeResp, ok := resp["node-clean"]; !ok || nodeResp.CleanedCount != 2 || nodeResp.FreedBytes != 2048 {
+		t.Fatalf("unexpected clean response: %+v", resp)
+	}
+
+	// 2. 全集群清理
+	respAll, err := cli.CleanJobs("", 0, true)
+	if err != nil {
+		t.Fatalf("CleanJobs all failed: %v", err)
+	}
+	if nodeResp, ok := respAll["node-clean"]; !ok || nodeResp.CleanedCount != 2 {
+		t.Fatalf("unexpected cluster clean response: %+v", respAll)
+	}
+
+	// 3. 鉴权失败测试
+	_ = cli.SaveKnownNode(protocol.KnownNode{
+		Name:   "node-badauth",
+		Target: strings.TrimPrefix(mockServer.URL, "http://"),
+		Token:  "wrong-token",
+	})
+	if _, err := cli.CleanJobs("node-badauth", 0, true); err == nil {
+		t.Fatal("expected error on 401 unauthorized")
+	}
+
+	// 4. 不存在的节点
+	if _, err := cli.CleanJobs("node-nonexistent", 0, true); err == nil {
+		t.Fatal("expected error on nonexistent node")
+	}
+}
+
+func TestClient_ListJobs_TargetFilter(t *testing.T) {
+	var node1Hits, node2Hits atomic.Int32
+
+	s1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		node1Hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode([]protocol.JobInfo{
+			{ID: "job-node1", Name: "task1", Status: protocol.JobStatusRunning},
+		})
+	}))
+	defer s1.Close()
+
+	s2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		node2Hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode([]protocol.JobInfo{
+			{ID: "job-node2", Name: "task2", Status: protocol.JobStatusCompleted},
+		})
+	}))
+	defer s2.Close()
+
+	tempDir := t.TempDir()
+	cli := NewClient()
+	cli.dataDir = tempDir
+	_ = cli.SaveKnownNode(protocol.KnownNode{
+		Name:   "node-1",
+		Target: strings.TrimPrefix(s1.URL, "http://"),
+		Token:  "t1",
+	})
+	_ = cli.SaveKnownNode(protocol.KnownNode{
+		Name:   "node-2",
+		Target: strings.TrimPrefix(s2.URL, "http://"),
+		Token:  "t2",
+	})
+
+	// 1. 仅定向查询 node-1
+	jobs1, err := cli.ListJobs("node-1")
+	if err != nil {
+		t.Fatalf("ListJobs node-1 failed: %v", err)
+	}
+	if len(jobs1) != 1 || jobs1[0].ID != "job-node1" {
+		t.Fatalf("unexpected jobs returned for node-1: %+v", jobs1)
+	}
+	if node1Hits.Load() != 1 || node2Hits.Load() != 0 {
+		t.Fatalf("expected only node-1 to be hit, got node1=%d, node2=%d", node1Hits.Load(), node2Hits.Load())
+	}
+
+	// 2. 全集群查询
+	jobsAll, err := cli.ListJobs()
+	if err != nil {
+		t.Fatalf("ListJobs all failed: %v", err)
+	}
+	if len(jobsAll) != 2 {
+		t.Fatalf("expected 2 jobs from cluster, got %d", len(jobsAll))
+	}
+}
+
+
 
 
 

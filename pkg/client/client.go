@@ -362,8 +362,39 @@ func (c *Client) RunJob(req protocol.RunJobRequest, explicitToken string) (*prot
 	return &info, nil
 }
 
-// ListJobs 并发查询所有已知在线 Worker 的任务列表
-func (c *Client) ListJobs() ([]protocol.JobInfo, error) {
+// ListJobs 查询指定节点或全集群所有已知在线 Worker 的任务列表 (targetNode 可选)
+func (c *Client) ListJobs(targetNode ...string) ([]protocol.JobInfo, error) {
+	node := ""
+	if len(targetNode) > 0 {
+		node = targetNode[0]
+	}
+
+	if node != "" {
+		rt, err := c.ResolveWorker(node, "")
+		if err != nil {
+			return nil, err
+		}
+		resp, err := c.doRequest(rt, http.MethodGet, "/api/v1/jobs/ps", nil)
+		if err != nil {
+			return nil, fmt.Errorf("list jobs from node '%s' failed: %w", node, err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			return nil, fmt.Errorf("list jobs from node '%s' failed (%d): %s", node, resp.StatusCode, strings.TrimSpace(string(body)))
+		}
+
+		var jobs []protocol.JobInfo
+		if err := json.NewDecoder(resp.Body).Decode(&jobs); err != nil {
+			return nil, err
+		}
+		sort.Slice(jobs, func(i, j int) bool {
+			return jobs[i].StartTime.After(jobs[j].StartTime)
+		})
+		return jobs, nil
+	}
+
 	knownNodes, err := c.getEffectiveKnownNodes()
 	if err != nil {
 		return nil, err
@@ -375,9 +406,9 @@ func (c *Client) ListJobs() ([]protocol.JobInfo, error) {
 
 	for _, kn := range knownNodes {
 		wg.Add(1)
-		go func(node protocol.KnownNode) {
+		go func(kn protocol.KnownNode) {
 			defer wg.Done()
-			rt, err := c.ResolveWorker(node.Name, node.Token)
+			rt, err := c.ResolveWorker(kn.Name, kn.Token)
 			if err != nil {
 				return
 			}
@@ -449,6 +480,79 @@ func (c *Client) KillJob(jobID string) (*protocol.JobInfo, error) {
 		return foundInfo, nil
 	}
 	return nil, fmt.Errorf("job '%s' not found across known workers", jobID)
+}
+
+// CleanJobs 向指定节点或全集群在线节点下发任务与日志清理指令
+func (c *Client) CleanJobs(targetNode string, days int, all bool) (map[string]protocol.CleanJobsResponse, error) {
+	reqData, err := json.Marshal(protocol.CleanJobsRequest{
+		Days: days,
+		All:  all,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	results := make(map[string]protocol.CleanJobsResponse)
+	var mu sync.Mutex
+
+	if targetNode != "" {
+		rt, err := c.ResolveWorker(targetNode, "")
+		if err != nil {
+			return nil, err
+		}
+		resp, err := c.doRequest(rt, http.MethodPost, "/api/v1/jobs/clean", bytes.NewReader(reqData))
+		if err != nil {
+			return nil, fmt.Errorf("clean jobs on node %s failed: %w", targetNode, err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			return nil, fmt.Errorf("clean jobs on node %s failed (%d): %s", targetNode, resp.StatusCode, strings.TrimSpace(string(body)))
+		}
+
+		var cleanResp protocol.CleanJobsResponse
+		if err := json.NewDecoder(resp.Body).Decode(&cleanResp); err != nil {
+			return nil, err
+		}
+		results[rt.Name] = cleanResp
+		return results, nil
+	}
+
+	// 全集群并发清理
+	knownNodes, err := c.getEffectiveKnownNodes()
+	if err != nil {
+		return nil, err
+	}
+
+	var wg sync.WaitGroup
+	for _, kn := range knownNodes {
+		wg.Add(1)
+		go func(node protocol.KnownNode) {
+			defer wg.Done()
+			rt, err := c.ResolveWorker(node.Name, node.Token)
+			if err != nil {
+				return
+			}
+			resp, err := c.doRequest(rt, http.MethodPost, "/api/v1/jobs/clean", bytes.NewReader(reqData))
+			if err != nil {
+				return
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode == http.StatusOK {
+				var cleanResp protocol.CleanJobsResponse
+				if err := json.NewDecoder(resp.Body).Decode(&cleanResp); err == nil {
+					mu.Lock()
+					results[rt.Name] = cleanResp
+					mu.Unlock()
+				}
+			}
+		}(kn)
+	}
+	wg.Wait()
+
+	return results, nil
 }
 
 // GetLogs 获取日志

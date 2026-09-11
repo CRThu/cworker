@@ -15,7 +15,19 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: 'go.mod'
-      - run: go build -ldflags="-s -w" -o bin/cw.exe .
-      - uses: softprops/action-gh-release@v2
+      - name: Build Binary
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path bin
+          go build -ldflags="-s -w" -o bin/cw.exe .
+      - name: Generate SHA-256 Checksum
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -Algorithm SHA256 bin/cw.exe).Hash.ToLower()
+          "$hash  cw.exe" | Set-Content -Path bin/cw.exe.sha256 -Encoding utf8
+      - name: Upload Release Assets
+        uses: softprops/action-gh-release@v2
         with:
-          files: bin/cw.exe
+          files: |
+            bin/cw.exe
+            bin/cw.exe.sha256

@@ -19,6 +19,7 @@ import (
 
 	"cworker/pkg/client"
 	"cworker/pkg/protocol"
+	"cworker/pkg/updater"
 )
 
 func TestCmd_Show(t *testing.T) {
@@ -712,3 +713,266 @@ func TestCmd_CpCLI_EdgeCases(t *testing.T) {
 		t.Fatalf("expected omitting directory error, got: %v", err)
 	}
 }
+
+func TestCmd_Ps_SortingAndTruncation(t *testing.T) {
+	now := time.Now()
+	jobs := []protocol.JobInfo{
+		{ID: "job-1", Status: protocol.JobStatusCompleted, StartTime: now.Add(-10 * time.Minute)},
+		{ID: "job-2", Status: protocol.JobStatusRunning, StartTime: now.Add(-2 * time.Minute)},
+		{ID: "job-3", Status: protocol.JobStatusCompleted, StartTime: now.Add(-1 * time.Minute)},
+		{ID: "job-4", Status: protocol.JobStatusRunning, StartTime: now.Add(-5 * time.Minute)},
+	}
+
+	sortJobsForDisplay(jobs)
+
+	// RUNNING 状态必须排在前面
+	if jobs[0].Status != protocol.JobStatusRunning || jobs[1].Status != protocol.JobStatusRunning {
+		t.Fatalf("expected first two jobs to be RUNNING, got: %s, %s", jobs[0].Status, jobs[1].Status)
+	}
+	// 在 RUNNING 中，较新的 job-2 (2分钟前) 排在较旧的 job-4 (5分钟前) 前面
+	if jobs[0].ID != "job-2" || jobs[1].ID != "job-4" {
+		t.Fatalf("expected job-2 then job-4, got: %s, %s", jobs[0].ID, jobs[1].ID)
+	}
+	// 在已完成中，较新的 job-3 (1分钟前) 排在较旧的 job-1 (10分钟前) 前面
+	if jobs[2].ID != "job-3" || jobs[3].ID != "job-1" {
+		t.Fatalf("expected job-3 then job-1, got: %s, %s", jobs[2].ID, jobs[3].ID)
+	}
+}
+
+func TestCmd_Clean_Validation(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv("USERPROFILE", tempDir)
+
+	// 未传 --days 且未传 --all 时应报错
+	cleanDays = 0
+	cleanAll = false
+	err := cleanCmd.RunE(cleanCmd, []string{})
+	if err == nil {
+		t.Fatal("expected error when neither --days nor --all is specified")
+	}
+	if !strings.Contains(err.Error(), "must specify either --days") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+}
+
+func TestCmd_Clean_ExecutionFlow(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv("USERPROFILE", tempDir)
+
+	var cleanCalled atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/jobs/clean" {
+			cleanCalled.Store(true)
+			rw.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(rw).Encode(protocol.CleanJobsResponse{
+				CleanedCount: 3,
+				FreedBytes:   1024 * 1024,
+			})
+			return
+		}
+		rw.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	cli := client.NewClient()
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "clean-node", Target: u.Host})
+
+	// 1. 测试 -y 自动确认全量清理
+	cleanCalled.Store(false)
+	cleanAll = true
+	cleanDays = 0
+	cleanNode = "clean-node"
+	cleanYes = true
+
+	out, err := captureStdout(func() error {
+		return cleanCmd.RunE(cleanCmd, []string{})
+	})
+	if err != nil {
+		t.Fatalf("clean -y failed: %v", err)
+	}
+	if !cleanCalled.Load() {
+		t.Fatal("clean endpoint was not called")
+	}
+	if !strings.Contains(out, "Cleaned 3 finished jobs") {
+		t.Fatalf("unexpected output: %s", out)
+	}
+
+	// 2. 测试交互式取消 (用户输入 n)
+	cleanCalled.Store(false)
+	cleanYes = false
+	cleanAll = true
+
+	oldStdin := os.Stdin
+	rPipe, wPipe, _ := os.Pipe()
+	os.Stdin = rPipe
+	_, _ = wPipe.Write([]byte("n\n"))
+	_ = wPipe.Close()
+
+	outCancel, errCancel := captureStdout(func() error {
+		return cleanCmd.RunE(cleanCmd, []string{})
+	})
+	os.Stdin = oldStdin
+
+	if errCancel != nil {
+		t.Fatalf("clean cancel failed: %v", errCancel)
+	}
+	if cleanCalled.Load() {
+		t.Fatal("clean should NOT have been called when user entered n")
+	}
+	if !strings.Contains(outCancel, "Operation canceled") {
+		t.Fatalf("expected 'Operation canceled', got: %s", outCancel)
+	}
+}
+
+func TestCmd_Ps_ExecutionFlow(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv("USERPROFILE", tempDir)
+
+	// 构造 25 个模拟任务
+	var mockJobs []protocol.JobInfo
+	for i := 0; i < 25; i++ {
+		st := protocol.JobStatusCompleted
+		if i == 0 {
+			st = protocol.JobStatusRunning
+		}
+		mockJobs = append(mockJobs, protocol.JobInfo{
+			ID:      fmt.Sprintf("job-%02d", i),
+			Name:    fmt.Sprintf("task-%d", i),
+			Status:  st,
+			Node:    "ps-node",
+			Command: "echo ok",
+		})
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/jobs/ps" {
+			rw.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(rw).Encode(mockJobs)
+			return
+		}
+		rw.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	cli := client.NewClient()
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "ps-node", Target: u.Host})
+
+	// 1. 默认查询 (limit 20) -> 触发省略提示
+	psNode = "ps-node"
+	psAll = false
+	psLimit = 20
+
+	out, err := captureStdout(func() error {
+		return psCmd.RunE(psCmd, []string{})
+	})
+	if err != nil {
+		t.Fatalf("psCmd failed: %v", err)
+	}
+	if !strings.Contains(out, "omitted") {
+		t.Fatalf("expected truncation note in output, got: %s", out)
+	}
+	if !strings.Contains(out, "RUNNING") {
+		t.Fatalf("expected running job in output, got: %s", out)
+	}
+
+	// 2. 带 --all 查询 -> 不省略
+	psAll = true
+	outAll, err := captureStdout(func() error {
+		return psCmd.RunE(psCmd, []string{})
+	})
+	if err != nil {
+		t.Fatalf("ps --all failed: %v", err)
+	}
+	if strings.Contains(outAll, "omitted") {
+		t.Fatalf("expected no truncation note with --all, got: %s", outAll)
+	}
+}
+
+func TestCmd_Update_ExecutionFlow(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv("USERPROFILE", tempDir)
+
+	mockRelease := updater.ReleaseInfo{
+		TagName: "v9.9.9",
+		Body:    "Bug fixes and improvements",
+		Assets: []updater.ReleaseAsset{
+			{Name: "cw.exe", Size: 2 * 1024 * 1024, BrowserDownloadURL: "http://example.com/cw.exe"},
+		},
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "releases/latest") {
+			rw.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(rw).Encode(mockRelease)
+			return
+		}
+		rw.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	// 1. 测试 --check 模式 (检测到有新版本但未触发下载)
+	origVer := Version
+	defer func() { Version = origVer }()
+
+	updateCheck = true
+	updateYes = false
+	updateForce = false
+	updateMirror = server.URL
+	updateProxy = ""
+
+	out, err := captureStdout(func() error {
+		return updateCmd.RunE(updateCmd, []string{})
+	})
+	if err != nil {
+		t.Fatalf("update --check failed: %v", err)
+	}
+	if !strings.Contains(out, "New release v9.9.9 is available") {
+		t.Fatalf("expected new release notice, got: %s", out)
+	}
+
+	// 2. 测试版本已最新
+	updateCheck = false
+	Version = "9.9.9"
+	outLatest, errLatest := captureStdout(func() error {
+		return updateCmd.RunE(updateCmd, []string{})
+	})
+	if errLatest != nil {
+		t.Fatalf("update when up to date failed: %v", errLatest)
+	}
+	if !strings.Contains(outLatest, "already up to date") {
+		t.Fatalf("expected already up to date, got: %s", outLatest)
+	}
+}
+
+func TestCmd_ExitErrorAndFormatBytes(t *testing.T) {
+	// 1. ExitError
+	err := &ExitError{Code: 42, Msg: "custom fatal error"}
+	if err.ExitCode() != 42 {
+		t.Fatalf("expected code 42, got: %d", err.ExitCode())
+	}
+	if err.Error() != "custom fatal error" {
+		t.Fatalf("expected msg 'custom fatal error', got: %s", err.Error())
+	}
+
+	// 2. formatBytes across all scale boundaries
+	cases := []struct {
+		bytes    int64
+		expected string
+	}{
+		{500, "500 B"},
+		{2048, "2.0 KB"},
+		{5 * 1024 * 1024, "5.0 MB"},
+		{3 * 1024 * 1024 * 1024, "3.00 GB"},
+	}
+	for _, c := range cases {
+		got := formatBytes(c.bytes)
+		if got != c.expected {
+			t.Errorf("formatBytes(%d) = %s; expected %s", c.bytes, got, c.expected)
+		}
+	}
+}
+
+
+

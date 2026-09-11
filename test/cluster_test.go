@@ -437,16 +437,17 @@ func TestCluster_ConcurrencyStress_NoDeadlock(t *testing.T) {
 		Token:  w.Token(),
 	})
 
-	var wg sync.WaitGroup
+	var dispatchWg sync.WaitGroup
+	var queryWg sync.WaitGroup
 	var activeJobIDs sync.Map
 	var dispatchErrors atomic.Int64
 	var queryErrors atomic.Int64
 
 	// 1. 并发派发任务 (10 个 Goroutine)
 	for i := 0; i < 10; i++ {
-		wg.Add(1)
+		dispatchWg.Add(1)
 		go func(idx int) {
-			defer wg.Done()
+			defer dispatchWg.Done()
 			job, err := cli.RunJob(protocol.RunJobRequest{
 				Node:    "stress-node",
 				Name:    fmt.Sprintf("stress-job-%d", idx),
@@ -462,9 +463,9 @@ func TestCluster_ConcurrencyStress_NoDeadlock(t *testing.T) {
 
 	// 2. 同时并发轮询 ps 与 nodes (10 个 Goroutine)
 	for i := 0; i < 10; i++ {
-		wg.Add(1)
+		queryWg.Add(1)
 		go func() {
-			defer wg.Done()
+			defer queryWg.Done()
 			for round := 0; round < 5; round++ {
 				if _, err := cli.ListJobs(); err != nil {
 					queryErrors.Add(1)
@@ -477,21 +478,23 @@ func TestCluster_ConcurrencyStress_NoDeadlock(t *testing.T) {
 		}()
 	}
 
-	// 等待任务全部成功派发并注册
-	time.Sleep(200 * time.Millisecond)
+	// 等待任务全部成功派发并进入运行态
+	dispatchWg.Wait()
 
-	// 3. 同时并发 Kill 已经派发的任务
+	// 3. 同时并发 Kill 已经派发的全部任务
+	var killWg sync.WaitGroup
 	activeJobIDs.Range(func(key, value any) bool {
 		jobID := key.(string)
-		wg.Add(1)
+		killWg.Add(1)
 		go func(jID string) {
-			defer wg.Done()
+			defer killWg.Done()
 			_, _ = cli.KillJob(jID)
 		}(jobID)
 		return true
 	})
 
-	wg.Wait()
+	killWg.Wait()
+	queryWg.Wait()
 
 	if dispatchErrors.Load() > 0 {
 		t.Fatalf("encountered %d dispatch errors under concurrency stress", dispatchErrors.Load())
@@ -517,7 +520,7 @@ func TestCluster_ConcurrencyStress_NoDeadlock(t *testing.T) {
 	}
 
 	// 等待所有后台被 kill 的进程完全退出并释放 Windows 日志文件锁
-	time.Sleep(400 * time.Millisecond)
+	time.Sleep(800 * time.Millisecond)
 	cancel()
 	time.Sleep(100 * time.Millisecond)
 }
@@ -601,3 +604,160 @@ func (r *brokenStreamReader) Read(p []byte) (n int, err error) {
 	}
 	return n, nil
 }
+
+// TestCluster_CleanJobs_EndToEnd 验证端到端多节点任务与磁盘物理日志清理及运行态任务保护
+func TestCluster_CleanJobs_EndToEnd(t *testing.T) {
+	portAlpha := getFreePort(t)
+	portBeta := getFreePort(t)
+
+	dataAlpha := t.TempDir()
+	dataBeta := t.TempDir()
+
+	wAlpha, err := worker.NewWorker(worker.Config{
+		Name:     "clean-alpha",
+		BindAddr: "127.0.0.1",
+		Port:     portAlpha,
+		DataDir:  dataAlpha,
+	})
+	if err != nil {
+		t.Fatalf("NewWorker alpha failed: %v", err)
+	}
+
+	wBeta, err := worker.NewWorker(worker.Config{
+		Name:     "clean-beta",
+		BindAddr: "127.0.0.1",
+		Port:     portBeta,
+		DataDir:  dataBeta,
+	})
+	if err != nil {
+		t.Fatalf("NewWorker beta failed: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() { _ = wAlpha.Start(ctx) }()
+	go func() { _ = wBeta.Start(ctx) }()
+	time.Sleep(200 * time.Millisecond)
+
+	cliDataDir := t.TempDir()
+	t.Setenv("USERPROFILE", cliDataDir)
+	cli := client.NewClient()
+
+	_ = cli.SaveKnownNode(protocol.KnownNode{
+		Name:   "clean-alpha",
+		Target: fmt.Sprintf("127.0.0.1:%d", portAlpha),
+		Token:  wAlpha.Token(),
+	})
+	_ = cli.SaveKnownNode(protocol.KnownNode{
+		Name:   "clean-beta",
+		Target: fmt.Sprintf("127.0.0.1:%d", portBeta),
+		Token:  wBeta.Token(),
+	})
+
+	// 1. 在 clean-alpha 上派发一个短任务和长运行任务
+	jobShortAlpha, err := cli.RunJob(protocol.RunJobRequest{
+		Node:    "clean-alpha",
+		Name:    "alpha-short",
+		Command: "cmd.exe /c echo alpha_done",
+	}, "")
+	if err != nil {
+		t.Fatalf("dispatch alpha-short failed: %v", err)
+	}
+
+	jobLongAlpha, err := cli.RunJob(protocol.RunJobRequest{
+		Node:    "clean-alpha",
+		Name:    "alpha-long-running",
+		Command: "ping 127.0.0.1 -n 30",
+	}, "")
+	if err != nil {
+		t.Fatalf("dispatch alpha-long failed: %v", err)
+	}
+	defer func() {
+		_, _ = cli.KillJob(jobLongAlpha.ID)
+	}()
+
+	// 2. 在 clean-beta 上派发一个短任务
+	jobShortBeta, err := cli.RunJob(protocol.RunJobRequest{
+		Node:    "clean-beta",
+		Name:    "beta-short",
+		Command: "cmd.exe /c echo beta_done",
+	}, "")
+	if err != nil {
+		t.Fatalf("dispatch beta-short failed: %v", err)
+	}
+
+	// 等待短任务执行完成
+	time.Sleep(500 * time.Millisecond)
+
+	// 检查各任务磁盘落盘目录存在
+	dirShortAlpha := filepath.Join(dataAlpha, "jobs", jobShortAlpha.ID)
+	dirLongAlpha := filepath.Join(dataAlpha, "jobs", jobLongAlpha.ID)
+	dirShortBeta := filepath.Join(dataBeta, "jobs", jobShortBeta.ID)
+
+	for _, d := range []string{dirShortAlpha, dirLongAlpha, dirShortBeta} {
+		if _, err := os.Stat(d); os.IsNotExist(err) {
+			t.Fatalf("expected job disk directory to exist: %s", d)
+		}
+	}
+
+	// 3. 执行定向节点清理：仅清理 clean-beta
+	resBeta, err := cli.CleanJobs("clean-beta", 0, true)
+	if err != nil {
+		t.Fatalf("CleanJobs on beta failed: %v", err)
+	}
+	if res, ok := resBeta["clean-beta"]; !ok || res.CleanedCount != 1 {
+		t.Fatalf("expected 1 cleaned job on beta, got: %+v", resBeta)
+	}
+
+	// 断言：beta-short 磁盘日志已被物理删除
+	if _, err := os.Stat(dirShortBeta); !os.IsNotExist(err) {
+		t.Fatalf("expected beta-short dir to be deleted from disk: %s", dirShortBeta)
+	}
+	// 断言：alpha 节点上的短任务与长任务完全不受影响！
+	if _, err := os.Stat(dirShortAlpha); os.IsNotExist(err) {
+		t.Fatalf("alpha-short dir should still exist: %s", dirShortAlpha)
+	}
+	if _, err := os.Stat(dirLongAlpha); os.IsNotExist(err) {
+		t.Fatalf("alpha-long dir should still exist: %s", dirLongAlpha)
+	}
+
+	// 4. 执行全集群清理：清理 clean-alpha
+	resAll, err := cli.CleanJobs("", 0, true)
+	if err != nil {
+		t.Fatalf("CleanJobs all failed: %v", err)
+	}
+	if res, ok := resAll["clean-alpha"]; !ok || res.CleanedCount != 1 {
+		t.Fatalf("expected 1 cleaned job on alpha, got: %+v", resAll)
+	}
+
+	// 断言：alpha-short 磁盘日志被删除
+	if _, err := os.Stat(dirShortAlpha); !os.IsNotExist(err) {
+		t.Fatalf("expected alpha-short dir to be deleted from disk: %s", dirShortAlpha)
+	}
+
+	// 断言：alpha-long 正在运行，严格受到保护！
+	if _, err := os.Stat(dirLongAlpha); os.IsNotExist(err) {
+		t.Fatalf("CRITICAL: running job dir on alpha was deleted: %s", dirLongAlpha)
+	}
+
+	// 5. 验证 ps 输出中 running 任务依然健康存在
+	jobs, err := cli.ListJobs("clean-alpha")
+	if err != nil {
+		t.Fatalf("ListJobs alpha failed: %v", err)
+	}
+	foundRunning := false
+	for _, j := range jobs {
+		if j.ID == jobLongAlpha.ID && j.Status == protocol.JobStatusRunning {
+			foundRunning = true
+			break
+		}
+	}
+	if !foundRunning {
+		t.Fatalf("expected running job %s to remain active in ps output", jobLongAlpha.ID)
+	}
+
+	// 终止长常驻任务，释放句柄
+	_, _ = cli.KillJob(jobLongAlpha.ID)
+}
+
