@@ -309,8 +309,8 @@ func Remove(targetPath string, recursive bool) error {
 	return os.Remove(cleanPath)
 }
 
-// SaveStream 将输入流原子落盘至指定目标文件，校验 SHA-256，并在出错时物理回滚清理临时文件
-func SaveStream(dstPath string, r io.Reader, expectedSha256 string) (string, error) {
+// SaveStreamWithValidator 将输入流原子落盘至指定目标文件，并在原子替换提交前执行校验回调 (SSOT)
+func SaveStreamWithValidator(dstPath string, r io.Reader, validator func(computedHash string) error) (string, error) {
 	cleanPath, err := pathutil.NormalizeLocalPath(dstPath)
 	if err != nil {
 		return "", err
@@ -350,8 +350,10 @@ func SaveStream(dstPath string, r io.Reader, expectedSha256 string) (string, err
 	}
 
 	computedHash := hex.EncodeToString(hasher.Sum(nil))
-	if expectedSha256 != "" && !strings.EqualFold(expectedSha256, computedHash) {
-		return "", fmt.Errorf("%w: expected %s, got %s", ErrHashMismatch, expectedSha256, computedHash)
+	if validator != nil {
+		if err := validator(computedHash); err != nil {
+			return "", err
+		}
 	}
 
 	// 原子替换
@@ -363,6 +365,16 @@ func SaveStream(dstPath string, r io.Reader, expectedSha256 string) (string, err
 	}
 	committed = true
 	return computedHash, nil
+}
+
+// SaveStream 将输入流原子落盘至指定目标文件，校验 SHA-256，并在出错时物理回滚清理临时文件
+func SaveStream(dstPath string, r io.Reader, expectedSha256 string) (string, error) {
+	return SaveStreamWithValidator(dstPath, r, func(computedHash string) error {
+		if expectedSha256 != "" && !strings.EqualFold(expectedSha256, computedHash) {
+			return fmt.Errorf("%w: expected %s, got %s", ErrHashMismatch, expectedSha256, computedHash)
+		}
+		return nil
+	})
 }
 
 // CopyFile 本地单文件安全原子拷贝 (计算 SHA-256 校验并支持进度追踪)

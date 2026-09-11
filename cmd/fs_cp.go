@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"time"
 
 	"cworker/pkg/client"
 	"cworker/pkg/pathutil"
@@ -173,40 +172,11 @@ var cpCmd = &cobra.Command{
 				cleanLocalDst = filepath.Join(cleanLocalDst, pathutil.SafeBaseName(srcPath))
 			}
 
-			dstDir := filepath.Dir(cleanLocalDst)
-			_ = os.MkdirAll(dstDir, 0755)
-
-			// 使用同目录下的临时文件落盘，下载并校验成功后原子重命名，严防失败时误删/破坏已有目标文件
-			tmpFile := filepath.Join(dstDir, fmt.Sprintf(".%s.cwtemp-%d", filepath.Base(cleanLocalDst), time.Now().UnixNano()))
-			f, err := os.OpenFile(tmpFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-			if err != nil {
-				return fmt.Errorf("create temp download file failed: %w", err)
-			}
-			committed := false
-			defer func() {
-				_ = f.Close()
-				if !committed {
-					_ = os.Remove(tmpFile)
-				}
-			}()
-
 			tracker := client.NewProgressTracker(1, 0)
 			fmt.Printf("[cworker] Downloading '%s:%s' -> local '%s'...\n", srcNode, srcPath, cleanLocalDst)
-			if err := cli.DownloadFileWithContext(ctx, srcNode, srcPath, f, tracker); err != nil {
+			if err := cli.DownloadToLocalFile(ctx, srcNode, srcPath, cleanLocalDst, tracker); err != nil {
 				return fmt.Errorf("download failed: %w", err)
 			}
-			if err := f.Close(); err != nil {
-				return fmt.Errorf("flush local file failed: %w", err)
-			}
-
-			// 原子重命名替换目标文件
-			if err := os.Rename(tmpFile, cleanLocalDst); err != nil {
-				_ = os.Remove(cleanLocalDst)
-				if err2 := os.Rename(tmpFile, cleanLocalDst); err2 != nil {
-					return fmt.Errorf("atomic rename failed: %w", err2)
-				}
-			}
-			committed = true
 			tracker.AddFile()
 			tracker.Finish()
 			fmt.Println("[OK] Download completed.")

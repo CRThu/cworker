@@ -337,7 +337,7 @@ func TestCmd_Cp_DownloadFile_FailureDoesNotDestroyExistingFile(t *testing.T) {
 		t.Fatalf("readdir failed: %v", err)
 	}
 	for _, e := range entries {
-		if strings.Contains(e.Name(), ".cwtemp-") {
+		if strings.Contains(e.Name(), ".cwtemp-") || strings.Contains(e.Name(), ".cwsave-") {
 			t.Fatalf("temporary download file was leaked: %s", e.Name())
 		}
 	}

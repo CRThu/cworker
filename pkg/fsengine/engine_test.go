@@ -403,6 +403,37 @@ func TestFsEngine_SaveStream_RollbackAndOverwrite(t *testing.T) {
 	}
 }
 
+func TestFsEngine_SaveStreamWithValidator(t *testing.T) {
+	tmpDir := t.TempDir()
+	targetFile := filepath.Join(tmpDir, "validate_test.txt")
+	_ = os.WriteFile(targetFile, []byte("orig"), 0644)
+
+	// 1. Validator fails
+	_, err := SaveStreamWithValidator(targetFile, bytes.NewReader([]byte("new_corrupt")), func(computedHash string) error {
+		return errors.New("custom validation rejection")
+	})
+	if err == nil {
+		t.Fatal("expected error from rejected validation")
+	}
+	// Verify original file untouched
+	readBack, _ := os.ReadFile(targetFile)
+	if string(readBack) != "orig" {
+		t.Fatalf("original file was overwritten despite validator failure")
+	}
+
+	// 2. Validator succeeds
+	_, err = SaveStreamWithValidator(targetFile, bytes.NewReader([]byte("new_valid")), func(computedHash string) error {
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error on valid stream: %v", err)
+	}
+	readBack, _ = os.ReadFile(targetFile)
+	if string(readBack) != "new_valid" {
+		t.Fatalf("file was not updated on valid stream")
+	}
+}
+
 func TestFsEngine_CopyDir_Advanced(t *testing.T) {
 	tmpDir := t.TempDir()
 

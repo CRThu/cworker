@@ -685,6 +685,62 @@ func (c *Client) DownloadFileWithContext(ctx context.Context, node, remotePath s
 	return nil
 }
 
+// DownloadToLocalFile 将远端文件流式下载并原子落盘至本地物理文件 (委托 fsengine.SaveStreamWithValidator 统一维护物理落盘与校验)
+func (c *Client) DownloadToLocalFile(ctx context.Context, node, remotePath, localFilePath string, tracker *ProgressTracker) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	cleanLocal, err := pathutil.NormalizeLocalPath(localFilePath)
+	if err != nil {
+		return err
+	}
+
+	rt, err := c.ResolveWorker(node, "")
+	if err != nil {
+		return err
+	}
+
+	path := fmt.Sprintf("/api/v1/fs/download?path=%s", url.QueryEscape(remotePath))
+	resp, err := c.doRequestWithContext(ctx, rt, http.MethodGet, path, nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("download failed (%d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	if tracker != nil {
+		if szStr := resp.Header.Get("X-File-Size"); szStr != "" {
+			if sz, err := strconv.ParseInt(szStr, 10, 64); err == nil && sz > 0 {
+				tracker.SetTotalBytes(sz)
+			}
+		}
+	}
+
+	var r io.Reader = resp.Body
+	if tracker != nil {
+		r = NewCountingReader(resp.Body, tracker)
+	}
+
+	_, err = fsengine.SaveStreamWithValidator(cleanLocal, r, func(computedHash string) error {
+		expectedHash := strings.TrimSpace(resp.Header.Get("X-File-SHA256"))
+		if expectedHash == "" && resp.Trailer != nil {
+			expectedHash = strings.TrimSpace(resp.Trailer.Get("X-File-SHA256"))
+		}
+		if expectedHash == "" {
+			return fmt.Errorf("download failed: worker %s did not return X-File-SHA256 checksum", node)
+		}
+		if !strings.EqualFold(expectedHash, computedHash) {
+			return fmt.Errorf("sha256 checksum mismatch: expected %s, got %s", expectedHash, computedHash)
+		}
+		return nil
+	})
+	return err
+}
+
 func (c *Client) ListDir(node, remotePath string, recursive ...bool) ([]protocol.FileInfo, error) {
 	return c.ListDirWithContext(context.Background(), node, remotePath, recursive...)
 }
@@ -1138,34 +1194,8 @@ concurrencyLoop:
 				errMu.Unlock()
 				return
 			}
-			localDir := filepath.Dir(localFilePath)
-			_ = os.MkdirAll(localDir, 0755)
 
-			tmpLocal := filepath.Join(localDir, fmt.Sprintf(".%s.cwtemp-%d", filepath.Base(localFilePath), time.Now().UnixNano()))
-			f, err := os.OpenFile(tmpLocal, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-			if err != nil {
-				errMu.Lock()
-				if firstErr == nil {
-					firstErr = fmt.Errorf("create local temp file failed: %w", err)
-					cancel()
-				}
-				errMu.Unlock()
-				return
-			}
-			committed := false
-			defer func() {
-				_ = f.Close()
-				if !committed {
-					_ = os.Remove(tmpLocal)
-				}
-			}()
-
-			var w io.Writer = f
-			if tracker != nil {
-				w = NewCountingWriter(f, tracker)
-			}
-
-			if err := c.DownloadFileWithContext(ctx, node, file.remotePath, w); err != nil {
+			if err := c.DownloadToLocalFile(ctx, node, file.remotePath, localFilePath, tracker); err != nil {
 				errMu.Lock()
 				if firstErr == nil {
 					firstErr = fmt.Errorf("download '%s' failed: %w", file.relPath, err)
@@ -1174,29 +1204,6 @@ concurrencyLoop:
 				errMu.Unlock()
 				return
 			}
-			if err := f.Close(); err != nil {
-				errMu.Lock()
-				if firstErr == nil {
-					firstErr = fmt.Errorf("close local file '%s' failed: %w", file.relPath, err)
-					cancel()
-				}
-				errMu.Unlock()
-				return
-			}
-
-			if err := os.Rename(tmpLocal, localFilePath); err != nil {
-				_ = os.Remove(localFilePath)
-				if err2 := os.Rename(tmpLocal, localFilePath); err2 != nil {
-					errMu.Lock()
-					if firstErr == nil {
-						firstErr = fmt.Errorf("commit local file '%s' failed: %w", file.relPath, err2)
-						cancel()
-					}
-					errMu.Unlock()
-					return
-				}
-			}
-			committed = true
 
 			if tracker != nil {
 				tracker.AddFile()

@@ -239,6 +239,17 @@ func TestClient_Operations(t *testing.T) {
 		t.Fatalf("DownloadFile failed: %v, got %s", err, downloadBuf.String())
 	}
 
+	// 3.1 测试 DownloadToLocalFile
+	localSavedFile := filepath.Join(tempDir, "saved_dest.txt")
+	err = cli.DownloadToLocalFile(context.Background(), "mock-node", "dest.txt", localSavedFile, nil)
+	if err != nil {
+		t.Fatalf("DownloadToLocalFile failed: %v", err)
+	}
+	savedContent, err := os.ReadFile(localSavedFile)
+	if err != nil || string(savedContent) != "mock-download-data" {
+		t.Fatalf("DownloadToLocalFile content mismatch: %v, got %s", err, string(savedContent))
+	}
+
 	// 4. 测试 ListDir
 	files, err := cli.ListDir("mock-node", ".")
 	if err != nil || len(files) != 1 {
