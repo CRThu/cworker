@@ -1,29 +1,31 @@
 package cmd
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"text/tabwriter"
 
 	"cworker/pkg/client"
 	"cworker/pkg/pathutil"
+	"cworker/pkg/protocol"
 	"github.com/spf13/cobra"
 )
 
 var lsCmd = &cobra.Command{
-	Use:   "ls <node>:<path>",
-	Short: "查看远端节点的目录内容与文件元数据",
+	Use:   "ls [[node]:]<path>",
+	Short: "查看远端节点或本地目录的内容与文件元数据",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		node, path := pathutil.ParseNodePath(args[0])
+		var files []protocol.FileInfo
+		var err error
+
 		if node == "" {
-			return errors.New("missing node target, format: <node>:<path>")
+			files, err = client.ListLocalDir(path)
+		} else {
+			cli := client.NewClient()
+			files, err = cli.ListDir(node, path)
 		}
-
-		cli := client.NewClient()
-
-		files, err := cli.ListDir(node, path)
 		if err != nil {
 			return err
 		}

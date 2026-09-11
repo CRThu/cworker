@@ -99,4 +99,34 @@ type FileInfo struct {
 	IsDir   bool      `json:"is_dir"`
 	Size    int64     `json:"size"`
 	ModTime time.Time `json:"mod_time"`
+	SHA256  string    `json:"sha256,omitempty"`
+}
+
+// DiffStatus 表示两端比对的状态定义
+type DiffStatus string
+
+const (
+	DiffStatusMatch    DiffStatus = "MATCH"
+	DiffStatusModified DiffStatus = "MODIFIED"
+	DiffStatusAdded    DiffStatus = "ADDED"
+	DiffStatusDeleted  DiffStatus = "DELETED"
+)
+
+// DiffEntry 记录单个路径在源端与目标端之间的差异详情
+type DiffEntry struct {
+	Status  DiffStatus `json:"status"`
+	Path    string     `json:"path"`
+	SrcSize int64      `json:"src_size"`
+	DstSize int64      `json:"dst_size"`
+	SrcHash string     `json:"src_hash,omitempty"`
+	DstHash string     `json:"dst_hash,omitempty"`
+}
+
+// DiffResult 汇总比对清单与统计摘要 (SSOT)
+type DiffResult struct {
+	Entries  []DiffEntry `json:"entries"`
+	Matched  int         `json:"matched"`
+	Modified int         `json:"modified"`
+	Added    int         `json:"added"`
+	Deleted  int         `json:"deleted"`
 }

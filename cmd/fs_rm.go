@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"bufio"
-	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -18,18 +17,20 @@ var (
 )
 
 var rmCmd = &cobra.Command{
-	Use:   "rm [flags] <node>:<path>",
-	Short: "删除远端节点的文件或目录 (非空目录需显式指定 -r)",
+	Use:   "rm [flags] [[node]:]<path>",
+	Short: "删除远端节点或本地的文件或目录 (非空目录需显式指定 -r)",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		node, path := pathutil.ParseNodePath(args[0])
-		if node == "" {
-			return errors.New("missing node target, format: <node>:<path>")
+
+		targetName := path
+		if node != "" {
+			targetName = fmt.Sprintf("%s:%s", node, path)
 		}
 
 		// 交互式二次确认防线
 		if rmRecursive && !rmYes {
-			fmt.Printf("Are you sure you want to recursively delete '%s:%s'? [y/N]: ", node, path)
+			fmt.Printf("Are you sure you want to recursively delete '%s'? [y/N]: ", targetName)
 			reader := bufio.NewReader(os.Stdin)
 			input, err := reader.ReadString('\n')
 			if err != nil {
@@ -42,13 +43,21 @@ var rmCmd = &cobra.Command{
 			}
 		}
 
+		if node == "" {
+			if err := client.DeleteLocal(path, rmRecursive); err != nil {
+				return fmt.Errorf("delete failed: %w", err)
+			}
+			fmt.Printf("[OK] Deleted '%s'\n", path)
+			return nil
+		}
+
 		cli := client.NewClient()
 
 		if err := cli.Delete(node, path, rmRecursive); err != nil {
 			return fmt.Errorf("delete failed: %w", err)
 		}
 
-		fmt.Printf("[OK] Deleted '%s:%s'\n", node, path)
+		fmt.Printf("[OK] Deleted '%s'\n", targetName)
 		return nil
 	},
 }

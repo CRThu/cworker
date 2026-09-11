@@ -3,6 +3,8 @@ package worker
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -171,6 +173,83 @@ func TestWorker_FsHandlers(t *testing.T) {
 
 	if _, err := os.Stat(targetFilePath); !os.IsNotExist(err) {
 		t.Fatalf("file should have been deleted, but still exists")
+	}
+}
+
+func TestWorker_FsHash(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "cw_worker_hash_test_*")
+	if err != nil {
+		t.Fatalf("create temp dir failed: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	w := &Worker{}
+
+	// 准备测试文件结构
+	subDir := filepath.Join(tempDir, "sub")
+	_ = os.MkdirAll(subDir, 0755)
+	file1Path := filepath.Join(subDir, "file1.txt")
+	file2Path := filepath.Join(subDir, "file2.txt")
+	content1 := []byte("hello_hash_content_1")
+	content2 := []byte("hello_hash_content_2")
+	_ = os.WriteFile(file1Path, content1, 0644)
+	_ = os.WriteFile(file2Path, content2, 0644)
+
+	expectedHash1 := sha256.Sum256(content1)
+	expectedHash1Hex := hex.EncodeToString(expectedHash1[:])
+
+	// 1. 测试单文件哈希
+	req1 := httptest.NewRequest(http.MethodGet, "/api/v1/fs/hash?path="+file1Path, nil)
+	rec1 := httptest.NewRecorder()
+	w.handleFsHash(rec1, req1)
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("handleFsHash single file failed: %d, body: %s", rec1.Code, rec1.Body.String())
+	}
+	var res1 []protocol.FileInfo
+	if err := json.NewDecoder(rec1.Body).Decode(&res1); err != nil {
+		t.Fatalf("decode single file response failed: %v", err)
+	}
+	if len(res1) != 1 || res1[0].SHA256 != expectedHash1Hex || res1[0].Size != int64(len(content1)) {
+		t.Fatalf("unexpected single file hash result: %+v", res1)
+	}
+
+	// 2. 测试目录递归哈希 (-r)
+	req2 := httptest.NewRequest(http.MethodGet, "/api/v1/fs/hash?path="+subDir+"&recursive=true", nil)
+	rec2 := httptest.NewRecorder()
+	w.handleFsHash(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("handleFsHash recursive dir failed: %d, body: %s", rec2.Code, rec2.Body.String())
+	}
+	var res2 []protocol.FileInfo
+	if err := json.NewDecoder(rec2.Body).Decode(&res2); err != nil {
+		t.Fatalf("decode dir response failed: %v", err)
+	}
+	if len(res2) != 2 {
+		t.Fatalf("expected 2 files in dir hash, got %d", len(res2))
+	}
+
+	// 3. 测试目录未加 recursive=true 拦截 (400 Bad Request)
+	req3 := httptest.NewRequest(http.MethodGet, "/api/v1/fs/hash?path="+subDir, nil)
+	rec3 := httptest.NewRecorder()
+	w.handleFsHash(rec3, req3)
+	if rec3.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for dir without recursive flag, got %d", rec3.Code)
+	}
+
+	// 4. 测试不存在路径 (404 Not Found)
+	req4 := httptest.NewRequest(http.MethodGet, "/api/v1/fs/hash?path="+filepath.Join(tempDir, "non_existent"), nil)
+	rec4 := httptest.NewRecorder()
+	w.handleFsHash(rec4, req4)
+	if rec4.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for non-existent path, got %d", rec4.Code)
+	}
+
+	// 5. 测试非 GET 方法 (405 Method Not Allowed)
+	req5 := httptest.NewRequest(http.MethodPost, "/api/v1/fs/hash?path="+file1Path, nil)
+	rec5 := httptest.NewRecorder()
+	w.handleFsHash(rec5, req5)
+	if rec5.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 for POST method, got %d", rec5.Code)
 	}
 }
 

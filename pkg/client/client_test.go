@@ -1310,5 +1310,193 @@ func TestClient_RunJob_AutoMemorizeToken(t *testing.T) {
 	}
 }
 
+func TestClient_HashLocalPath(t *testing.T) {
+	tempDir := t.TempDir()
+	file1 := filepath.Join(tempDir, "f1.txt")
+	content1 := []byte("content_hash_1")
+	if err := os.WriteFile(file1, content1, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. 单文件哈希
+	res, err := HashLocalPath(file1, false)
+	if err != nil {
+		t.Fatalf("HashLocalPath failed: %v", err)
+	}
+	if len(res) != 1 || res[0].Size != int64(len(content1)) {
+		t.Fatalf("unexpected hash res: %+v", res)
+	}
+	expectedHash := sha256.Sum256(content1)
+	if res[0].SHA256 != hex.EncodeToString(expectedHash[:]) {
+		t.Fatalf("sha256 mismatch: expected %s, got %s", hex.EncodeToString(expectedHash[:]), res[0].SHA256)
+	}
+
+	// 2. 目录未加 recursive=true 报错
+	_, err = HashLocalPath(tempDir, false)
+	if err == nil || !strings.Contains(err.Error(), "requires recursive flag (-r)") {
+		t.Fatalf("expected recursive flag error, got: %v", err)
+	}
+
+	// 3. 目录递归哈希
+	subDir := filepath.Join(tempDir, "sub")
+	_ = os.MkdirAll(subDir, 0755)
+	file2 := filepath.Join(subDir, "f2.txt")
+	_ = os.WriteFile(file2, []byte("content_hash_2"), 0644)
+
+	resDir, err := HashLocalPath(tempDir, true)
+	if err != nil {
+		t.Fatalf("HashLocalPath dir failed: %v", err)
+	}
+	if len(resDir) != 2 {
+		t.Fatalf("expected 2 files in dir, got %d", len(resDir))
+	}
+
+	// 4. 不存在路径报错
+	_, err = HashLocalPath(filepath.Join(tempDir, "non_existent"), false)
+	if err == nil {
+		t.Fatal("expected error for non existent path")
+	}
+}
+
+func TestClient_CompareSingleFile(t *testing.T) {
+	f1 := protocol.FileInfo{
+		Name:   "file.txt",
+		Size:   100,
+		SHA256: "hash123",
+	}
+	f2Identical := protocol.FileInfo{
+		Name:   "file.txt",
+		Size:   100,
+		SHA256: "hash123",
+	}
+	f3DiffHash := protocol.FileInfo{
+		Name:   "file.txt",
+		Size:   100,
+		SHA256: "hash456",
+	}
+	f4DiffSize := protocol.FileInfo{
+		Name:   "file.txt",
+		Size:   200,
+		SHA256: "hash123",
+	}
+
+	resMatch := CompareSingleFile(f1, f2Identical)
+	if resMatch.Matched != 1 || resMatch.Modified != 0 || resMatch.Entries[0].Status != protocol.DiffStatusMatch {
+		t.Fatalf("expected match, got: %+v", resMatch)
+	}
+
+	resDiffHash := CompareSingleFile(f1, f3DiffHash)
+	if resDiffHash.Matched != 0 || resDiffHash.Modified != 1 || resDiffHash.Entries[0].Status != protocol.DiffStatusModified {
+		t.Fatalf("expected modified on hash diff, got: %+v", resDiffHash)
+	}
+
+	resDiffSize := CompareSingleFile(f1, f4DiffSize)
+	if resDiffSize.Matched != 0 || resDiffSize.Modified != 1 || resDiffSize.Entries[0].Status != protocol.DiffStatusModified {
+		t.Fatalf("expected modified on size diff, got: %+v", resDiffSize)
+	}
+}
+
+func TestClient_CompareFileInfos(t *testing.T) {
+	src := []protocol.FileInfo{
+		{Path: "same.txt", Size: 10, SHA256: "hashA"},
+		{Path: "modified_hash.txt", Size: 20, SHA256: "hashB"},
+		{Path: "modified_size.txt", Size: 30, SHA256: "hashC"},
+		{Path: "added.txt", Size: 40, SHA256: "hashD"},
+	}
+	dst := []protocol.FileInfo{
+		{Path: "same.txt", Size: 10, SHA256: "hashA"},
+		{Path: "modified_hash.txt", Size: 20, SHA256: "hashB_diff"},
+		{Path: "modified_size.txt", Size: 35, SHA256: "hashC_diff"},
+		{Path: "deleted.txt", Size: 50, SHA256: "hashE"},
+	}
+
+	res := CompareFileInfos(src, dst)
+	if res.Matched != 1 {
+		t.Fatalf("expected 1 matched, got %d", res.Matched)
+	}
+	if res.Modified != 2 {
+		t.Fatalf("expected 2 modified, got %d", res.Modified)
+	}
+	if res.Added != 1 {
+		t.Fatalf("expected 1 added, got %d", res.Added)
+	}
+	if res.Deleted != 1 {
+		t.Fatalf("expected 1 deleted, got %d", res.Deleted)
+	}
+	if len(res.Entries) != 5 {
+		t.Fatalf("expected 5 total entries, got %d", len(res.Entries))
+	}
+}
+
+func TestClient_HashRemotePath(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/fs/hash" {
+			rw.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if r.URL.Query().Get("path") == "error" {
+			rw.WriteHeader(http.StatusBadRequest)
+			_, _ = rw.Write([]byte("bad request"))
+			return
+		}
+		list := []protocol.FileInfo{
+			{Name: "test.txt", Path: "test.txt", Size: 123, SHA256: "testhash"},
+		}
+		rw.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(rw).Encode(list)
+	}))
+	defer server.Close()
+
+	cli := NewClient()
+	cli.dataDir = t.TempDir()
+
+	u, _ := url.Parse(server.URL)
+	list, err := cli.HashRemotePath(context.Background(), u.Host, "some/path", false)
+	if err != nil {
+		t.Fatalf("HashRemotePath failed: %v", err)
+	}
+	if len(list) != 1 || list[0].SHA256 != "testhash" {
+		t.Fatalf("unexpected remote hash response: %+v", list)
+	}
+
+	_, err = cli.HashRemotePath(context.Background(), u.Host, "error", false)
+	if err == nil || !strings.Contains(err.Error(), "bad request") {
+		t.Fatalf("expected bad request error, got: %v", err)
+	}
+}
+
+func TestClient_LocalCopy(t *testing.T) {
+	tempDir := t.TempDir()
+	srcDir := filepath.Join(tempDir, "src")
+	dstDir := filepath.Join(tempDir, "dst")
+	_ = os.MkdirAll(filepath.Join(srcDir, "sub"), 0755)
+
+	content1 := []byte("local copy file 1")
+	content2 := []byte("local copy file 2 in sub")
+	_ = os.WriteFile(filepath.Join(srcDir, "f1.txt"), content1, 0644)
+	_ = os.WriteFile(filepath.Join(srcDir, "sub", "f2.txt"), content2, 0644)
+
+	cli := NewClient()
+
+	// 1. 测试单文件本地拷贝
+	singleDst := filepath.Join(tempDir, "single_dst.txt")
+	if err := cli.LocalCopyFile(filepath.Join(srcDir, "f1.txt"), singleDst, nil); err != nil {
+		t.Fatalf("LocalCopyFile failed: %v", err)
+	}
+	read1, err := os.ReadFile(singleDst)
+	if err != nil || string(read1) != string(content1) {
+		t.Fatalf("LocalCopyFile content mismatch: %v, got %s", err, string(read1))
+	}
+
+	// 2. 测试目录本地并发拷贝
+	if err := cli.LocalCopyDir(context.Background(), srcDir, dstDir, 4, nil); err != nil {
+		t.Fatalf("LocalCopyDir failed: %v", err)
+	}
+	readSub, err := os.ReadFile(filepath.Join(dstDir, "sub", "f2.txt"))
+	if err != nil || string(readSub) != string(content2) {
+		t.Fatalf("LocalCopyDir nested content mismatch: %v, got %s", err, string(readSub))
+	}
+}
+
 
 

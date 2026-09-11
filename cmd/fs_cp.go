@@ -29,10 +29,6 @@ var cpCmd = &cobra.Command{
 		srcNode, srcPath := pathutil.ParseNodePath(srcRaw)
 		dstNode, dstPath := pathutil.ParseNodePath(dstRaw)
 
-		if srcNode == "" && dstNode == "" {
-			return errors.New("both source and destination are local paths, please use local system copy")
-		}
-
 		recursive, _ := cmd.Flags().GetBool("recursive")
 		concurrency, _ := cmd.Flags().GetInt("concurrency")
 		if concurrency <= 0 {
@@ -214,6 +210,56 @@ var cpCmd = &cobra.Command{
 			tracker.AddFile()
 			tracker.Finish()
 			fmt.Println("[OK] Download completed.")
+			return nil
+		}
+
+		// 4. 本地到本地拷贝
+		if srcNode == "" && dstNode == "" {
+			cleanLocalSrc, err := pathutil.NormalizeLocalPath(srcPath)
+			if err != nil {
+				return err
+			}
+			cleanLocalDst, err := pathutil.NormalizeLocalPath(dstPath)
+			if err != nil {
+				return err
+			}
+
+			fi, err := os.Stat(cleanLocalSrc)
+			if err != nil {
+				return fmt.Errorf("open local source path failed: %w", err)
+			}
+
+			if fi.IsDir() {
+				if !recursive {
+					return fmt.Errorf("omitting directory '%s' (use -r to copy recursively)", srcPath)
+				}
+
+				if dstFi, err := os.Stat(cleanLocalDst); err == nil && dstFi.IsDir() {
+					cleanLocalDst = filepath.Join(cleanLocalDst, pathutil.SafeBaseName(cleanLocalSrc))
+				}
+
+				fmt.Printf("[cworker] Copying local directory '%s' -> '%s' (concurrency: %d)...\n",
+					cleanLocalSrc, cleanLocalDst, concurrency)
+				if err := cli.LocalCopyDir(ctx, cleanLocalSrc, cleanLocalDst, concurrency, nil); err != nil {
+					return fmt.Errorf("local copy directory failed: %w", err)
+				}
+				fmt.Println("[OK] Local directory copy completed.")
+				return nil
+			}
+
+			// 单文件本地拷贝
+			if dstFi, err := os.Stat(cleanLocalDst); err == nil && dstFi.IsDir() {
+				cleanLocalDst = filepath.Join(cleanLocalDst, pathutil.SafeBaseName(cleanLocalSrc))
+			}
+
+			tracker := client.NewProgressTracker(1, fi.Size())
+			fmt.Printf("[cworker] Copying local file '%s' -> '%s'...\n", cleanLocalSrc, cleanLocalDst)
+			if err := cli.LocalCopyFile(cleanLocalSrc, cleanLocalDst, tracker); err != nil {
+				return fmt.Errorf("local copy failed: %w", err)
+			}
+			tracker.AddFile()
+			tracker.Finish()
+			fmt.Println("[OK] Local copy completed.")
 			return nil
 		}
 

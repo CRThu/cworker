@@ -1,8 +1,8 @@
 package cmd
 
 import (
-	"errors"
 	"fmt"
+	"os"
 
 	"cworker/pkg/client"
 	"cworker/pkg/pathutil"
@@ -10,13 +10,21 @@ import (
 )
 
 var mdCmd = &cobra.Command{
-	Use:   "md <node>:<path>",
-	Short: "在远端节点递归创建空目录 (自动附带 -p 行为)",
+	Use:   "md [<node>:]<path>",
+	Short: "在远端节点或本地递归创建空目录 (自动附带 -p 行为)",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		node, path := pathutil.ParseNodePath(args[0])
 		if node == "" {
-			return errors.New("missing node target, format: <node>:<path>")
+			cleanPath, err := pathutil.NormalizeLocalPath(path)
+			if err != nil {
+				return err
+			}
+			if err := os.MkdirAll(cleanPath, 0755); err != nil {
+				return fmt.Errorf("local mkdir failed: %w", err)
+			}
+			fmt.Printf("[OK] Local directory created: '%s'\n", cleanPath)
+			return nil
 		}
 
 		cli := client.NewClient()

@@ -1,7 +1,7 @@
 package cmd
 
 import (
-	"errors"
+	"io"
 	"os"
 
 	"cworker/pkg/client"
@@ -10,13 +10,23 @@ import (
 )
 
 var catCmd = &cobra.Command{
-	Use:   "cat <node>:<path>",
-	Short: "直接在本地终端打印远端文件的文本内容，免去临时下载",
+	Use:   "cat [<node>:]<path>",
+	Short: "直接在控制台终端打印远端或本地文件的文本内容",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		node, path := pathutil.ParseNodePath(args[0])
 		if node == "" {
-			return errors.New("missing node target, format: <node>:<path>")
+			cleanLocal, err := pathutil.NormalizeLocalPath(path)
+			if err != nil {
+				return err
+			}
+			f, err := os.Open(cleanLocal)
+			if err != nil {
+				return err
+			}
+			defer f.Close()
+			_, err = io.Copy(os.Stdout, f)
+			return err
 		}
 
 		cli := client.NewClient()

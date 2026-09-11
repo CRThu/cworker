@@ -163,12 +163,13 @@ func (w *Worker) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/v1/jobs/logs", w.authMiddleware(w.handleGetLogs))
 	mux.HandleFunc("/api/v1/jobs/stream", w.authMiddleware(w.handleStreamLogs))
 
-	// 文件五件套正交端点
+	// 文件六件套正交端点
 	mux.HandleFunc("/api/v1/fs/upload", w.authMiddleware(w.handleFsUpload))
 	mux.HandleFunc("/api/v1/fs/download", w.authMiddleware(w.handleFsDownload))
 	mux.HandleFunc("/api/v1/fs/ls", w.authMiddleware(w.handleFsList))
 	mux.HandleFunc("/api/v1/fs/md", w.authMiddleware(w.handleFsMakeDir))
 	mux.HandleFunc("/api/v1/fs/rm", w.authMiddleware(w.handleFsRemove))
+	mux.HandleFunc("/api/v1/fs/hash", w.authMiddleware(w.handleFsHash))
 
 	bindAddr := w.cfg.BindAddr
 	if bindAddr == "" {
@@ -800,4 +801,128 @@ func (w *Worker) handleFsRemove(rw http.ResponseWriter, r *http.Request) {
 
 	rw.WriteHeader(http.StatusOK)
 	_, _ = rw.Write([]byte("DELETED"))
+}
+
+func (w *Worker) handleFsHash(rw http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(rw, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	rawPath := r.URL.Query().Get("path")
+	cleanPath, err := pathutil.NormalizeLocalPath(rawPath)
+	if err != nil {
+		http.Error(rw, "invalid path: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	fi, err := os.Stat(cleanPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			http.Error(rw, "path not found", http.StatusNotFound)
+			return
+		}
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	recursive := r.URL.Query().Get("recursive") == "true"
+
+	if fi.IsDir() {
+		if !recursive {
+			http.Error(rw, "path is a directory, requires recursive flag (-r)", http.StatusBadRequest)
+			return
+		}
+
+		var list []protocol.FileInfo
+		err = filepath.WalkDir(cleanPath, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if path == cleanPath {
+				return nil
+			}
+			info, err := d.Info()
+			if err != nil {
+				return nil
+			}
+			// 过滤符号链接避免循环递归
+			if info.Mode()&os.ModeSymlink != 0 {
+				if d.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if d.IsDir() {
+				return nil
+			}
+
+			rel, err := filepath.Rel(cleanPath, path)
+			if err != nil {
+				return err
+			}
+
+			hash, err := hashFile(path)
+			if err != nil {
+				return fmt.Errorf("hash file %s failed: %w", path, err)
+			}
+
+			list = append(list, protocol.FileInfo{
+				Name:    d.Name(),
+				Path:    filepath.ToSlash(rel),
+				IsDir:   false,
+				Size:    info.Size(),
+				ModTime: info.ModTime(),
+				SHA256:  hash,
+			})
+			return nil
+		})
+		if err != nil {
+			http.Error(rw, "walk dir failed: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		if list == nil {
+			list = []protocol.FileInfo{}
+		}
+
+		rw.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(rw).Encode(list)
+		return
+	}
+
+	// 单文件哈希
+	hash, err := hashFile(cleanPath)
+	if err != nil {
+		http.Error(rw, "hash file failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	list := []protocol.FileInfo{
+		{
+			Name:    filepath.Base(cleanPath),
+			Path:    filepath.Base(cleanPath),
+			IsDir:   false,
+			Size:    fi.Size(),
+			ModTime: fi.ModTime(),
+			SHA256:  hash,
+		},
+	}
+
+	rw.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(rw).Encode(list)
+}
+
+func hashFile(filePath string) (string, error) {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), nil
 }

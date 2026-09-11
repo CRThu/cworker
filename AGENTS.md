@@ -26,6 +26,15 @@
 7. **文件夹递归拷贝规范（必须显式附加 `-r`）**：
    * Agent 调用 `cw cp` 传输整个文件夹时，**必须显式附加 `-r`（递归）**；若缺少 `-r`，CLI 会主动拦截并提示 `omitting directory`；
    * 默认并发连接数为 8，可通过 `-j <num>` 调节；内置端到端单遍流式 SHA-256 核验与非 TTY 纯净单行摘要，对 Agent 上下文完全透明无污染。
+8. **跨机与本地文件强一致性比对（`cw diff`）与确定性退出码**：
+   * 专为多机同步核验与 Pre-flight 检查设计，支持全拓扑：`本地 <-> 远端`、`远端 <-> 远端`、`本地 <-> 本地`；
+   * 递归比对目录时**必须显式附加 `-r`**（若缺失直接报错并退出码 2）；
+   * **默认排除全部 `[MATCH]` 匹配项**，终端仅输出 `[MODIFIED]`、`[ADDED]`、`[DELETED]` 的差异行，并在末尾单行汇总匹配数，零冗余噪音，避免污染 Agent 认知上下文；
+   * **确定性退出码契约**：
+     * `0`：两端完全一致（无变动）；
+     * `1`：存在变动（有修改/新增/删除）；
+     * `2`：异常错误（文件不存在、遗漏 `-r`、网络异常等）。
+     Agent 可直接在自动化脚本中以单行退出码判定是否触发全量同步。
 
 ---
 
@@ -77,8 +86,14 @@ cw cp -r ./workspace DESKTOP-4090:D:/workspace
 # 跨机器直接中继拷贝目录 (零中转磁盘开销，内存管道直灌)
 cw cp -r DESKTOP-4090:D:/workspace/output TEST-BOX:D:/workspace/output
 
-# 读取远端配置文件或阶段性结果 (文本直接打印，免去临时下载)
+# 读取远端或本地配置文件 (文本直接打印，免去临时下载)
 cw cat DESKTOP-4090:D:/workspace/metrics.json
+
+# 跨机或本地差异核验 (单文件对比，返回 Size 与完整 SHA-256)
+cw diff ./train.py DESKTOP-4090:D:/workspace/train.py
+
+# 递归比对两端目录树 (Pre-flight 同步前核验，默认排除相同文件，退出码 0 表示一致，1 表示存在差异)
+cw diff -r ./workspace DESKTOP-4090:D:/workspace
 
 # 任务结束后清理远程工作临时目录 (强制附加 -r -y 避免交互死锁)
 cw rm -r -y DESKTOP-4090:D:/workspace/temp/

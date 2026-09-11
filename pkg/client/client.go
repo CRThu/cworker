@@ -1336,3 +1336,522 @@ concurrencyLoop:
 	return ctx.Err()
 }
 
+// LocalCopyFile 本地文件安全拷贝 (流式拷贝，同时计算 SHA-256 并原子写入)
+func (c *Client) LocalCopyFile(srcPath, dstPath string, tracker *ProgressTracker) error {
+	cleanSrc, err := pathutil.NormalizeLocalPath(srcPath)
+	if err != nil {
+		return err
+	}
+	cleanDst, err := pathutil.NormalizeLocalPath(dstPath)
+	if err != nil {
+		return err
+	}
+
+	srcFile, err := os.Open(cleanSrc)
+	if err != nil {
+		return fmt.Errorf("open source file failed: %w", err)
+	}
+	defer srcFile.Close()
+
+	fi, err := srcFile.Stat()
+	if err != nil {
+		return fmt.Errorf("stat source file failed: %w", err)
+	}
+	if fi.IsDir() {
+		return fmt.Errorf("source '%s' is a directory", srcPath)
+	}
+
+	dstDir := filepath.Dir(cleanDst)
+	if err := os.MkdirAll(dstDir, 0755); err != nil {
+		return fmt.Errorf("create destination dir failed: %w", err)
+	}
+
+	tmpFile := filepath.Join(dstDir, fmt.Sprintf(".%s.cwlocal-%d", filepath.Base(cleanDst), time.Now().UnixNano()))
+	destFile, err := os.OpenFile(tmpFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return fmt.Errorf("create temp destination file failed: %w", err)
+	}
+	committed := false
+	defer func() {
+		_ = destFile.Close()
+		if !committed {
+			_ = os.Remove(tmpFile)
+		}
+	}()
+
+	srcHasher := sha256.New()
+	dstHasher := sha256.New()
+
+	var r io.Reader = srcFile
+	if tracker != nil {
+		r = NewCountingReader(srcFile, tracker)
+	}
+	teeSrc := io.TeeReader(r, srcHasher)
+	destWriter := io.MultiWriter(destFile, dstHasher)
+
+	if _, err := io.Copy(destWriter, teeSrc); err != nil {
+		return fmt.Errorf("copy data failed: %w", err)
+	}
+
+	if err := destFile.Close(); err != nil {
+		return fmt.Errorf("flush destination file failed: %w", err)
+	}
+
+	srcHash := hex.EncodeToString(srcHasher.Sum(nil))
+	dstHash := hex.EncodeToString(dstHasher.Sum(nil))
+	if srcHash != dstHash {
+		return fmt.Errorf("local copy sha256 mismatch: src=%s, dst=%s", srcHash, dstHash)
+	}
+
+	if err := os.Rename(tmpFile, cleanDst); err != nil {
+		_ = os.Remove(cleanDst)
+		if err2 := os.Rename(tmpFile, cleanDst); err2 != nil {
+			return fmt.Errorf("atomic rename failed: %w", err2)
+		}
+	}
+	committed = true
+	return nil
+}
+
+// LocalCopyDir 本地目录递归并发拷贝
+func (c *Client) LocalCopyDir(ctx context.Context, srcBaseDir, dstBaseDir string, concurrency int, tracker *ProgressTracker) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	cleanSrc, err := pathutil.NormalizeLocalPath(srcBaseDir)
+	if err != nil {
+		return err
+	}
+	cleanDst, err := pathutil.NormalizeLocalPath(dstBaseDir)
+	if err != nil {
+		return err
+	}
+
+	type localEntry struct {
+		relPath string
+		size    int64
+	}
+	var dirs []string
+	var files []localEntry
+	var totalBytes int64
+
+	err = filepath.WalkDir(cleanSrc, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if path == cleanSrc {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		rel, err := filepath.Rel(cleanSrc, path)
+		if err != nil {
+			return err
+		}
+		relSlash := filepath.ToSlash(rel)
+		if d.IsDir() {
+			dirs = append(dirs, relSlash)
+		} else {
+			files = append(files, localEntry{
+				relPath: relSlash,
+				size:    info.Size(),
+			})
+			totalBytes += info.Size()
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("walk local source dir failed: %w", err)
+	}
+
+	if tracker == nil {
+		tracker = NewProgressTracker(int64(len(files)), totalBytes)
+	}
+
+	_ = os.MkdirAll(cleanDst, 0755)
+	for _, d := range dirs {
+		subDir := filepath.Join(cleanDst, filepath.FromSlash(d))
+		if err := os.MkdirAll(subDir, 0755); err != nil {
+			return fmt.Errorf("create local dir '%s' failed: %w", subDir, err)
+		}
+	}
+
+	if concurrency <= 0 {
+		concurrency = 8
+	}
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var firstErr error
+	var errMu sync.Mutex
+
+	for _, fe := range files {
+		select {
+		case <-ctx.Done():
+			break
+		case sem <- struct{}{}:
+		}
+
+		wg.Add(1)
+		go func(entry localEntry) {
+			defer func() {
+				<-sem
+				wg.Done()
+			}()
+
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			srcF := filepath.Join(cleanSrc, filepath.FromSlash(entry.relPath))
+			dstF := filepath.Join(cleanDst, filepath.FromSlash(entry.relPath))
+			if err := c.LocalCopyFile(srcF, dstF, tracker); err != nil {
+				errMu.Lock()
+				if firstErr == nil {
+					firstErr = fmt.Errorf("copy '%s' failed: %w", entry.relPath, err)
+					cancel()
+				}
+				errMu.Unlock()
+				return
+			}
+			if tracker != nil {
+				tracker.AddFile()
+			}
+		}(fe)
+	}
+
+	wg.Wait()
+	if tracker != nil {
+		tracker.Finish()
+	}
+	if firstErr != nil {
+		return firstErr
+	}
+	return ctx.Err()
+}
+
+// HashRemotePath 获取远端路径的文件/目录 SHA-256 清单
+func (c *Client) HashRemotePath(ctx context.Context, node, remotePath string, recursive bool) ([]protocol.FileInfo, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	rt, err := c.ResolveWorker(node, "")
+	if err != nil {
+		return nil, err
+	}
+
+	path := fmt.Sprintf("/api/v1/fs/hash?path=%s&recursive=%t", url.QueryEscape(remotePath), recursive)
+	resp, err := c.doRequestWithContext(ctx, rt, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("hash remote path failed (%d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var list []protocol.FileInfo
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		return nil, err
+	}
+	return list, nil
+}
+
+// HashLocalPath 获取本地路径的文件/目录 SHA-256 清单 (与远端 handleFsHash 契约保持一致)
+func HashLocalPath(localPath string, recursive bool) ([]protocol.FileInfo, error) {
+	cleanPath, err := pathutil.NormalizeLocalPath(localPath)
+	if err != nil {
+		return nil, fmt.Errorf("invalid path: %w", err)
+	}
+
+	fi, err := os.Stat(cleanPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("path not found: %s", localPath)
+		}
+		return nil, err
+	}
+
+	if fi.IsDir() {
+		if !recursive {
+			return nil, fmt.Errorf("path is a directory, requires recursive flag (-r)")
+		}
+
+		var list []protocol.FileInfo
+		err = filepath.WalkDir(cleanPath, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if path == cleanPath {
+				return nil
+			}
+			info, err := d.Info()
+			if err != nil {
+				return nil
+			}
+			if info.Mode()&os.ModeSymlink != 0 {
+				if d.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if d.IsDir() {
+				return nil
+			}
+
+			rel, err := filepath.Rel(cleanPath, path)
+			if err != nil {
+				return err
+			}
+
+			hash, err := hashLocalFile(path)
+			if err != nil {
+				return fmt.Errorf("hash file %s failed: %w", path, err)
+			}
+
+			list = append(list, protocol.FileInfo{
+				Name:    d.Name(),
+				Path:    filepath.ToSlash(rel),
+				IsDir:   false,
+				Size:    info.Size(),
+				ModTime: info.ModTime(),
+				SHA256:  hash,
+			})
+			return nil
+		})
+		if err != nil {
+			return nil, fmt.Errorf("walk local dir failed: %w", err)
+		}
+		if list == nil {
+			list = []protocol.FileInfo{}
+		}
+		return list, nil
+	}
+
+	// 单文件
+	hash, err := hashLocalFile(cleanPath)
+	if err != nil {
+		return nil, fmt.Errorf("hash local file failed: %w", err)
+	}
+
+	return []protocol.FileInfo{
+		{
+			Name:    filepath.Base(cleanPath),
+			Path:    filepath.Base(cleanPath),
+			IsDir:   false,
+			Size:    fi.Size(),
+			ModTime: fi.ModTime(),
+			SHA256:  hash,
+		},
+	}, nil
+}
+
+func hashLocalFile(filePath string) (string, error) {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+// CompareFileInfos 对比源端与目标端的文件清单并生成 Diff 汇总结果
+func CompareFileInfos(srcFiles, dstFiles []protocol.FileInfo) *protocol.DiffResult {
+	srcMap := make(map[string]protocol.FileInfo, len(srcFiles))
+	dstMap := make(map[string]protocol.FileInfo, len(dstFiles))
+	allPathsMap := make(map[string]struct{}, len(srcFiles)+len(dstFiles))
+
+	for _, sf := range srcFiles {
+		p := filepath.ToSlash(sf.Path)
+		srcMap[p] = sf
+		allPathsMap[p] = struct{}{}
+	}
+	for _, df := range dstFiles {
+		p := filepath.ToSlash(df.Path)
+		dstMap[p] = df
+		allPathsMap[p] = struct{}{}
+	}
+
+	allPaths := make([]string, 0, len(allPathsMap))
+	for p := range allPathsMap {
+		allPaths = append(allPaths, p)
+	}
+	sort.Strings(allPaths)
+
+	res := &protocol.DiffResult{
+		Entries: make([]protocol.DiffEntry, 0, len(allPaths)),
+	}
+
+	for _, p := range allPaths {
+		sf, inSrc := srcMap[p]
+		df, inDst := dstMap[p]
+
+		if inSrc && inDst {
+			if sf.Size != df.Size {
+				res.Modified++
+				res.Entries = append(res.Entries, protocol.DiffEntry{
+					Status:  protocol.DiffStatusModified,
+					Path:    p,
+					SrcSize: sf.Size,
+					DstSize: df.Size,
+					SrcHash: sf.SHA256,
+					DstHash: df.SHA256,
+				})
+			} else if sf.SHA256 != "" && df.SHA256 != "" && strings.EqualFold(sf.SHA256, df.SHA256) {
+				res.Matched++
+				res.Entries = append(res.Entries, protocol.DiffEntry{
+					Status:  protocol.DiffStatusMatch,
+					Path:    p,
+					SrcSize: sf.Size,
+					DstSize: df.Size,
+					SrcHash: sf.SHA256,
+					DstHash: df.SHA256,
+				})
+			} else {
+				res.Modified++
+				res.Entries = append(res.Entries, protocol.DiffEntry{
+					Status:  protocol.DiffStatusModified,
+					Path:    p,
+					SrcSize: sf.Size,
+					DstSize: df.Size,
+					SrcHash: sf.SHA256,
+					DstHash: df.SHA256,
+				})
+			}
+		} else if inSrc && !inDst {
+			res.Added++
+			res.Entries = append(res.Entries, protocol.DiffEntry{
+				Status:  protocol.DiffStatusAdded,
+				Path:    p,
+				SrcSize: sf.Size,
+				DstSize: 0,
+				SrcHash: sf.SHA256,
+				DstHash: "",
+			})
+		} else if !inSrc && inDst {
+			res.Deleted++
+			res.Entries = append(res.Entries, protocol.DiffEntry{
+				Status:  protocol.DiffStatusDeleted,
+				Path:    p,
+				SrcSize: 0,
+				DstSize: df.Size,
+				SrcHash: "",
+				DstHash: df.SHA256,
+			})
+		}
+	}
+
+	return res
+}
+
+// CompareSingleFile 比对两个单文件并返回差异结果
+func CompareSingleFile(srcFile, dstFile protocol.FileInfo) *protocol.DiffResult {
+	status := protocol.DiffStatusModified
+	matched := 0
+	modified := 0
+
+	if srcFile.Size == dstFile.Size && strings.EqualFold(srcFile.SHA256, dstFile.SHA256) {
+		status = protocol.DiffStatusMatch
+		matched = 1
+	} else {
+		modified = 1
+	}
+
+	return &protocol.DiffResult{
+		Entries: []protocol.DiffEntry{
+			{
+				Status:  status,
+				Path:    srcFile.Name,
+				SrcSize: srcFile.Size,
+				DstSize: dstFile.Size,
+				SrcHash: srcFile.SHA256,
+				DstHash: dstFile.SHA256,
+			},
+		},
+		Matched:  matched,
+		Modified: modified,
+	}
+}
+
+// ListLocalDir 列出本地目录中的条目 (与远端 handleFsList 保持契约一致)
+func ListLocalDir(localPath string) ([]protocol.FileInfo, error) {
+	cleanPath, err := pathutil.NormalizeLocalPath(localPath)
+	if err != nil {
+		return nil, err
+	}
+	fi, err := os.Stat(cleanPath)
+	if err != nil {
+		return nil, err
+	}
+	if !fi.IsDir() {
+		return nil, fmt.Errorf("path is a file, not a directory")
+	}
+
+	entries, err := os.ReadDir(cleanPath)
+	if err != nil {
+		return nil, fmt.Errorf("readdir failed: %w", err)
+	}
+
+	var list []protocol.FileInfo
+	for _, e := range entries {
+		info, _ := e.Info()
+		size := int64(0)
+		modTime := time.Now()
+		if info != nil {
+			size = info.Size()
+			modTime = info.ModTime()
+		}
+		list = append(list, protocol.FileInfo{
+			Name:    e.Name(),
+			Path:    e.Name(),
+			IsDir:   e.IsDir(),
+			Size:    size,
+			ModTime: modTime,
+		})
+	}
+	return list, nil
+}
+
+// DeleteLocal 删除本地文件或目录 (与远端 handleFsRemove 保持契约一致)
+func DeleteLocal(localPath string, recursive bool) error {
+	cleanPath, err := pathutil.NormalizeLocalPath(localPath)
+	if err != nil {
+		return err
+	}
+	fi, err := os.Stat(cleanPath)
+	if err != nil {
+		return err
+	}
+
+	if fi.IsDir() {
+		if !recursive {
+			entries, _ := os.ReadDir(cleanPath)
+			if len(entries) > 0 {
+				return fmt.Errorf("path is a non-empty directory, requires recursive flag (-r)")
+			}
+			return os.Remove(cleanPath)
+		}
+		return os.RemoveAll(cleanPath)
+	}
+	return os.Remove(cleanPath)
+}
+

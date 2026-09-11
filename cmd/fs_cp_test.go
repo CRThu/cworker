@@ -72,10 +72,47 @@ func TestCmd_Cp_JoinRemote(t *testing.T) {
 	}
 }
 
-func TestCmd_Cp_BothLocalError(t *testing.T) {
-	err := cpCmd.RunE(cpCmd, []string{"./fileA.txt", "./fileB.txt"})
-	if err == nil || !strings.Contains(err.Error(), "both source and destination are local paths") {
-		t.Fatalf("expected both local paths error, got: %v", err)
+func TestCmd_Cp_BothLocal(t *testing.T) {
+	tempDir := t.TempDir()
+	srcFile := filepath.Join(tempDir, "src.txt")
+	dstFile := filepath.Join(tempDir, "dst.txt")
+	content := []byte("hello local copy")
+	if err := os.WriteFile(srcFile, content, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. 单文件本地拷贝
+	if err := cpCmd.RunE(cpCmd, []string{srcFile, dstFile}); err != nil {
+		t.Fatalf("local file copy failed: %v", err)
+	}
+	dstContent, err := os.ReadFile(dstFile)
+	if err != nil || string(dstContent) != string(content) {
+		t.Fatalf("local file content mismatch: %v, got %s", err, string(dstContent))
+	}
+
+	// 2. 目录递归本地拷贝 (-r)
+	srcDir := filepath.Join(tempDir, "src_dir")
+	dstDir := filepath.Join(tempDir, "dst_dir")
+	_ = os.MkdirAll(filepath.Join(srcDir, "nested"), 0755)
+	_ = os.WriteFile(filepath.Join(srcDir, "nested", "data.txt"), []byte("nested content"), 0644)
+
+	cpCmd.Flags().Set("recursive", "true")
+	defer cpCmd.Flags().Set("recursive", "false")
+
+	if err := cpCmd.RunE(cpCmd, []string{srcDir, dstDir}); err != nil {
+		t.Fatalf("local dir copy failed: %v", err)
+	}
+	nestedDst := filepath.Join(dstDir, "nested", "data.txt")
+	nestedContent, err := os.ReadFile(nestedDst)
+	if err != nil || string(nestedContent) != "nested content" {
+		t.Fatalf("local dir nested content mismatch: %v, got %s", err, string(nestedContent))
+	}
+
+	// 3. 本地目录未传 -r 时应被拦截
+	cpCmd.Flags().Set("recursive", "false")
+	err = cpCmd.RunE(cpCmd, []string{srcDir, filepath.Join(tempDir, "dst2")})
+	if err == nil || !strings.Contains(err.Error(), "omitting directory") {
+		t.Fatalf("expected omitting directory error for local dir without -r, got: %v", err)
 	}
 }
 

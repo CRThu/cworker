@@ -136,34 +136,43 @@ func TestCmd_ServiceHelpers(t *testing.T) {
 }
 
 func TestCmd_FsValidations(t *testing.T) {
-	// mdCmd 参数校验：缺少节点目标
-	err := mdCmd.RunE(mdCmd, []string{"invalid_no_colon"})
-	if err == nil {
-		t.Fatal("expected error for missing node colon in mdCmd")
+	tempDir := t.TempDir()
+
+	// mdCmd 本地创建目录支持
+	localMdDir := filepath.Join(tempDir, "local_md_test")
+	if err := mdCmd.RunE(mdCmd, []string{localMdDir}); err != nil {
+		t.Fatalf("expected local mdCmd to succeed, got: %v", err)
+	}
+	if fi, err := os.Stat(localMdDir); err != nil || !fi.IsDir() {
+		t.Fatalf("local mdCmd did not create directory: %v", err)
 	}
 
-	// catCmd 参数校验：缺少节点目标
-	err = catCmd.RunE(catCmd, []string{"invalid_no_colon"})
-	if err == nil {
-		t.Fatal("expected error for missing node colon in catCmd")
+	// catCmd 本地读取支持与不存在报错
+	localCatFile := filepath.Join(tempDir, "cat_test.txt")
+	_ = os.WriteFile(localCatFile, []byte("cat content"), 0644)
+	if err := catCmd.RunE(catCmd, []string{localCatFile}); err != nil {
+		t.Fatalf("expected local catCmd to succeed, got: %v", err)
+	}
+	if err := catCmd.RunE(catCmd, []string{filepath.Join(tempDir, "non_existent.txt")}); err == nil {
+		t.Fatal("expected error for non-existent file in catCmd")
 	}
 
-	// lsCmd 参数校验：缺少节点目标
-	err = lsCmd.RunE(lsCmd, []string{"invalid_no_colon"})
+	// lsCmd 路径不存在时报错
+	err := lsCmd.RunE(lsCmd, []string{filepath.Join(tempDir, "non_existent_dir")})
 	if err == nil {
-		t.Fatal("expected error for missing node colon in lsCmd")
+		t.Fatal("expected error for non-existent dir in lsCmd")
 	}
 
-	// rmCmd 参数校验：缺少节点目标
-	err = rmCmd.RunE(rmCmd, []string{"invalid_no_colon"})
+	// rmCmd 路径不存在时报错
+	err = rmCmd.RunE(rmCmd, []string{filepath.Join(tempDir, "non_existent_file")})
 	if err == nil {
-		t.Fatal("expected error for missing node colon in rmCmd")
+		t.Fatal("expected error for non-existent path in rmCmd")
 	}
 
-	// cpCmd 参数校验：全为本地路径
-	err = cpCmd.RunE(cpCmd, []string{"local1.txt", "local2.txt"})
+	// cpCmd 参数校验：本地不存在源文件时报错
+	err = cpCmd.RunE(cpCmd, []string{filepath.Join(tempDir, "missing.txt"), filepath.Join(tempDir, "dst.txt")})
 	if err == nil {
-		t.Fatal("expected error when both paths are local in cpCmd")
+		t.Fatal("expected error when local source does not exist in cpCmd")
 	}
 }
 
