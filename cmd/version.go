@@ -9,7 +9,7 @@ import (
 
 var (
 	// Version 当前软件发布版本号 (SSOT 单一事实来源)
-	Version = "1.1.0"
+	Version = "1.2.0"
 	// BuildDate 构建日期
 	BuildDate = "2026-09-11"
 )
