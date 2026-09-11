@@ -15,10 +15,12 @@ import (
 
 var (
 	diffRecursive bool
+	diffAll       bool
+	diffLimit     int
 )
 
 var diffCmd = &cobra.Command{
-	Use:          "diff [flags] <src> <dest>",
+	Use:          "diff [flags] [<node>:]<src> [<node>:]<dest>",
 	Short:        "跨机或本地比对文件与目录 (基于 SHA-256 强校验，默认排除相同文件)",
 	Args:         cobra.ExactArgs(2),
 	SilenceUsage: true,
@@ -30,6 +32,8 @@ var diffCmd = &cobra.Command{
 		dstNode, dstPath := pathutil.ParseNodePath(dstRaw)
 
 		recursive, _ := cmd.Flags().GetBool("recursive")
+		all, _ := cmd.Flags().GetBool("all")
+		limit, _ := cmd.Flags().GetInt("limit")
 
 		ctx := cmd.Context()
 		if ctx == nil {
@@ -98,12 +102,22 @@ var diffCmd = &cobra.Command{
 			return nil
 		}
 
-		// 输出差异条目 (默认排除全部 MATCH 项)
+		// 输出差异条目 (默认排除全部 MATCH 项，若差异条目过多自动截断省略)
+		totalDiffs := diffRes.Modified + diffRes.Added + diffRes.Deleted
+		effectiveLimit := limit
+		if all || limit <= 0 {
+			effectiveLimit = totalDiffs
+		}
+
 		w := tabwriter.NewWriter(os.Stdout, 2, 8, 2, ' ', 0)
 		fmt.Fprintln(w, "STATUS\tSIZE (SRC -> DST)\tPATH")
+		displayed := 0
 		for _, entry := range diffRes.Entries {
 			if entry.Status == protocol.DiffStatusMatch {
 				continue
+			}
+			if displayed >= effectiveLimit {
+				break
 			}
 
 			var sizeStr string
@@ -117,8 +131,13 @@ var diffCmd = &cobra.Command{
 			}
 
 			fmt.Fprintf(w, "[%s]\t%s\t%s\n", entry.Status, sizeStr, entry.Path)
+			displayed++
 		}
 		_ = w.Flush()
+
+		if displayed < totalDiffs {
+			fmt.Printf("... and %d more differing entries omitted (use --all to show all)\n", totalDiffs-displayed)
+		}
 
 		fmt.Printf("\nSummary: %d matched, %d modified, %d added, %d deleted.\n",
 			diffRes.Matched, diffRes.Modified, diffRes.Added, diffRes.Deleted)
@@ -143,5 +162,7 @@ func formatBytes(bytes int64) string {
 
 func init() {
 	diffCmd.Flags().BoolVarP(&diffRecursive, "recursive", "r", false, "递归比对目录及其下所有文件")
+	diffCmd.Flags().BoolVar(&diffAll, "all", false, "显示全部差异条目，不进行截断省略")
+	diffCmd.Flags().IntVar(&diffLimit, "limit", 50, "最大展示的差异条目数 (默认 50，设为 0 或传 --all 查看全部)")
 	RootCmd.AddCommand(diffCmd)
 }

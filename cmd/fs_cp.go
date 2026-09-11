@@ -19,8 +19,8 @@ var (
 )
 
 var cpCmd = &cobra.Command{
-	Use:   "cp [flags] <src> <dest>",
-	Short: "跨机拷贝文件或目录 (支持 本地->远端、远端->本地、远端->远端 管道直连与并发传输)",
+	Use:   "cp [flags] [<node>:]<src> [<node>:]<dest>",
+	Short: "跨机或本地拷贝文件与目录 (支持 本地<->远端、远端<->远端、本地<->本地 管道直连与并发传输)",
 	Args:  cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		srcRaw := args[0]

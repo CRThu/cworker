@@ -9,6 +9,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -21,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"cworker/pkg/fsengine"
 	"cworker/pkg/pathutil"
 	"cworker/pkg/process"
 	"cworker/pkg/protocol"
@@ -529,61 +531,16 @@ func (w *Worker) handleFsUpload(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 自动递归创建父级目录
-	parentDir := filepath.Dir(cleanPath)
-	if err := os.MkdirAll(parentDir, 0755); err != nil {
-		http.Error(rw, "create parent dir failed: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	if fi, err := os.Stat(cleanPath); err == nil && fi.IsDir() {
-		http.Error(rw, "destination path is an existing directory", http.StatusBadRequest)
-		return
-	}
-
-	// 写入同目录下的临时文件，待流式传输完成且校验通过后再原子替换目标文件，防止传输中断破坏目标原文件
-	tmpPath := filepath.Join(parentDir, fmt.Sprintf(".%s.cwupload-%d", filepath.Base(cleanPath), time.Now().UnixNano()))
-	destFile, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	expectedHash := strings.TrimSpace(r.Header.Get("X-File-SHA256"))
+	computedHash, err := fsengine.SaveStream(cleanPath, r.Body, expectedHash)
 	if err != nil {
-		http.Error(rw, "create temp file failed: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	committed := false
-	defer func() {
-		_ = destFile.Close()
-		if !committed {
-			_ = os.Remove(tmpPath)
+		if errors.Is(err, fsengine.ErrDestinationIsDir) || errors.Is(err, fsengine.ErrHashMismatch) {
+			http.Error(rw, err.Error(), http.StatusBadRequest)
+			return
 		}
-	}()
-
-	hasher := sha256.New()
-	destWriter := io.MultiWriter(destFile, hasher)
-
-	if _, err := io.Copy(destWriter, r.Body); err != nil {
 		http.Error(rw, "write file failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if err := destFile.Close(); err != nil {
-		http.Error(rw, "flush dest file failed: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	computedHash := hex.EncodeToString(hasher.Sum(nil))
-	expectedHash := strings.TrimSpace(r.Header.Get("X-File-SHA256"))
-	if expectedHash != "" && !strings.EqualFold(expectedHash, computedHash) {
-		http.Error(rw, fmt.Sprintf("sha256 mismatch: expected %s, got %s", expectedHash, computedHash), http.StatusBadRequest)
-		return
-	}
-
-	// 原子替换目标文件
-	if err := os.Rename(tmpPath, cleanPath); err != nil {
-		_ = os.Remove(cleanPath)
-		if err2 := os.Rename(tmpPath, cleanPath); err2 != nil {
-			http.Error(rw, "commit dest file failed: "+err2.Error(), http.StatusInternalServerError)
-			return
-		}
-	}
-	committed = true
 
 	rw.Header().Set("X-File-SHA256", computedHash)
 	rw.WriteHeader(http.StatusOK)
@@ -648,84 +605,19 @@ func (w *Worker) handleFsList(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fi, err := os.Stat(cleanPath)
+	recursive := r.URL.Query().Get("recursive") == "true"
+	list, err := fsengine.ListDir(cleanPath, recursive)
 	if err != nil {
 		if os.IsNotExist(err) {
 			http.Error(rw, "path not found", http.StatusNotFound)
 			return
 		}
+		if errors.Is(err, fsengine.ErrPathIsFile) {
+			http.Error(rw, "path is a file, not a directory", http.StatusBadRequest)
+			return
+		}
 		http.Error(rw, err.Error(), http.StatusInternalServerError)
 		return
-	}
-	if !fi.IsDir() {
-		http.Error(rw, "path is a file, not a directory", http.StatusBadRequest)
-		return
-	}
-
-	recursive := r.URL.Query().Get("recursive") == "true"
-	var list []protocol.FileInfo
-
-	if recursive {
-		err = filepath.WalkDir(cleanPath, func(path string, d os.DirEntry, err error) error {
-			if err != nil {
-				return err
-			}
-			if path == cleanPath {
-				return nil
-			}
-			info, err := d.Info()
-			if err != nil {
-				return nil
-			}
-			// 过滤符号链接避免循环递归
-			if info.Mode()&os.ModeSymlink != 0 {
-				if d.IsDir() {
-					return filepath.SkipDir
-				}
-				return nil
-			}
-
-			rel, err := filepath.Rel(cleanPath, path)
-			if err != nil {
-				return err
-			}
-
-			list = append(list, protocol.FileInfo{
-				Name:    d.Name(),
-				Path:    filepath.ToSlash(rel),
-				IsDir:   d.IsDir(),
-				Size:    info.Size(),
-				ModTime: info.ModTime(),
-			})
-			return nil
-		})
-		if err != nil {
-			http.Error(rw, "walk dir failed: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-	} else {
-		entries, err := os.ReadDir(cleanPath)
-		if err != nil {
-			http.Error(rw, "readdir failed: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		for _, e := range entries {
-			info, _ := e.Info()
-			size := int64(0)
-			modTime := time.Now()
-			if info != nil {
-				size = info.Size()
-				modTime = info.ModTime()
-			}
-			list = append(list, protocol.FileInfo{
-				Name:    e.Name(),
-				Path:    e.Name(),
-				IsDir:   e.IsDir(),
-				Size:    size,
-				ModTime: modTime,
-			})
-		}
 	}
 
 	rw.Header().Set("Content-Type", "application/json")
@@ -745,7 +637,7 @@ func (w *Worker) handleFsMakeDir(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := os.MkdirAll(cleanPath, 0755); err != nil {
+	if err := fsengine.MakeDir(cleanPath); err != nil {
 		http.Error(rw, "mkdir failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -768,35 +660,17 @@ func (w *Worker) handleFsRemove(rw http.ResponseWriter, r *http.Request) {
 	}
 
 	recursive := r.URL.Query().Get("recursive") == "true"
-	fi, err := os.Stat(cleanPath)
-	if err != nil {
+	if err := fsengine.Remove(cleanPath, recursive); err != nil {
 		if os.IsNotExist(err) {
 			http.Error(rw, "path not found", http.StatusNotFound)
 			return
 		}
-		http.Error(rw, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	if fi.IsDir() {
-		if !recursive {
-			entries, _ := os.ReadDir(cleanPath)
-			if len(entries) > 0 {
-				http.Error(rw, "path is a non-empty directory, requires recursive flag (-r)", http.StatusBadRequest)
-				return
-			}
-			_ = os.Remove(cleanPath)
-		} else {
-			if err := os.RemoveAll(cleanPath); err != nil {
-				http.Error(rw, "remove dir failed: "+err.Error(), http.StatusInternalServerError)
-				return
-			}
-		}
-	} else {
-		if err := os.Remove(cleanPath); err != nil {
-			http.Error(rw, "remove file failed: "+err.Error(), http.StatusInternalServerError)
+		if errors.Is(err, fsengine.ErrNonEmptyDirRequiresRecursive) {
+			http.Error(rw, "path is a non-empty directory, requires recursive flag (-r)", http.StatusBadRequest)
 			return
 		}
+		http.Error(rw, "remove failed: "+err.Error(), http.StatusInternalServerError)
+		return
 	}
 
 	rw.WriteHeader(http.StatusOK)
@@ -816,113 +690,21 @@ func (w *Worker) handleFsHash(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fi, err := os.Stat(cleanPath)
+	recursive := r.URL.Query().Get("recursive") == "true"
+	list, err := fsengine.Hash(cleanPath, recursive)
 	if err != nil {
 		if os.IsNotExist(err) {
 			http.Error(rw, "path not found", http.StatusNotFound)
 			return
 		}
-		http.Error(rw, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	recursive := r.URL.Query().Get("recursive") == "true"
-
-	if fi.IsDir() {
-		if !recursive {
+		if errors.Is(err, fsengine.ErrDirRequiresRecursive) {
 			http.Error(rw, "path is a directory, requires recursive flag (-r)", http.StatusBadRequest)
 			return
 		}
-
-		var list []protocol.FileInfo
-		err = filepath.WalkDir(cleanPath, func(path string, d os.DirEntry, err error) error {
-			if err != nil {
-				return err
-			}
-			if path == cleanPath {
-				return nil
-			}
-			info, err := d.Info()
-			if err != nil {
-				return nil
-			}
-			// 过滤符号链接避免循环递归
-			if info.Mode()&os.ModeSymlink != 0 {
-				if d.IsDir() {
-					return filepath.SkipDir
-				}
-				return nil
-			}
-			if d.IsDir() {
-				return nil
-			}
-
-			rel, err := filepath.Rel(cleanPath, path)
-			if err != nil {
-				return err
-			}
-
-			hash, err := hashFile(path)
-			if err != nil {
-				return fmt.Errorf("hash file %s failed: %w", path, err)
-			}
-
-			list = append(list, protocol.FileInfo{
-				Name:    d.Name(),
-				Path:    filepath.ToSlash(rel),
-				IsDir:   false,
-				Size:    info.Size(),
-				ModTime: info.ModTime(),
-				SHA256:  hash,
-			})
-			return nil
-		})
-		if err != nil {
-			http.Error(rw, "walk dir failed: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		if list == nil {
-			list = []protocol.FileInfo{}
-		}
-
-		rw.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(rw).Encode(list)
+		http.Error(rw, "hash failed: "+err.Error(), http.StatusInternalServerError)
 		return
-	}
-
-	// 单文件哈希
-	hash, err := hashFile(cleanPath)
-	if err != nil {
-		http.Error(rw, "hash file failed: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	list := []protocol.FileInfo{
-		{
-			Name:    filepath.Base(cleanPath),
-			Path:    filepath.Base(cleanPath),
-			IsDir:   false,
-			Size:    fi.Size(),
-			ModTime: fi.ModTime(),
-			SHA256:  hash,
-		},
 	}
 
 	rw.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(rw).Encode(list)
-}
-
-func hashFile(filePath string) (string, error) {
-	f, err := os.Open(filePath)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-
-	hasher := sha256.New()
-	if _, err := io.Copy(hasher, f); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(hasher.Sum(nil)), nil
 }

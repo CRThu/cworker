@@ -165,12 +165,12 @@ cw kill job-58a90e40
 ### 3. 跨机与本地文件治理
 | 命令 | 行为与特性 |
 | :--- | :--- |
-| `cw cp [-r] [-j <n>] <src> <dest>` | 支持文件与目录 本地 $\leftrightarrow$ 远端、远端 $\leftrightarrow$ 远端、本地 $\leftrightarrow$ 本地；单遍流式 SHA-256 校验；`-r` 递归拷贝，`-j` 并发连接数（默认 8） |
-| `cw diff [-r] <src> <dest>` | 跨机或本地文件/目录 SHA-256 强校验比对；`-r` 递归比对，默认排除相同文件；退出码：`0` 一致，`1` 差异，`2` 异常 |
-| `cw cat [[node]:]<path>` | 直接在控制台终端打印远端或本地文件文本内容 |
-| `cw ls <node>:<path>` | 结构化输出远端目录结构、大小与修改时间 |
-| `cw md [[node]:]<path>` | 远端或本地递归创建目录（等同 `mkdir -p`） |
-| `cw rm [-r] [-y] <node>:<path>` | 删除远端文件或目录；非空目录需 `-r`，脚本调用带 `-y` 可跳过二次确认 |
+| `cw cp [-r] [-j <n>] [<node>:]<src> [<node>:]<dest>` | 支持文件与目录 本地 $\leftrightarrow$ 远端、远端 $\leftrightarrow$ 远端、本地 $\leftrightarrow$ 本地；单遍流式 SHA-256 校验；`-r` 递归拷贝，`-j` 并发连接数（默认 8） |
+| `cw diff [-r] [--limit <n>] [--all] [<node>:]<src> [<node>:]<dest>` | 跨机或本地文件/目录 SHA-256 强校验比对；`-r` 递归比对，默认排除相同文件，大差异自动截断（默认 50 条）；退出码：`0` 一致，`1` 差异，`2` 异常 |
+| `cw cat [<node>:]<path>` | 直接在控制台终端打印远端或本地文件文本内容 |
+| `cw ls [<node>:]<path>` | 结构化输出远端或本地目录结构、大小与修改时间 |
+| `cw md [<node>:]<path>` | 远端或本地递归创建目录（等同 `mkdir -p`） |
+| `cw rm [-r] [-y] [<node>:]<path>` | 删除远端或本地文件或目录；非空目录需 `-r`，脚本调用带 `-y` 可跳过二次确认 |
 
 ---
 

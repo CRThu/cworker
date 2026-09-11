@@ -1498,5 +1498,52 @@ func TestClient_LocalCopy(t *testing.T) {
 	}
 }
 
+func TestClient_LocalOperations(t *testing.T) {
+	tempDir := t.TempDir()
+
+	// 1. MakeLocalDir
+	targetDir := filepath.Join(tempDir, "x", "y", "z")
+	if err := MakeLocalDir(targetDir); err != nil {
+		t.Fatalf("MakeLocalDir failed: %v", err)
+	}
+	if fi, err := os.Stat(targetDir); err != nil || !fi.IsDir() {
+		t.Fatalf("directory was not created by MakeLocalDir")
+	}
+
+	// 2. ListLocalDir
+	file1 := filepath.Join(targetDir, "f1.txt")
+	_ = os.WriteFile(file1, []byte("content"), 0644)
+	subDir := filepath.Join(targetDir, "sub")
+	_ = os.Mkdir(subDir, 0755)
+
+	entries, err := ListLocalDir(targetDir)
+	if err != nil {
+		t.Fatalf("ListLocalDir failed: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 entries in ListLocalDir, got %d", len(entries))
+	}
+
+	// 3. DeleteLocal
+	// Non-empty dir without recursive -> should fail
+	if err := DeleteLocal(targetDir, false); err == nil {
+		t.Fatal("expected error deleting non-empty dir without recursive")
+	}
+
+	// Delete file
+	if err := DeleteLocal(file1, false); err != nil {
+		t.Fatalf("DeleteLocal file failed: %v", err)
+	}
+
+	// Delete remaining with recursive
+	if err := DeleteLocal(targetDir, true); err != nil {
+		t.Fatalf("DeleteLocal recursive failed: %v", err)
+	}
+	if _, err := os.Stat(targetDir); !os.IsNotExist(err) {
+		t.Fatalf("targetDir should be deleted")
+	}
+}
+
+
 
 

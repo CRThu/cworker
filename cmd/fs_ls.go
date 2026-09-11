@@ -12,7 +12,7 @@ import (
 )
 
 var lsCmd = &cobra.Command{
-	Use:   "ls [[node]:]<path>",
+	Use:   "ls [<node>:]<path>",
 	Short: "查看远端节点或本地目录的内容与文件元数据",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {

@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"fmt"
-	"os"
 
 	"cworker/pkg/client"
 	"cworker/pkg/pathutil"
@@ -16,14 +15,10 @@ var mdCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		node, path := pathutil.ParseNodePath(args[0])
 		if node == "" {
-			cleanPath, err := pathutil.NormalizeLocalPath(path)
-			if err != nil {
-				return err
-			}
-			if err := os.MkdirAll(cleanPath, 0755); err != nil {
+			if err := client.MakeLocalDir(path); err != nil {
 				return fmt.Errorf("local mkdir failed: %w", err)
 			}
-			fmt.Printf("[OK] Local directory created: '%s'\n", cleanPath)
+			fmt.Printf("[OK] Local directory created: '%s'\n", path)
 			return nil
 		}
 

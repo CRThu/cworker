@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"cworker/pkg/client"
+	"cworker/pkg/pathutil"
 	"cworker/pkg/protocol"
 	"cworker/pkg/worker"
 )
@@ -366,6 +367,35 @@ func TestCluster_FullLifecycle(t *testing.T) {
 	emptyRootFi, err := os.Stat(filepath.Join(restoredDir, "empty_root"))
 	if err != nil || !emptyRootFi.IsDir() {
 		t.Fatalf("empty_root directory not preserved")
+	}
+
+	// 5.5 跨节点真实在环哈希比对 (node-alpha vs node-beta)
+	alphaHashFiles, err := cli.HashRemotePath(ctx, "node-alpha", remoteDirAlpha, true)
+	if err != nil {
+		t.Fatalf("HashRemotePath on alpha failed: %v", err)
+	}
+	betaHashFiles, err := cli.HashRemotePath(ctx, "node-beta", remoteDirBeta, true)
+	if err != nil {
+		t.Fatalf("HashRemotePath on beta failed: %v", err)
+	}
+
+	diffIdentical := client.CompareFileInfos(alphaHashFiles, betaHashFiles)
+	if diffIdentical.Matched != 2 || diffIdentical.Modified != 0 || diffIdentical.Added != 0 || diffIdentical.Deleted != 0 {
+		t.Fatalf("expected 2 matched, 0 diffs across identical nodes, got: %+v", diffIdentical)
+	}
+
+	// 在 beta 上篡改 file1.txt，验证跨节点真实差异探测
+	tamperedBetaFile := pathutil.JoinRemotePath(remoteDirBeta, "file1.txt")
+	if err := cli.UploadFile("node-beta", tamperedBetaFile, strings.NewReader("tampered_content_xyz")); err != nil {
+		t.Fatalf("tamper upload on beta failed: %v", err)
+	}
+	betaHashFilesTampered, err := cli.HashRemotePath(ctx, "node-beta", remoteDirBeta, true)
+	if err != nil {
+		t.Fatalf("HashRemotePath on beta tampered failed: %v", err)
+	}
+	diffTampered := client.CompareFileInfos(alphaHashFiles, betaHashFilesTampered)
+	if diffTampered.Matched != 1 || diffTampered.Modified != 1 {
+		t.Fatalf("expected 1 matched and 1 modified, got: %+v", diffTampered)
 	}
 
 	// 清理远程目录

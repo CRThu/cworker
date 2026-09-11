@@ -17,7 +17,7 @@ var (
 )
 
 var rmCmd = &cobra.Command{
-	Use:   "rm [flags] [[node]:]<path>",
+	Use:   "rm [flags] [<node>:]<path>",
 	Short: "删除远端节点或本地的文件或目录 (非空目录需显式指定 -r)",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
