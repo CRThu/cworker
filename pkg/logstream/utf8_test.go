@@ -36,7 +36,14 @@ func TestEnsureUTF8(t *testing.T) {
 		t.Fatalf("expected Chinese '你好', got: %s", string(out))
 	}
 
-	// 4. 空切片
+	// 4. 任意非合规二进制/混合序列，确保严格输出合法 UTF-8 且无 panic
+	mixedBytes := []byte{0xFF, 0xFE, 0x80, 0xC0}
+	out = EnsureUTF8(mixedBytes)
+	if !utf8.Valid(out) {
+		t.Fatalf("EnsureUTF8 output must strictly be valid utf8 for arbitrary bytes")
+	}
+
+	// 5. 空切片
 	if len(EnsureUTF8(nil)) != 0 {
 		t.Fatalf("expected empty slice for nil")
 	}
