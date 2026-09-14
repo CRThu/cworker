@@ -4,12 +4,13 @@ import (
 	"fmt"
 	"runtime"
 
+	"cworker/pkg/protocol"
 	"github.com/spf13/cobra"
 )
 
 var (
-	// Version 当前软件发布版本号 (SSOT 单一事实来源)
-	Version = "1.2.0"
+	// Version 当前软件发布版本号 (以 protocol.Version 为契约权威)
+	Version = protocol.Version
 	// BuildDate 构建日期
 	BuildDate = "2026-09-11"
 )

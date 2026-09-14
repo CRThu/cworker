@@ -24,6 +24,7 @@ description: >-
 - **Async Execution**: `cw run` returns immediately with a `job-<hex>` handle. Do not block; poll status with `cw ps` or inspect output with `cw logs <job_id>`.
 - **Process Tree Cleanup**: `cw kill <job_id>` uses Win32 Job Objects to terminate the entire process hierarchy without leaving orphan processes.
 - **`cw clean` MUST include `-y`**: Cleaning finished job records and logs requires `-y` for non-interactive execution. You must also specify either `--days <n>` or `--all`. Active `RUNNING` jobs are strictly protected from deletion.
+- **`cw ui` is a Foreground Blocking Server**: `cw ui [--port <p>] [--no-open]` runs the embedded local Web console on 127.0.0.1. Do NOT execute it synchronously in non-daemon agent subshells as it blocks indefinitely; advise users to run it in a separate terminal or launch it as a background daemon process.
 - **401 Unauthorized Recovery**: If a command returns 401, the target node's token changed or is missing. Fetch the token via `cw show` on that node. You can either update the ledger via `cw node add <node> <target> --token <token>`, or dispatch directly with `cw run -n <node> --token <token> ...` (the client will automatically persist valid tokens to the local ledger upon successful handshake).
 
 ## 2. CLI Reference
@@ -46,6 +47,7 @@ description: >-
 | **List Dir** | `cw ls [<node>:]<path>` | Lists directory entries, mode, size, and mod time (remote or local) |
 | **Make Dir** | `cw md [<node>:]<path>` | Recursive directory creation (`mkdir -p`) on remote or local |
 | **Remove** | `cw rm -r -y [<node>:]<path>` | Non-interactive recursive deletion on remote or local |
+| **Web Console** | `cw ui [--port <p>] [--no-open]` | Local Web console (127.0.0.1; foreground blocking server; embedded Svelte SPA) |
 | **Service Control**| `cw service <start\|stop\|status>` | Manages background service (requires Admin) |
 | **Update** | `cw update [-y] [--check] [--force] [--proxy <url>] [--mirror <url>]` | Manual self-update from GitHub (`crthu/cworker`); auto detects registry proxy; aborts if jobs running |
 | **Version** | `cw -v` / `cw version` | Outputs version, build date, Go runtime |

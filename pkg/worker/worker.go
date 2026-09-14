@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"cworker/pkg/fsengine"
+	"cworker/pkg/logstream"
 	"cworker/pkg/pathutil"
 	"cworker/pkg/process"
 	"cworker/pkg/protocol"
@@ -513,21 +514,22 @@ func (w *Worker) handleGetLogs(rw http.ResponseWriter, r *http.Request) {
 	defer file.Close()
 
 	linesStr := r.URL.Query().Get("lines")
+	var content []byte
 	if linesStr != "" {
 		if n, err := strconv.Atoi(linesStr); err == nil && n > 0 {
-			content, err := tailFile(file, n)
+			content, err = tailFile(file, n)
 			if err != nil {
 				http.Error(rw, "tail log failed: "+err.Error(), http.StatusInternalServerError)
 				return
 			}
-			rw.Header().Set("Content-Type", "text/plain; charset=utf-8")
-			_, _ = rw.Write(content)
-			return
 		}
+	}
+	if content == nil {
+		content, _ = io.ReadAll(file)
 	}
 
 	rw.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	_, _ = io.Copy(rw, file)
+	_, _ = rw.Write(logstream.EnsureUTF8(content))
 }
 
 func (w *Worker) handleStreamLogs(rw http.ResponseWriter, r *http.Request) {
@@ -541,7 +543,22 @@ func (w *Worker) handleStreamLogs(rw http.ResponseWriter, r *http.Request) {
 	job, exists := w.jobs[jobID]
 	w.mu.RUnlock()
 
+	logPath := filepath.Join(w.cfg.DataDir, "jobs", jobID, "output.log")
+
 	if !exists {
+		// 若内存中无该任务对象 (例如任务执行完毕后 Worker 曾重启)，仍兜底直读磁盘历史日志
+		if f, err := os.Open(logPath); err == nil {
+			defer f.Close()
+			conn, err := websocket.Accept(rw, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+			if err == nil {
+				defer conn.Close(websocket.StatusNormalClosure, "")
+				data, _ := io.ReadAll(f)
+				if len(data) > 0 {
+					_ = conn.Write(r.Context(), websocket.MessageText, logstream.EnsureUTF8(data))
+				}
+			}
+			return
+		}
 		http.Error(rw, "job not found", http.StatusNotFound)
 		return
 	}
@@ -554,7 +571,7 @@ func (w *Worker) handleStreamLogs(rw http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
-	logPath := filepath.Join(w.cfg.DataDir, "jobs", jobID, "output.log")
+	// 1. 先将已落盘历史输出转为安全 UTF-8 推送到客户端
 	if f, err := os.Open(logPath); err == nil {
 		if fi, err := f.Stat(); err == nil && fi.Size() > 0 {
 			var hist []byte
@@ -564,10 +581,15 @@ func (w *Worker) handleStreamLogs(rw http.ResponseWriter, r *http.Request) {
 				hist, _ = io.ReadAll(f)
 			}
 			if len(hist) > 0 {
-				_ = conn.Write(r.Context(), websocket.MessageText, hist)
+				_ = conn.Write(r.Context(), websocket.MessageText, logstream.EnsureUTF8(hist))
 			}
 		}
 		_ = f.Close()
+	}
+
+	// 2. 若任务已结束，推送完历史日志即可正常关闭
+	if job.GetInfo().Status != protocol.JobStatusRunning {
+		return
 	}
 
 	subCh, unsubscribe := job.Broadcaster().Subscribe()
@@ -581,7 +603,7 @@ func (w *Worker) handleStreamLogs(rw http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
-			err := conn.Write(r.Context(), websocket.MessageText, chunk)
+			err := conn.Write(r.Context(), websocket.MessageText, logstream.EnsureUTF8(chunk))
 			if err != nil {
 				return
 			}

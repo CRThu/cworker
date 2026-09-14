@@ -161,6 +161,7 @@ cw kill job-58a90e40
 | `cw clean <--days <n> \| --all> [-n node] [-y]` | 显式清理已结束任务记录与磁盘 `output.log`；支持按天数筛选或全量清理已完成任务；严格保护 RUNNING 任务不受影响 |
 | `cw kill <job_id>` | 终止任务并销毁整棵子进程树（基于 Win32 Job Object） |
 | `cw logs <job_id> [-f] [-n lines]` | 查看任务日志；带 `-f` 实时跟随，`-n` 截取末尾行数（默认 100） |
+| `cw ui [--port <port>] [--no-open]` | 启动本地集中式 Web 控制台（严格监听 127.0.0.1，单文件 Go embed 内置前端，提供节点治理、任务生命周期、流式日志终端与文件互传） |
 | `cw update [-y] [--check] [--force] [--proxy <url>] [--mirror <url>]` | 从官方 GitHub Releases (`crthu/cworker`) 手动拉包自升级；自动感知系统代理与环境变量；有 RUNNING 活跃任务时严格报错拦截（除非 `--force`）；原地 Rename-Replace 无锁替换并重启服务 |
 | `cw version` / `cw -v` | 查看当前软件版本号、构建日期与 Go 运行环境 |
 
@@ -213,18 +214,20 @@ cworker 基于标准系统 DNS 解析（`net.LookupHost`），无需公网 IP �
 ### 1. 代码工程目录
 ```text
 cworker/
-├── .github/workflows/    # CI/CD (自动化测试与 Release 打包)
-├── cmd/                  # Cobra CLI 命令定义 (run, ps, logs, cp, service...)
+├── .github/workflows/    # CI/CD (Bun+Go 自动化测试与 Release 打包)
+├── cmd/                  # Cobra CLI 命令定义 (run, ps, logs, cp, ui, service...)
 ├── pkg/
 │   ├── client/           # HTTP/WS 客户端与 Known-Nodes 账本管理
 │   ├── worker/           # Worker 后台服务引擎与 API 路由
 │   ├── process/          # Win32 Job Object 孤儿治理与跨 Session 单例互斥锁
 │   ├── logstream/        # WebSocket 广播式日志流分发
 │   ├── pathutil/         # Windows 物理路径与 node:path 强类型智能归一化
+│   ├── ui/               # 本地 Web 控制台 HTTP 服务与嵌入式产物 (dist/*)
 │   └── protocol/         # 核心通信协议契约 (SSOT)
+├── web/                  # 前端现代化 SPA 控制台工程 (Svelte 5 + TS + Vite + Bun)
 ├── .agents/skills/cworker/ # AI Agent 技能定义
 ├── test/                 # 集群全拓扑、高并发与故障注入原生集成测试套件
-└── build.bat             # 一键单二进制编译与端到端集成测试脚本
+└── build.bat             # 一键自动构建前端 SPA、编译 Go 单二进制与测试脚本
 ```
 
 ### 2. 默认运行时存储目录 (`%USERPROFILE%\.cworker`)
@@ -244,12 +247,16 @@ cworker/
 
 ## 🛠️ 构建与开发
 
+### 环境依赖
+* **Go**：1.21+（后端与统一单二进制编译）
+* **Bun**：1.0+（前端 SPA 现代化构建与 Vitest 驱动）
+
 使用仓库内置构建脚本即可完成日常开发流：
 ```cmd
-:: 1. 编译单二进制至 bin\cw.exe
+:: 1. 自动构建前端 (Bun) 并编译单二进制至 bin\cw.exe
 build.bat
 
-:: 2. 编译并运行全量单元测试
+:: 2. 自动运行前端 Vitest 与后端 Go 全量单元测试
 build.bat test
 
 :: 3. 运行双节点无广播与进程治理端到端全链路实测

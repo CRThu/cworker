@@ -12,8 +12,31 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install Frontend Dependencies
+        working-directory: web
+        run: bun install --frozen-lockfile
+
+      - name: Run Frontend Tests
+        working-directory: web
+        run: bun run test
+
+      - name: Build Frontend Assets
+        working-directory: web
+        run: bun run build
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
         with:
           go-version-file: 'go.mod'
-      - run: go test ./...
-      - run: go build -ldflags="-s -w" -o bin/cw.exe .
+
+      - name: Run Backend Tests
+        run: go test ./...
+
+      - name: Build Unified Binary
+        run: go build -ldflags="-s -w" -o bin/cw.exe .

@@ -12,7 +12,20 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Build Frontend Assets
+        working-directory: web
+        run: |
+          bun install --frozen-lockfile
+          bun run build
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
         with:
           go-version-file: 'go.mod'
       - name: Build Binary

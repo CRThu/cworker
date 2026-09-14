@@ -289,6 +289,9 @@ func (c *Client) ListNodes() ([]protocol.NodeInfo, error) {
 				if resp.StatusCode == http.StatusOK {
 					var info protocol.NodeInfo
 					if err := json.NewDecoder(resp.Body).Decode(&info); err == nil {
+						if node.Name != "" {
+							info.Name = node.Name
+						}
 						mu.Lock()
 						list = append(list, info)
 						mu.Unlock()
@@ -555,9 +558,25 @@ func (c *Client) CleanJobs(targetNode string, days int, all bool) (map[string]pr
 	return results, nil
 }
 
-// GetLogs 获取日志
+func (c *Client) resolveTargetForJob(node string, jobID string) (*ResolvedTarget, error) {
+	if node != "" {
+		knownNodes, _ := c.getEffectiveKnownNodes()
+		if kn, ok := knownNodes[strings.ToLower(node)]; ok {
+			return c.ResolveWorker(kn.Name, kn.Token)
+		}
+		return c.ResolveWorker(node, "")
+	}
+	return c.findJobWorker(jobID)
+}
+
+// GetLogs 获取日志 (自动探测节点)
 func (c *Client) GetLogs(jobID string, lines int) (string, error) {
-	rt, err := c.findJobWorker(jobID)
+	return c.GetLogsNode("", jobID, lines)
+}
+
+// GetLogsNode 获取指定节点上的日志
+func (c *Client) GetLogsNode(node string, jobID string, lines int) (string, error) {
+	rt, err := c.resolveTargetForJob(node, jobID)
 	if err != nil {
 		return "", err
 	}
@@ -578,9 +597,14 @@ func (c *Client) GetLogs(jobID string, lines int) (string, error) {
 	return string(data), err
 }
 
-// StreamLogs 实时流式日志
+// StreamLogs 实时流式日志 (自动探测节点)
 func (c *Client) StreamLogs(ctx context.Context, jobID string, out io.Writer) error {
-	rt, err := c.findJobWorker(jobID)
+	return c.StreamLogsNode(ctx, "", jobID, out)
+}
+
+// StreamLogsNode 实时流式日志 (指定或探测节点)
+func (c *Client) StreamLogsNode(ctx context.Context, node string, jobID string, out io.Writer) error {
+	rt, err := c.resolveTargetForJob(node, jobID)
 	if err != nil {
 		return err
 	}
@@ -616,6 +640,7 @@ func (c *Client) findJobWorker(jobID string) (*ResolvedTarget, error) {
 		return nil, err
 	}
 
+	// 1. 先通过 /api/v1/jobs/ps 检索活跃/内存中的任务
 	for _, kn := range knownNodes {
 		rt, err := c.ResolveWorker(kn.Name, kn.Token)
 		if err != nil {
@@ -640,6 +665,24 @@ func (c *Client) findJobWorker(jobID string) (*ResolvedTarget, error) {
 			resp.Body.Close()
 		}
 	}
+
+	// 2. 若内存中未匹配 (如任务已完成且 Worker 曾重启)，向节点检索磁盘历史日志
+	for _, kn := range knownNodes {
+		rt, err := c.ResolveWorker(kn.Name, kn.Token)
+		if err != nil {
+			continue
+		}
+		path := fmt.Sprintf("/api/v1/jobs/logs?job_id=%s&lines=1", url.QueryEscape(jobID))
+		resp, err := c.doRequest(rt, http.MethodGet, path, nil)
+		if err != nil {
+			continue
+		}
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			return rt, nil
+		}
+	}
+
 	return nil, fmt.Errorf("job '%s' not found across known workers", jobID)
 }
 

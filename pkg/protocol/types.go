@@ -4,10 +4,16 @@ import "time"
 
 // 核心系统契约与协议常量 (SSOT 单一事实来源)
 const (
+	// Version 当前软件系统发布版本契约 (SSOT 单一事实来源)
+	Version = "1.2.0"
 	// DefaultPort Worker 默认监听端口
 	DefaultPort = 19000
 	// DefaultPortStr Worker 默认监听端口字符串形式
 	DefaultPortStr = "19000"
+	// DefaultUIPort Web UI 控制台默认监听端口
+	DefaultUIPort = 19001
+	// DefaultUIPortStr Web UI 控制台默认监听端口字符串形式
+	DefaultUIPortStr = "19001"
 	// DefaultDataDirName 默认用户存储目录名称
 	DefaultDataDirName = ".cworker"
 	// TokenFileName 默认 Token 文件名
