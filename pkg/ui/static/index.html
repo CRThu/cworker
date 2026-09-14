@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>cworker - 分布式任务治理与集群控制台</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <!-- 左侧固定导航栏 -->
+    <aside class="sidebar">
+        <div class="sidebar-header">
+            <span class="logo-badge">🥕</span>
+            <div>
+                <div class="brand-title">cworker <span style="font-size: 11px; background: rgba(249, 115, 22, 0.2); color: #f97316; padding: 1px 6px; border-radius: 4px;">Console</span></div>
+                <div class="brand-sub">内网分布式原生进程治理</div>
+            </div>
+        </div>
+
+        <nav class="sidebar-nav">
+            <div class="nav-item active" data-tab="nodes" id="nav-tab-nodes">
+                <span class="nav-icon">🖥️</span>
+                <span>节点矩阵</span>
+                <span class="nav-badge" id="badge-nodes-count">0</span>
+            </div>
+            <div class="nav-item" data-tab="jobs" id="nav-tab-jobs">
+                <span class="nav-icon">⚡</span>
+                <span>任务治理</span>
+                <span class="nav-badge" id="badge-jobs-running">0</span>
+            </div>
+            <div class="nav-item" data-tab="files" id="nav-tab-files">
+                <span class="nav-icon">📁</span>
+                <span>文件互传</span>
+            </div>
+        </nav>
+
+        <div class="sidebar-footer">
+            <div class="cluster-status-pill">
+                <span style="display: flex; align-items: center; gap: 6px;">
+                    <span class="status-dot online"></span>
+                    <span id="footer-online-count">0 在线</span>
+                </span>
+                <span style="color: var(--text-dim);">|</span>
+                <span id="footer-running-count">0 运行中</span>
+            </div>
+            <button class="btn-sidebar" id="btn-open-my-card">
+                <span>🔑</span> 本机名片 / Token
+            </button>
+        </div>
+    </aside>
+
+    <!-- 右侧主工作区 -->
+    <main class="main-workspace">
+        <header class="top-bar">
+            <div class="view-title" id="top-view-title">
+                <span>🖥️</span> 节点矩阵 (Nodes)
+            </div>
+            <div class="top-actions">
+                <div class="refresh-control">
+                    <span>自动刷新:</span>
+                    <select class="select" id="refresh-interval-select">
+                        <option value="2000" selected>2 秒</option>
+                        <option value="5000">5 秒</option>
+                        <option value="0">暂停</option>
+                    </select>
+                </div>
+                <button class="btn btn-primary" id="top-primary-action-btn">
+                    + 添加 Worker
+                </button>
+            </div>
+        </header>
+
+        <div class="content-container">
+            <!-- 视图 1: 节点矩阵 (Nodes) -->
+            <section id="view-nodes" class="tab-view">
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <div class="stat-label">总节点数</div>
+                        <div class="stat-value" id="stat-total-nodes">0</div>
+                        <div class="stat-sub" id="stat-online-nodes">0 在线</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">全集群活跃任务</div>
+                        <div class="stat-value" id="stat-active-jobs" style="color: var(--primary);">0</div>
+                        <div class="stat-sub">当前运行中 Job</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">平均 CPU 负荷</div>
+                        <div class="stat-value" id="stat-avg-cpu">0.0%</div>
+                        <div class="stat-sub">在线节点均值</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">集群总可用内存</div>
+                        <div class="stat-value" id="stat-total-mem">0 GB</div>
+                        <div class="stat-sub">物理可用内存总计</div>
+                    </div>
+                </div>
+
+                <div class="table-card">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>状态</th>
+                                <th>节点名称</th>
+                                <th>目标地址</th>
+                                <th>CPU 负荷</th>
+                                <th>内存占用 (已用 / 总量)</th>
+                                <th>活跃任务</th>
+                                <th>安全 TOKEN</th>
+                                <th style="text-align: right;">操作</th>
+                            </tr>
+                        </thead>
+                        <tbody id="nodes-table-body">
+                            <tr>
+                                <td colspan="8" style="text-align: center; color: var(--text-dim); padding: 32px;">正在加载节点数据...</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
+            <!-- 视图 2: 任务治理 (Jobs) -->
+            <section id="view-jobs" class="tab-view" style="display: none;">
+                <div class="filter-bar">
+                    <select class="select" id="job-node-filter" style="min-width: 160px;">
+                        <option value="">全部节点 (全集群)</option>
+                    </select>
+
+                    <div class="filter-pills" id="job-status-pills">
+                        <div class="pill-item active" data-status="">全部</div>
+                        <div class="pill-item" data-status="RUNNING">运行中</div>
+                        <div class="pill-item" data-status="COMPLETED">已成功</div>
+                        <div class="pill-item" data-status="FAILED">失败</div>
+                        <div class="pill-item" data-status="STOPPED">终止</div>
+                    </div>
+
+                    <input type="text" class="input" id="job-search-input" placeholder="搜索 Job ID / 名称 / 命令..." style="width: 240px;">
+
+                    <div style="margin-left: auto; display: flex; gap: 8px;">
+                        <button class="btn btn-secondary btn-sm" id="btn-open-clean-modal">
+                            🧹 清理历史
+                        </button>
+                    </div>
+                </div>
+
+                <div class="table-card">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>任务 ID</th>
+                                <th>节点</th>
+                                <th>任务名称</th>
+                                <th>状态</th>
+                                <th>CPU%</th>
+                                <th>内存</th>
+                                <th>运行时长</th>
+                                <th>执行命令</th>
+                                <th style="text-align: right;">操作</th>
+                            </tr>
+                        </thead>
+                        <tbody id="jobs-table-body">
+                            <tr>
+                                <td colspan="9" style="text-align: center; color: var(--text-dim); padding: 32px;">正在加载任务列表...</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
+            <!-- 视图 3: 文件互传 (Files) -->
+            <section id="view-files" class="tab-view" style="display: none;">
+                <div class="filter-bar">
+                    <div style="display: flex; align-items: center; gap: 8px; flex: 1;">
+                        <select class="select" id="fs-node-select" style="min-width: 160px;">
+                            <option value="">本机 (Local)</option>
+                        </select>
+                        <input type="text" class="input" id="fs-path-input" placeholder="输入目录路径 (例如 D:/workspace 或 .)" style="flex: 1;">
+                        <button class="btn btn-secondary" id="fs-browse-btn">前往</button>
+                    </div>
+
+                    <div style="display: flex; gap: 8px;">
+                        <input type="file" id="fs-file-input" style="display: none;">
+                        <button class="btn btn-secondary" id="fs-upload-trigger-btn">
+                            📤 上传文件
+                        </button>
+                        <button class="btn btn-primary" id="fs-open-transfer-modal-btn">
+                            🚀 跨机互传
+                        </button>
+                    </div>
+                </div>
+
+                <div class="table-card" id="fs-drop-zone" style="min-height: 360px;">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th style="width: 40px;">类型</th>
+                                <th>文件/目录名称</th>
+                                <th>大小</th>
+                                <th>修改时间</th>
+                                <th style="text-align: right;">操作</th>
+                            </tr>
+                        </thead>
+                        <tbody id="fs-table-body">
+                            <tr>
+                                <td colspan="5" style="text-align: center; color: var(--text-dim); padding: 32px;">请选择节点并点击“前往”以加载文件目录</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+        </div>
+    </main>
+
+    <!-- ================= 模态弹窗集 ================= -->
+
+    <!-- 模态框: 派发新任务 (Run Job) -->
+    <div class="modal-overlay" id="modal-run-job">
+        <div class="modal-content">
+            <div class="modal-header">
+                <div class="modal-title">⚡ 派发新任务 (cw run)</div>
+                <button class="modal-close" data-close="modal-run-job">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label class="form-label">目标 Worker 节点 *</label>
+                    <select class="select" id="run-job-node" required>
+                        <option value="">自动负载均衡 (推荐最低负荷)</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">任务自定义名称 (Name)</label>
+                    <input type="text" class="input" id="run-job-name" placeholder="例如: data-sync, train-model (可选)">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">工作目录 (CWD)</label>
+                    <input type="text" class="input" id="run-job-dir" placeholder="远端物理路径 (例如 D:/workspace，留空为默认)">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">执行命令 (Command) *</label>
+                    <textarea class="input" id="run-job-cmd" rows="3" placeholder="例如: python train.py --epochs 10 或 cmd /c ping 127.0.0.1" required style="resize: vertical;"></textarea>
+                    <span class="form-hint">直接在目标 Worker 原生宿主环境下执行，毫秒级异步调度返回。</span>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" data-close="modal-run-job">取消</button>
+                <button class="btn btn-primary" id="btn-submit-run-job">立即派发</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 模态框: 终止任务高危二次确认 (Kill Job) -->
+    <div class="modal-overlay" id="modal-kill-confirm">
+        <div class="modal-content" style="max-width: 480px;">
+            <div class="modal-header">
+                <div class="modal-title" style="color: #f87171;">⚠️ 确认终止任务？</div>
+                <button class="modal-close" data-close="modal-kill-confirm">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div style="background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.3); border-radius: 8px; padding: 12px; font-size: 13px; color: #fca5a5; line-height: 1.5;">
+                    <strong>高危破坏性操作：</strong><br>
+                    终止操作将由 Windows 内核级 <strong>Win32 Job Object</strong> 直接销毁整棵子进程树，无孤儿进程风险，但正在进行的计算或未落盘数据将立即丢失！
+                </div>
+                <div style="font-size: 13px; color: var(--text-muted);">
+                    <div>任务句柄: <strong id="kill-job-id-text" style="color: #fff;"></strong></div>
+                    <div>执行命令: <span id="kill-job-cmd-text" style="font-family: var(--font-mono); color: var(--text-dim);"></span></div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" data-close="modal-kill-confirm">取消</button>
+                <button class="btn btn-danger" id="btn-submit-kill-job">确定终止进程树</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 模态框: 清理已完成任务 (Clean Jobs) -->
+    <div class="modal-overlay" id="modal-clean-jobs">
+        <div class="modal-content" style="max-width: 480px;">
+            <div class="modal-header">
+                <div class="modal-title">🧹 清理历史任务与磁盘日志</div>
+                <button class="modal-close" data-close="modal-clean-jobs">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label class="form-label">目标范围</label>
+                    <select class="select" id="clean-jobs-node">
+                        <option value="">全集群所有已知 Worker</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">清理策略</label>
+                    <div style="display: flex; flex-direction: column; gap: 8px; font-size: 13px;">
+                        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                            <input type="radio" name="clean-policy" value="all" checked id="clean-radio-all">
+                            <span>清理所有已结束的终态任务 (All finished jobs)</span>
+                        </label>
+                        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                            <input type="radio" name="clean-policy" value="days" id="clean-radio-days">
+                            <span>仅清理早于指定天数的历史任务:</span>
+                            <input type="number" class="input" id="clean-days-input" value="7" min="1" style="width: 70px; padding: 3px 6px;"> 天前
+                        </label>
+                    </div>
+                    <span class="form-hint" style="color: #22c55e;">✔ 处于 RUNNING 状态的任务受底层绝对保护，绝不被清理。</span>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" data-close="modal-clean-jobs">取消</button>
+                <button class="btn btn-primary" id="btn-submit-clean-jobs">执行清理</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 模态框: 添加 Worker 节点 (Add Node) -->
+    <div class="modal-overlay" id="modal-add-node">
+        <div class="modal-content">
+            <div class="modal-header">
+                <div class="modal-title">🖥️ 添加 Worker 节点到本地账本</div>
+                <button class="modal-close" data-close="modal-add-node">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label class="form-label">节点别名 (Name) *</label>
+                    <input type="text" class="input" id="add-node-name" placeholder="例如: desktop-4090 或 worker-lab" required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">目标网络地址 (Target Host:Port) *</label>
+                    <input type="text" class="input" id="add-node-target" placeholder="例如: 192.168.1.105:19000 或 my-pc:19000" required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">安全认证 Token (选填)</label>
+                    <input type="password" class="input" id="add-node-token" placeholder="64位十六进制密钥 (首次连接自动记忆)">
+                    <span class="form-hint">可在远端机器上运行 'cw show' 查阅其有效 Token。</span>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" data-close="modal-add-node">取消</button>
+                <button class="btn btn-primary" id="btn-submit-add-node">保存并探活</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 模态框: 本机名片 / Token (My Node Card) -->
+    <div class="modal-overlay" id="modal-my-card">
+        <div class="modal-content">
+            <div class="modal-header">
+                <div class="modal-title">🔑 本机名片与安全 Token</div>
+                <button class="modal-close" data-close="modal-my-card">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label class="form-label">本机主机名</label>
+                    <input type="text" class="input" id="my-card-hostname" readonly>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">本机安全 Token (Ed25519)</label>
+                    <div style="display: flex; gap: 8px;">
+                        <input type="password" class="input" id="my-card-token" readonly style="flex: 1; font-family: var(--font-mono); font-size: 12px;">
+                        <button class="btn btn-secondary" id="btn-toggle-my-token">👁️</button>
+                        <button class="btn btn-secondary" id="btn-copy-my-token">复制</button>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">一键配对命令 (供远端控制机直接添加本机)</label>
+                    <div style="display: flex; gap: 8px;">
+                        <input type="text" class="input" id="my-card-pairing-cmd" readonly style="flex: 1; font-family: var(--font-mono); font-size: 12px;">
+                        <button class="btn btn-secondary" id="btn-copy-pairing-cmd">复制</button>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" data-close="modal-my-card">关闭</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 模态框: 实时流式日志终端抽屉 (Live Terminal Logs) -->
+    <div class="modal-overlay" id="modal-terminal-logs">
+        <div class="modal-content terminal-modal">
+            <div class="modal-header">
+                <div class="modal-title" style="display: flex; align-items: center; gap: 10px;">
+                    <span>📜 实时日志:</span>
+                    <span id="terminal-job-id" style="font-family: var(--font-mono); color: var(--primary);"></span>
+                    <span id="terminal-job-status" class="badge"></span>
+                </div>
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <label style="font-size: 12px; color: var(--text-dim); display: flex; align-items: center; gap: 5px; cursor: pointer;">
+                        <input type="checkbox" id="terminal-autoscroll" checked> 自动滚屏
+                    </label>
+                    <button class="btn btn-secondary btn-sm" id="terminal-clear-btn">清屏</button>
+                    <button class="btn btn-secondary btn-sm" id="terminal-download-btn">下载日志</button>
+                    <button class="modal-close" data-close="modal-terminal-logs">&times;</button>
+                </div>
+            </div>
+            <div class="terminal-body" id="terminal-output"></div>
+            <div class="modal-footer" style="padding: 8px 20px;">
+                <span style="font-size: 11px; color: var(--text-dim); margin-right: auto;" id="terminal-footer-hint">WebSocket 已连接，正在实时流式推流...</span>
+                <button class="btn btn-secondary btn-sm" data-close="modal-terminal-logs">关闭</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 模态框: 跨机/本地中继文件互传 (Transfer) -->
+    <div class="modal-overlay" id="modal-transfer">
+        <div class="modal-content">
+            <div class="modal-header">
+                <div class="modal-title">🚀 跨机 / 本地文件高速互传 (cw cp)</div>
+                <button class="modal-close" data-close="modal-transfer">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label class="form-label">源路径 (Source) *</label>
+                    <div style="display: flex; gap: 8px;">
+                        <select class="select" id="transfer-src-node" style="width: 140px;">
+                            <option value="">本地 (Local)</option>
+                        </select>
+                        <input type="text" class="input" id="transfer-src-path" placeholder="源物理绝对路径 (如 D:/data)" style="flex: 1;" required>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">目标路径 (Destination) *</label>
+                    <div style="display: flex; gap: 8px;">
+                        <select class="select" id="transfer-dst-node" style="width: 140px;">
+                            <option value="">本地 (Local)</option>
+                        </select>
+                        <input type="text" class="input" id="transfer-dst-path" placeholder="目标物理绝对路径 (如 D:/backup)" style="flex: 1;" required>
+                    </div>
+                </div>
+                <div style="display: flex; gap: 16px; align-items: center; font-size: 13px;">
+                    <label style="display: flex; align-items: center; gap: 6px; cursor: pointer;">
+                        <input type="checkbox" id="transfer-recursive" checked> 递归文件夹 (-r)
+                    </label>
+                    <div style="display: flex; align-items: center; gap: 6px;">
+                        <span>并发连接数:</span>
+                        <input type="number" class="input" id="transfer-concurrency" value="8" min="1" max="64" style="width: 60px; padding: 4px 6px;">
+                    </div>
+                </div>
+                <div id="transfer-progress-box" style="display: none; background: var(--bg-input); padding: 12px; border-radius: 6px; border: 1px solid var(--border);">
+                    <div style="display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 6px;">
+                        <span id="transfer-status-text">传输中...</span>
+                        <span id="transfer-percent-text">0%</span>
+                    </div>
+                    <div class="progress-bar-wrap" style="width: 100%;">
+                        <div class="progress-bar-fill" id="transfer-progress-fill" style="width: 0%;"></div>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" data-close="modal-transfer">取消</button>
+                <button class="btn btn-primary" id="btn-submit-transfer">开始传输</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 轻提示 Toast 容器 -->
+    <div class="toast-container" id="toast-container"></div>
+
+    <script src="/static/ansi.js"></script>
+    <script src="/static/app.js"></script>
+</body>
+</html>

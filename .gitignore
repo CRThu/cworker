@@ -9,4 +9,4 @@ test_fs*
 *.log
 *.out
 coverage*
-*.html
+coverage*.html
