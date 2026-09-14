@@ -84,6 +84,26 @@ export interface TransferProgress {
   percent: number;
   finished: boolean;
   error?: string;
+  totalFiles?: number;
+  completedFiles?: number;
+  totalBytes?: number;
+  transferredBytes?: number;
+  speedBps?: number;
+  activeFiles?: string[];
+  expanded?: boolean;
+}
+
+export interface TransferStreamFrame {
+  type: 'progress' | 'done' | 'error';
+  percent?: number;
+  total_files?: number;
+  completed_files?: number;
+  total_bytes?: number;
+  transferred_bytes?: number;
+  speed_bps?: number;
+  active_files?: string[];
+  error?: string;
 }
 
 export type ThemeMode = 'system' | 'dark' | 'light';
+

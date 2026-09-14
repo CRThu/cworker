@@ -479,6 +479,14 @@ func CopyDir(ctx context.Context, srcBaseDir, dstBaseDir string, concurrency int
 		return fmt.Errorf("walk local source dir failed: %w", err)
 	}
 
+	var totalBytes int64
+	for _, f := range files {
+		totalBytes += f.size
+	}
+	if st, ok := tracker.(interface{ SetTotals(int64, int64) }); ok && st != nil {
+		st.SetTotals(int64(len(files)), totalBytes)
+	}
+
 	// 先建目录骨架 (保证空目录守恒)
 	if err := os.MkdirAll(cleanDst, 0755); err != nil {
 		return fmt.Errorf("create destination dir '%s' failed: %w", cleanDst, err)
@@ -524,6 +532,10 @@ concurrencyLoop:
 
 			srcF := filepath.Join(cleanSrc, filepath.FromSlash(entry.relPath))
 			dstF := filepath.Join(cleanDst, filepath.FromSlash(entry.relPath))
+			if st, ok := tracker.(interface{ StartFile(string); EndFile(string) }); ok && st != nil {
+				st.StartFile(entry.relPath)
+				defer st.EndFile(entry.relPath)
+			}
 			if err := CopyFile(srcF, dstF, tracker); err != nil {
 				errMu.Lock()
 				if firstErr == nil {

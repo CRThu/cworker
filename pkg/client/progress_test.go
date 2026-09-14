@@ -230,3 +230,52 @@ func TestIsSafeRelativePath(t *testing.T) {
 	}
 }
 
+func TestProgressTracker_SnapshotAndCallbacks(t *testing.T) {
+	tracker := NewProgressTracker(2, 200)
+	tracker.SetTTY(false)
+
+	var snapshots []ProgressSnapshot
+	var mu sync.Mutex
+	tracker.SetUpdateCallback(func(snap ProgressSnapshot) {
+		mu.Lock()
+		defer mu.Unlock()
+		snapshots = append(snapshots, snap)
+	})
+
+	tracker.StartFile("alpha.txt")
+	snap1 := tracker.Snapshot()
+	if len(snap1.ActiveFiles) != 1 || snap1.ActiveFiles[0] != "alpha.txt" {
+		t.Fatalf("expected active file alpha.txt, got %v", snap1.ActiveFiles)
+	}
+
+	tracker.AddBytes(100)
+	tracker.AddFile()
+	tracker.EndFile("alpha.txt")
+
+	tracker.StartFile("beta.txt")
+	snap2 := tracker.Snapshot()
+	if len(snap2.ActiveFiles) != 1 || snap2.ActiveFiles[0] != "beta.txt" {
+		t.Fatalf("expected active file beta.txt, got %v", snap2.ActiveFiles)
+	}
+
+	tracker.AddBytes(100)
+	tracker.AddFile()
+	tracker.EndFile("beta.txt")
+
+	tracker.Finish()
+
+	mu.Lock()
+	count := len(snapshots)
+	mu.Unlock()
+
+	if count == 0 {
+		t.Fatal("expected update callbacks to be triggered, got 0")
+	}
+
+	finalSnap := tracker.Snapshot()
+	if finalSnap.CompletedFiles != 2 || finalSnap.TransferredBytes != 200 || finalSnap.Percent != 100 {
+		t.Fatalf("unexpected final snapshot: %+v", finalSnap)
+	}
+}
+
+

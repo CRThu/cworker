@@ -343,3 +343,99 @@ func TestCmd_Cp_DownloadFile_FailureDoesNotDestroyExistingFile(t *testing.T) {
 	}
 }
 
+// TestCmd_Cp_BulkDirectory_MoreThan8Files 验证通过 CLI cp -r 传输多于 8 个文件的大批量目录复制完整性
+func TestCmd_Cp_BulkDirectory_MoreThan8Files(t *testing.T) {
+	tempProfile := t.TempDir()
+	t.Setenv("USERPROFILE", tempProfile)
+
+	server, uploadedFiles, createdDirs := setupMockWorkerServer(t)
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	cli := client.NewClient()
+	_ = cli.SaveKnownNode(protocol.KnownNode{
+		Name:   "mock-node",
+		Target: u.Host,
+	})
+
+	srcDir := filepath.Join(tempProfile, "cli_bulk_src")
+	dstDir := filepath.Join(tempProfile, "cli_bulk_dst")
+
+	const fileCount = 20
+	expectedContents := make(map[string]string)
+
+	// 创建多层级子目录与 20 个文件
+	_ = os.MkdirAll(filepath.Join(srcDir, "sub1", "nested"), 0755)
+	_ = os.MkdirAll(filepath.Join(srcDir, "empty_dir"), 0755)
+
+	for i := 1; i <= fileCount; i++ {
+		var relPath string
+		var content string
+		if i <= 10 {
+			relPath = fmt.Sprintf("sub1/nested/file_%02d.txt", i)
+			content = fmt.Sprintf("content of file %d - %s", i, strings.Repeat("X", i*50))
+		} else {
+			relPath = fmt.Sprintf("file_%02d.txt", i)
+			content = fmt.Sprintf("root content of file %d", i)
+		}
+		expectedContents[filepath.ToSlash(relPath)] = content
+		fullPath := filepath.Join(srcDir, filepath.FromSlash(relPath))
+		if err := os.WriteFile(fullPath, []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// 1. 测试本地到本地大批量并发目录复制
+	cpCmd.Flags().Set("recursive", "true")
+	cpCmd.Flags().Set("concurrency", "4") // 限制并发为 4，强迫 20 个文件多轮复用池
+	defer func() {
+		cpCmd.Flags().Set("recursive", "false")
+		cpCmd.Flags().Set("concurrency", "8")
+	}()
+
+	if err := cpCmd.RunE(cpCmd, []string{srcDir, dstDir}); err != nil {
+		t.Fatalf("local bulk copy failed: %v", err)
+	}
+
+	// 验证本地 20 个文件全部存在且内容一致
+	for relPath, expectedContent := range expectedContents {
+		dstPath := filepath.Join(dstDir, filepath.FromSlash(relPath))
+		data, err := os.ReadFile(dstPath)
+		if err != nil {
+			t.Fatalf("destination file '%s' missing: %v", relPath, err)
+		}
+		if string(data) != expectedContent {
+			t.Fatalf("content mismatch for '%s'", relPath)
+		}
+	}
+
+	// 2. 测试本地上传到远端 mock worker (20 个文件)
+	if err := cpCmd.RunE(cpCmd, []string{srcDir, "mock-node:D:/remote_bulk_upload"}); err != nil {
+		t.Fatalf("remote bulk upload failed: %v", err)
+	}
+
+	// 验证远端收到的所有 20 个文件
+	var remoteUploadedCount int
+	for relPath, expectedContent := range expectedContents {
+		remoteRel := pathutil.JoinRemotePath("D:/remote_bulk_upload", relPath)
+		val, ok := uploadedFiles.Load(remoteRel)
+		if !ok {
+			t.Fatalf("file '%s' was not uploaded to remote worker", remoteRel)
+		}
+		if val.(string) != expectedContent {
+			t.Fatalf("uploaded file '%s' content mismatch", remoteRel)
+		}
+		remoteUploadedCount++
+	}
+	if remoteUploadedCount != fileCount {
+		t.Fatalf("expected %d uploaded files, got %d", fileCount, remoteUploadedCount)
+	}
+
+	// 验证空目录在远端也被创建
+	remoteEmpty := pathutil.JoinRemotePath("D:/remote_bulk_upload", "empty_dir")
+	if _, ok := createdDirs.Load(remoteEmpty); !ok {
+		t.Fatalf("empty directory '%s' was not created on remote worker", remoteEmpty)
+	}
+}
+
+

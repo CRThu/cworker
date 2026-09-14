@@ -492,6 +492,171 @@ func TestServer_HandleFsTransfer_LocalToLocal(t *testing.T) {
 	}
 }
 
+// TestServer_HandleFsTransfer_StreamingNDJSON 测试 application/x-ndjson 流式进度反馈与多文件状态
+func TestServer_HandleFsTransfer_StreamingNDJSON(t *testing.T) {
+	srv, tempDir, cleanup := setupTestEnv(t)
+	defer cleanup()
+	handler := srv.Handler()
+
+	srcDir := filepath.Join(tempDir, "stream_src")
+	dstDir := filepath.Join(tempDir, "stream_dst")
+	_ = os.MkdirAll(srcDir, 0755)
+	_ = os.WriteFile(filepath.Join(srcDir, "file1.txt"), []byte("file-1-data-stream"), 0644)
+	_ = os.WriteFile(filepath.Join(srcDir, "file2.txt"), []byte("file-2-data-stream"), 0644)
+
+	// 1. 测试目录传输流式反馈 (?stream=true)
+	payload := fmt.Sprintf(`{"src_path":%q,"dst_path":%q,"recursive":true}`, srcDir, dstDir)
+	req := httptest.NewRequest(http.MethodPost, "/api/ui/fs/transfer?stream=true", strings.NewReader(payload))
+	req.Header.Set("Accept", "application/x-ndjson")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for streaming transfer, got %d: %s", w.Code, w.Body.String())
+	}
+
+	contentType := w.Header().Get("Content-Type")
+	if !strings.Contains(contentType, "application/x-ndjson") {
+		t.Fatalf("expected Content-Type application/x-ndjson, got %q", contentType)
+	}
+
+	// 验证按行包含 NDJSON 帧
+	lines := strings.Split(strings.TrimSpace(w.Body.String()), "\n")
+	if len(lines) == 0 {
+		t.Fatal("expected at least one NDJSON frame")
+	}
+
+	var hasDone bool
+	for _, l := range lines {
+		var m map[string]any
+		if err := json.Unmarshal([]byte(l), &m); err != nil {
+			t.Fatalf("invalid json line %q: %v", l, err)
+		}
+		if m["type"] == "done" {
+			hasDone = true
+		}
+	}
+	if !hasDone {
+		t.Fatalf("expected done frame in stream output, got: %s", w.Body.String())
+	}
+
+	// 2. 测试流式模式下错误处理帧
+	badPayload := fmt.Sprintf(`{"src_path":%q,"dst_path":%q,"recursive":false}`, srcDir, dstDir)
+	reqErr := httptest.NewRequest(http.MethodPost, "/api/ui/fs/transfer?stream=true", strings.NewReader(badPayload))
+	wErr := httptest.NewRecorder()
+	handler.ServeHTTP(wErr, reqErr)
+
+	if wErr.Code != http.StatusOK {
+		t.Fatalf("expected 200 stream container for stream error, got %d", wErr.Code)
+	}
+	errLines := strings.Split(strings.TrimSpace(wErr.Body.String()), "\n")
+	var hasErrorFrame bool
+	for _, l := range errLines {
+		var m map[string]any
+		if err := json.Unmarshal([]byte(l), &m); err == nil {
+			if m["type"] == "error" && m["error"] != "" {
+				hasErrorFrame = true
+			}
+		}
+	}
+	if !hasErrorFrame {
+		t.Fatalf("expected error frame in stream output, got: %s", wErr.Body.String())
+	}
+}
+
+// TestServer_HandleFsTransfer_StreamingNDJSON_BulkFiles 验证超过 8 个并发槽位（24 个文件）时 UI 流式推送的准确性与全部落盘
+func TestServer_HandleFsTransfer_StreamingNDJSON_BulkFiles(t *testing.T) {
+	srv, tempDir, cleanup := setupTestEnv(t)
+	defer cleanup()
+	handler := srv.Handler()
+
+	srcDir := filepath.Join(tempDir, "bulk_stream_src")
+	dstDir := filepath.Join(tempDir, "bulk_stream_dst")
+	const totalFiles = 24
+
+	expectedContents := make(map[string]string)
+	for i := 1; i <= totalFiles; i++ {
+		var relPath string
+		var content string
+		if i <= 8 {
+			relPath = fmt.Sprintf("root_file_%02d.txt", i)
+			content = fmt.Sprintf("root file content %d", i)
+		} else if i <= 16 {
+			relPath = fmt.Sprintf("sub/nested/file_%02d.bin", i)
+			content = strings.Repeat(fmt.Sprintf("DATA-%02d-", i), 200)
+		} else {
+			relPath = fmt.Sprintf("deep/level2/level3/chunk_%02d.txt", i)
+			content = fmt.Sprintf("deep content %d", i)
+		}
+		fullSrc := filepath.Join(srcDir, filepath.FromSlash(relPath))
+		_ = os.MkdirAll(filepath.Dir(fullSrc), 0755)
+		if err := os.WriteFile(fullSrc, []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+		expectedContents[filepath.ToSlash(relPath)] = content
+	}
+
+	payload := fmt.Sprintf(`{"src_path":%q,"dst_path":%q,"recursive":true}`, srcDir, dstDir)
+	req := httptest.NewRequest(http.MethodPost, "/api/ui/fs/transfer?stream=true", strings.NewReader(payload))
+	req.Header.Set("Accept", "application/x-ndjson")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for bulk streaming transfer, got %d: %s", w.Code, w.Body.String())
+	}
+
+	lines := strings.Split(strings.TrimSpace(w.Body.String()), "\n")
+	if len(lines) == 0 {
+		t.Fatal("expected NDJSON output")
+	}
+
+	var hasDone bool
+	var maxCompleted int
+	for _, l := range lines {
+		var m map[string]any
+		if err := json.Unmarshal([]byte(l), &m); err != nil {
+			t.Fatalf("invalid json line %s: %v", l, err)
+		}
+		if m["type"] == "progress" {
+			if tf, ok := m["total_files"].(float64); ok && int(tf) != totalFiles {
+				t.Fatalf("expected total_files %d, got %v", totalFiles, tf)
+			}
+			if cf, ok := m["completed_files"].(float64); ok {
+				if int(cf) > maxCompleted {
+					maxCompleted = int(cf)
+				}
+			}
+		} else if m["type"] == "done" {
+			hasDone = true
+			if pct, ok := m["percent"].(float64); !ok || int(pct) != 100 {
+				t.Fatalf("expected done frame percent 100, got %v", m["percent"])
+			}
+		}
+	}
+
+	if !hasDone {
+		t.Fatalf("expected done frame, output: %s", w.Body.String())
+	}
+	if maxCompleted != totalFiles {
+		t.Fatalf("expected progress completed_files to reach %d, reached %d", totalFiles, maxCompleted)
+	}
+
+	// 验证 24 个文件全部物理落盘且内容完全一致
+	for relPath, expectedContent := range expectedContents {
+		fullDst := filepath.Join(dstDir, filepath.FromSlash(relPath))
+		data, err := os.ReadFile(fullDst)
+		if err != nil {
+			t.Fatalf("file '%s' not copied to dst: %v", relPath, err)
+		}
+		if string(data) != expectedContent {
+			t.Fatalf("content mismatch for '%s'", relPath)
+		}
+	}
+}
+
+
+
 // TestServer_WorkerIntegration 真实拉起 Worker 节点进行全链路集成测试 (Run -> PS -> Stream -> Kill -> Clean)
 func TestServer_WorkerIntegration(t *testing.T) {
 	tempDir, err := os.MkdirTemp("", "cworker-integ-*")

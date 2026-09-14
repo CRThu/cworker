@@ -11,6 +11,7 @@
     FolderPlus,
     Trash2,
     RefreshCw,
+    X,
   } from 'lucide-svelte';
   import { listDir, transfer, getRoots, makeDir, removePath } from '../api';
   import { formatBytes } from '../utils/format';
@@ -258,22 +259,52 @@
   ) {
     progress = {
       active: true,
-      statusText: '正在传输...',
-      percent: 45,
+      statusText: '正在准备传输...',
+      percent: 0,
       finished: false,
     };
 
     try {
-      await transfer({
-        src_node: srcNode,
-        src_path: srcPath,
-        dst_node: dstNode,
-        dst_path: dstPath,
-        recursive,
-        concurrency: 8,
-      });
+      await transfer(
+        {
+          src_node: srcNode,
+          src_path: srcPath,
+          dst_node: dstNode,
+          dst_path: dstPath,
+          recursive,
+          concurrency: 8,
+        },
+        (frame) => {
+          if (frame.type === 'progress') {
+            const filesText = frame.total_files && frame.total_files > 0
+              ? ` (${frame.completed_files ?? 0}/${frame.total_files} 项)`
+              : '';
+            const sizeText = frame.total_bytes && frame.total_bytes > 0
+              ? ` · ${formatBytes(frame.transferred_bytes || 0)} / ${formatBytes(frame.total_bytes)}`
+              : '';
+            const speedText = frame.speed_bps && frame.speed_bps > 0
+              ? ` · ${formatBytes(frame.speed_bps)}/s`
+              : '';
+
+            progress = {
+              ...progress,
+              active: true,
+              percent: frame.percent ?? progress.percent,
+              statusText: `正在传输${filesText}${sizeText}${speedText}`,
+            };
+          } else if (frame.type === 'done') {
+            progress = {
+              ...progress,
+              percent: 100,
+              finished: true,
+              statusText: '传输完成',
+            };
+          }
+        }
+      );
 
       progress = {
+        ...progress,
         active: true,
         statusText: '传输完成',
         percent: 100,
@@ -287,7 +318,9 @@
       }
 
       setTimeout(() => {
-        progress.active = false;
+        if (progress.finished && !progress.error) {
+          progress.active = false;
+        }
       }, 3000);
     } catch (e: any) {
       progress = {
@@ -855,10 +888,23 @@
     <div class="progress-banner {progress.error ? 'error' : (progress.finished ? 'success' : '')}">
       <div class="progress-info">
         <div class="progress-status-left">
-          <span class="progress-pulse-dot"></span>
+          {#if !progress.finished && !progress.error}
+            <span class="progress-pulse-dot"></span>
+          {/if}
           <span>{progress.statusText}</span>
         </div>
-        <span class="mono font-semibold">{progress.percent}%</span>
+        <div class="progress-actions">
+          <span class="mono font-semibold">{progress.percent}%</span>
+          <button
+            class="btn-banner-close"
+            type="button"
+            title="关闭进度横幅"
+            aria-label="关闭进度横幅"
+            on:click={() => progress = { ...progress, active: false }}
+          >
+            <X size={13} />
+          </button>
+        </div>
       </div>
       <div class="progress-track">
         <div class="progress-fill" style="width: {progress.percent}%;"></div>
@@ -1029,6 +1075,27 @@
   }
   .progress-banner.error .progress-fill {
     background: var(--danger);
+  }
+  .progress-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .btn-banner-close {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+    border: none;
+    border-radius: 4px;
+    padding: 2px;
+    color: var(--text-dim);
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+  .btn-banner-close:hover {
+    background: var(--bg-hover);
+    color: var(--text-main);
   }
   .panes-grid {
     display: grid;

@@ -709,7 +709,7 @@ func (s *Server) handleFsDownload(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleFsTransfer 跨机/本地中继文件传输
+// handleFsTransfer 跨机/本地中继文件传输 (支持 application/x-ndjson 实时流式进度反馈与传统 JSON 响应)
 func (s *Server) handleFsTransfer(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -732,31 +732,87 @@ func (s *Server) handleFsTransfer(w http.ResponseWriter, r *http.Request) {
 		req.Concurrency = 8
 	}
 
+	isStream := r.URL.Query().Get("stream") == "true" || strings.Contains(r.Header.Get("Accept"), "application/x-ndjson")
+	flusher, isFlusher := w.(http.Flusher)
+
+	var sendMu sync.Mutex
+	sendStreamFrame := func(frame map[string]any) {
+		if !isStream {
+			return
+		}
+		sendMu.Lock()
+		defer sendMu.Unlock()
+		data, _ := json.Marshal(frame)
+		_, _ = w.Write(append(data, '\n'))
+		if isFlusher {
+			flusher.Flush()
+		}
+	}
+
+	if isStream {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("X-Accel-Buffering", "no")
+		w.WriteHeader(http.StatusOK)
+		if isFlusher {
+			flusher.Flush()
+		}
+	}
+
+	handleTransferError := func(statusCode int, msg string) {
+		if isStream {
+			sendStreamFrame(map[string]any{
+				"type":  "error",
+				"error": msg,
+			})
+		} else {
+			http.Error(w, msg, statusCode)
+		}
+	}
+
 	ctx := r.Context()
 	srcNode, srcPath := req.SrcNode, req.SrcPath
 	dstNode, dstPath := req.DstNode, req.DstPath
+
+	tracker := client.NewProgressTracker(0, 0)
+	tracker.SetTTY(false)
+	tracker.SetUpdateCallback(func(snap client.ProgressSnapshot) {
+		sendStreamFrame(map[string]any{
+			"type":              "progress",
+			"percent":           snap.Percent,
+			"total_files":       snap.TotalFiles,
+			"completed_files":   snap.CompletedFiles,
+			"total_bytes":       snap.TotalBytes,
+			"transferred_bytes": snap.TransferredBytes,
+			"speed_bps":         snap.SpeedBytesSec,
+			"active_files":      snap.ActiveFiles,
+		})
+	})
 
 	// 1. 远端到远端中继拷贝
 	if srcNode != "" && dstNode != "" {
 		_, lsErr := s.cli.ListDirWithContext(ctx, srcNode, srcPath)
 		if lsErr == nil {
 			if !req.Recursive {
-				http.Error(w, "path is a directory, recursive (-r) flag required", http.StatusBadRequest)
+				handleTransferError(http.StatusBadRequest, "path is a directory, recursive (-r) flag required")
 				return
 			}
 			if _, err := s.cli.ListDirWithContext(ctx, dstNode, dstPath); err == nil {
 				dstPath = pathutil.JoinRemotePath(dstPath, pathutil.SafeBaseName(srcPath))
 			}
-			if err := s.cli.RelayCopyDir(ctx, srcNode, srcPath, dstNode, dstPath, req.Concurrency, nil); err != nil {
-				http.Error(w, "relay copy dir failed: "+err.Error(), http.StatusInternalServerError)
+			if err := s.cli.RelayCopyDir(ctx, srcNode, srcPath, dstNode, dstPath, req.Concurrency, tracker); err != nil {
+				handleTransferError(http.StatusInternalServerError, "relay copy dir failed: "+err.Error())
 				return
 			}
 		} else {
 			if _, err := s.cli.ListDirWithContext(ctx, dstNode, dstPath); err == nil {
 				dstPath = pathutil.JoinRemotePath(dstPath, pathutil.SafeBaseName(srcPath))
 			}
-			if err := s.cli.RelayCopyWithContext(ctx, srcNode, srcPath, dstNode, dstPath, nil); err != nil {
-				http.Error(w, "relay copy file failed: "+err.Error(), http.StatusInternalServerError)
+			tracker.StartFile(pathutil.SafeBaseName(srcPath))
+			err := s.cli.RelayCopyWithContext(ctx, srcNode, srcPath, dstNode, dstPath, tracker)
+			tracker.EndFile(pathutil.SafeBaseName(srcPath))
+			if err != nil {
+				handleTransferError(http.StatusInternalServerError, "relay copy file failed: "+err.Error())
 				return
 			}
 		}
@@ -764,38 +820,42 @@ func (s *Server) handleFsTransfer(w http.ResponseWriter, r *http.Request) {
 		// 2. 本地到远端上传
 		cleanSrc, err := pathutil.NormalizeLocalPath(srcPath)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			handleTransferError(http.StatusBadRequest, err.Error())
 			return
 		}
 		fi, err := os.Stat(cleanSrc)
 		if err != nil {
-			http.Error(w, "local source not found: "+err.Error(), http.StatusBadRequest)
+			handleTransferError(http.StatusBadRequest, "local source not found: "+err.Error())
 			return
 		}
 		if fi.IsDir() {
 			if !req.Recursive {
-				http.Error(w, "local path is directory, recursive (-r) required", http.StatusBadRequest)
+				handleTransferError(http.StatusBadRequest, "local path is directory, recursive (-r) required")
 				return
 			}
 			if _, err := s.cli.ListDirWithContext(ctx, dstNode, dstPath); err == nil {
 				dstPath = pathutil.JoinRemotePath(dstPath, pathutil.SafeBaseName(cleanSrc))
 			}
-			if err := s.cli.UploadDir(ctx, dstNode, dstPath, cleanSrc, req.Concurrency, nil); err != nil {
-				http.Error(w, "upload dir failed: "+err.Error(), http.StatusInternalServerError)
+			if err := s.cli.UploadDir(ctx, dstNode, dstPath, cleanSrc, req.Concurrency, tracker); err != nil {
+				handleTransferError(http.StatusInternalServerError, "upload dir failed: "+err.Error())
 				return
 			}
 		} else {
 			f, err := os.Open(cleanSrc)
 			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
+				handleTransferError(http.StatusInternalServerError, err.Error())
 				return
 			}
 			defer f.Close()
 			if _, err := s.cli.ListDirWithContext(ctx, dstNode, dstPath); err == nil {
 				dstPath = pathutil.JoinRemotePath(dstPath, pathutil.SafeBaseName(cleanSrc))
 			}
-			if err := s.cli.UploadFileWithContext(ctx, dstNode, dstPath, f); err != nil {
-				http.Error(w, "upload file failed: "+err.Error(), http.StatusInternalServerError)
+			tracker.StartFile(pathutil.SafeBaseName(cleanSrc))
+			r := client.NewCountingReader(f, tracker)
+			uploadErr := s.cli.UploadFileWithContext(ctx, dstNode, dstPath, r)
+			tracker.EndFile(pathutil.SafeBaseName(cleanSrc))
+			if uploadErr != nil {
+				handleTransferError(http.StatusInternalServerError, "upload file failed: "+uploadErr.Error())
 				return
 			}
 		}
@@ -803,28 +863,31 @@ func (s *Server) handleFsTransfer(w http.ResponseWriter, r *http.Request) {
 		// 3. 远端到本地下载
 		cleanDst, err := pathutil.NormalizeLocalPath(dstPath)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			handleTransferError(http.StatusBadRequest, err.Error())
 			return
 		}
 		_, lsErr := s.cli.ListDirWithContext(ctx, srcNode, srcPath)
 		if lsErr == nil {
 			if !req.Recursive {
-				http.Error(w, "remote path is directory, recursive (-r) required", http.StatusBadRequest)
+				handleTransferError(http.StatusBadRequest, "remote path is directory, recursive (-r) required")
 				return
 			}
 			if fi, err := os.Stat(cleanDst); err == nil && fi.IsDir() {
 				cleanDst = filepath.Join(cleanDst, pathutil.SafeBaseName(srcPath))
 			}
-			if err := s.cli.DownloadDir(ctx, srcNode, srcPath, cleanDst, req.Concurrency, nil); err != nil {
-				http.Error(w, "download dir failed: "+err.Error(), http.StatusInternalServerError)
+			if err := s.cli.DownloadDir(ctx, srcNode, srcPath, cleanDst, req.Concurrency, tracker); err != nil {
+				handleTransferError(http.StatusInternalServerError, "download dir failed: "+err.Error())
 				return
 			}
 		} else {
 			if fi, err := os.Stat(cleanDst); err == nil && fi.IsDir() {
 				cleanDst = filepath.Join(cleanDst, pathutil.SafeBaseName(srcPath))
 			}
-			if err := s.cli.DownloadToLocalFile(ctx, srcNode, srcPath, cleanDst, nil); err != nil {
-				http.Error(w, "download file failed: "+err.Error(), http.StatusInternalServerError)
+			tracker.StartFile(pathutil.SafeBaseName(srcPath))
+			err := s.cli.DownloadToLocalFile(ctx, srcNode, srcPath, cleanDst, tracker)
+			tracker.EndFile(pathutil.SafeBaseName(srcPath))
+			if err != nil {
+				handleTransferError(http.StatusInternalServerError, "download file failed: "+err.Error())
 				return
 			}
 		}
@@ -834,24 +897,35 @@ func (s *Server) handleFsTransfer(w http.ResponseWriter, r *http.Request) {
 		cleanDst, _ := pathutil.NormalizeLocalPath(dstPath)
 		fi, err := os.Stat(cleanSrc)
 		if err != nil {
-			http.Error(w, "local source not found: "+err.Error(), http.StatusBadRequest)
+			handleTransferError(http.StatusBadRequest, "local source not found: "+err.Error())
 			return
 		}
 		if fi.IsDir() {
 			if !req.Recursive {
-				http.Error(w, "path is directory, recursive (-r) required", http.StatusBadRequest)
+				handleTransferError(http.StatusBadRequest, "path is directory, recursive (-r) required")
 				return
 			}
-			if err := s.cli.LocalCopyDir(ctx, cleanSrc, cleanDst, req.Concurrency, nil); err != nil {
-				http.Error(w, "copy dir failed: "+err.Error(), http.StatusInternalServerError)
+			if err := s.cli.LocalCopyDir(ctx, cleanSrc, cleanDst, req.Concurrency, tracker); err != nil {
+				handleTransferError(http.StatusInternalServerError, "copy dir failed: "+err.Error())
 				return
 			}
 		} else {
-			if err := s.cli.LocalCopyFile(cleanSrc, cleanDst, nil); err != nil {
-				http.Error(w, "copy file failed: "+err.Error(), http.StatusInternalServerError)
+			tracker.StartFile(pathutil.SafeBaseName(cleanSrc))
+			err := s.cli.LocalCopyFile(cleanSrc, cleanDst, tracker)
+			tracker.EndFile(pathutil.SafeBaseName(cleanSrc))
+			if err != nil {
+				handleTransferError(http.StatusInternalServerError, "copy file failed: "+err.Error())
 				return
 			}
 		}
+	}
+
+	if isStream {
+		sendStreamFrame(map[string]any{
+			"type":    "done",
+			"percent": 100,
+		})
+		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")

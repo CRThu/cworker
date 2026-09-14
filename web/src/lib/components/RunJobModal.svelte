@@ -1,7 +1,9 @@
 <!-- web/src/lib/components/RunJobModal.svelte - 派发新任务模态框 (默认智能随机命名) -->
 <script lang="ts">
   import { createEventDispatcher } from 'svelte';
+  import { Folder } from 'lucide-svelte';
   import { generateJobName } from '../utils/format';
+  import DirPickerModal from './DirPickerModal.svelte';
   import type { NodeInfo } from '../types';
 
   export let open: boolean = false;
@@ -13,6 +15,7 @@
   let jobName: string = '';
   let jobDir: string = '';
   let jobCmd: string = '';
+  let showDirPicker: boolean = false;
 
   // 模态框打开时自动预填一个随机名称
   $: if (open) {
@@ -87,13 +90,24 @@
 
           <div class="form-group">
             <label for="run-job-dir" class="form-label">工作目录</label>
-            <input
-              id="run-job-dir"
-              type="text"
-              class="input w-full"
-              bind:value={jobDir}
-              placeholder="留空使用默认目录"
-            />
+            <div class="input-with-action">
+              <input
+                id="run-job-dir"
+                type="text"
+                class="input w-full"
+                bind:value={jobDir}
+                placeholder="留空使用默认目录"
+              />
+              <button
+                type="button"
+                class="btn btn-secondary btn-browse"
+                on:click={() => showDirPicker = true}
+                title="弹出选择目录窗口"
+              >
+                <Folder size={14} />
+                <span>浏览</span>
+              </button>
+            </div>
           </div>
 
           <div class="form-group">
@@ -116,6 +130,17 @@
       </form>
     </div>
   </div>
+
+  <DirPickerModal
+    open={showDirPicker}
+    node={targetNode}
+    initialPath={jobDir}
+    on:select={(e) => {
+      jobDir = e.detail.path;
+      showDirPicker = false;
+    }}
+    on:close={() => showDirPicker = false}
+  />
 {/if}
 
 <style>
@@ -199,5 +224,20 @@
     padding: 12px 18px;
     background: var(--bg-elevated);
     border-top: 1px solid var(--border-subtle);
+  }
+  .input-with-action {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+  .btn-browse {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    white-space: nowrap;
+    padding: 0 12px;
+    height: 34px;
+    font-size: 12px;
+    box-sizing: border-box;
   }
 </style>

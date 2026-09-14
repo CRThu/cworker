@@ -19,7 +19,18 @@ func isTerminal() bool {
 	return (fi.Mode() & os.ModeCharDevice) != 0
 }
 
-// ProgressTracker 线程安全的流式进度追踪器 (TTY 环境平滑刷新，非 TTY/Agent 环境静默)
+// ProgressSnapshot 进度快照契约 (供 Web UI 与自动化监听流式消费)
+type ProgressSnapshot struct {
+	TotalFiles       int64    `json:"total_files"`
+	CompletedFiles   int64    `json:"completed_files"`
+	TotalBytes       int64    `json:"total_bytes"`
+	TransferredBytes int64    `json:"transferred_bytes"`
+	Percent          int      `json:"percent"`
+	SpeedBytesSec    int64    `json:"speed_bytes_sec"`
+	ActiveFiles      []string `json:"active_files,omitempty"`
+}
+
+// ProgressTracker 线程安全的流式进度追踪器 (TTY 环境平滑刷新，非 TTY/Agent 环境静默，支持回调)
 type ProgressTracker struct {
 	totalFiles       int64
 	completedFiles   int64
@@ -31,6 +42,8 @@ type ProgressTracker struct {
 	out              io.Writer
 	mu               sync.Mutex
 	finishOnce       sync.Once
+	activeFiles      map[string]struct{}
+	onUpdate         func(ProgressSnapshot)
 }
 
 // NewProgressTracker 创建并初始化传输进度追踪器
@@ -42,12 +55,114 @@ func NewProgressTracker(totalFiles, totalBytes int64) *ProgressTracker {
 		totalFiles = 0
 	}
 	return &ProgressTracker{
-		totalFiles: totalFiles,
-		totalBytes: totalBytes,
-		startTime:  time.Now(),
-		lastRender: time.Now(),
-		isTTY:      isTerminal(),
-		out:        os.Stdout,
+		totalFiles:  totalFiles,
+		totalBytes:  totalBytes,
+		startTime:   time.Now(),
+		lastRender:  time.Now(),
+		isTTY:       isTerminal(),
+		out:         os.Stdout,
+		activeFiles: make(map[string]struct{}),
+	}
+}
+
+// SetUpdateCallback 设置进度状态更新回调
+func (p *ProgressTracker) SetUpdateCallback(cb func(ProgressSnapshot)) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	p.onUpdate = cb
+	p.mu.Unlock()
+}
+
+// SetTotals 动态设置或校准待传输总文件数与总字节量 (在目录前置扫描完成后权威回填)
+func (p *ProgressTracker) SetTotals(totalFiles, totalBytes int64) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	if totalFiles >= 0 {
+		p.totalFiles = totalFiles
+	}
+	if totalBytes >= 0 {
+		p.totalBytes = totalBytes
+	}
+	p.mu.Unlock()
+	p.maybeRender(false)
+}
+
+// StartFile 标记某个相对路径文件开始传输 (加入活跃集合)
+func (p *ProgressTracker) StartFile(name string) {
+	if p == nil || name == "" {
+		return
+	}
+	p.mu.Lock()
+	if p.activeFiles == nil {
+		p.activeFiles = make(map[string]struct{})
+	}
+	p.activeFiles[name] = struct{}{}
+	p.mu.Unlock()
+	p.maybeRender(false)
+}
+
+// EndFile 标记某个相对路径文件传输结束 (移出活跃集合)
+func (p *ProgressTracker) EndFile(name string) {
+	if p == nil || name == "" {
+		return
+	}
+	p.mu.Lock()
+	if p.activeFiles != nil {
+		delete(p.activeFiles, name)
+	}
+	p.mu.Unlock()
+	p.maybeRender(false)
+}
+
+// Snapshot 获取当前瞬时进度快照
+func (p *ProgressTracker) Snapshot() ProgressSnapshot {
+	if p == nil {
+		return ProgressSnapshot{}
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	trans := atomic.LoadInt64(&p.transferredBytes)
+	done := atomic.LoadInt64(&p.completedFiles)
+	totalB := atomic.LoadInt64(&p.totalBytes)
+
+	var percent float64
+	if totalB > 0 {
+		percent = float64(trans) / float64(totalB) * 100.0
+		if percent > 100.0 {
+			percent = 100.0
+		}
+	} else if p.totalFiles > 0 {
+		percent = float64(done) / float64(p.totalFiles) * 100.0
+	}
+
+	now := time.Now()
+	elapsed := now.Sub(p.startTime).Seconds()
+	speedBytesSec := 0.0
+	if elapsed > 0.05 {
+		speedBytesSec = float64(trans) / elapsed
+	}
+
+	var active []string
+	if len(p.activeFiles) > 0 {
+		active = make([]string, 0, len(p.activeFiles))
+		for f := range p.activeFiles {
+			active = append(active, f)
+		}
+	}
+
+	return ProgressSnapshot{
+		TotalFiles:       p.totalFiles,
+		CompletedFiles:   done,
+		TotalBytes:       totalB,
+		TransferredBytes: trans,
+		Percent:          int(percent),
+		SpeedBytesSec:    int64(speedBytesSec),
+		ActiveFiles:      active,
 	}
 }
 
@@ -183,16 +298,15 @@ func FormatSpeed(bytesPerSec float64) string {
 }
 
 func (p *ProgressTracker) maybeRender(force bool) {
-	if p == nil || !p.isTTY {
+	if p == nil {
 		return
 	}
 
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	now := time.Now()
-	// 节流：每 100ms 最多渲染一次，避免刷屏卡顿终端
+	// 节流：每 100ms 最多渲染一次，避免刷屏卡顿终端与过度分发
 	if !force && now.Sub(p.lastRender) < 100*time.Millisecond {
+		p.mu.Unlock()
 		return
 	}
 	p.lastRender = now
@@ -218,6 +332,36 @@ func (p *ProgressTracker) maybeRender(force bool) {
 		speedBytesSec = float64(trans) / elapsed
 	}
 
+	var active []string
+	if len(p.activeFiles) > 0 {
+		active = make([]string, 0, len(p.activeFiles))
+		for f := range p.activeFiles {
+			active = append(active, f)
+		}
+	}
+
+	updateCb := p.onUpdate
+	isTTY := p.isTTY
+	out := p.out
+	totalFiles := p.totalFiles
+	p.mu.Unlock()
+
+	if updateCb != nil {
+		updateCb(ProgressSnapshot{
+			TotalFiles:       totalFiles,
+			CompletedFiles:   done,
+			TotalBytes:       totalB,
+			TransferredBytes: trans,
+			Percent:          int(percent),
+			SpeedBytesSec:    int64(speedBytesSec),
+			ActiveFiles:      active,
+		})
+	}
+
+	if !isTTY {
+		return
+	}
+
 	// 构造 20 格进度条
 	barWidth := 20
 	filled := int(percent / 100.0 * float64(barWidth))
@@ -232,12 +376,11 @@ func (p *ProgressTracker) maybeRender(force bool) {
 		bar += ">" + strings.Repeat(" ", barWidth-filled-1)
 	}
 
-	out := p.out
 	if out == nil {
 		out = os.Stdout
 	}
 	fmt.Fprintf(out, "\r[%s] %5.1f%% (%s/%s, %d/%d files, %s)  ",
-		bar, percent, FormatSize(trans), FormatSize(totalB), done, p.totalFiles, FormatSpeed(speedBytesSec))
+		bar, percent, FormatSize(trans), FormatSize(totalB), done, totalFiles, FormatSpeed(speedBytesSec))
 }
 
 // Finish 完成传输并换行输出统计结果
@@ -247,23 +390,40 @@ func (p *ProgressTracker) Finish() {
 	}
 
 	p.finishOnce.Do(func() {
+		p.mu.Lock()
 		elapsed := time.Since(p.startTime)
 		trans := atomic.LoadInt64(&p.transferredBytes)
 		done := atomic.LoadInt64(&p.completedFiles)
+		totalB := atomic.LoadInt64(&p.totalBytes)
+		totalFiles := p.totalFiles
+		updateCb := p.onUpdate
 
 		speedBytesSec := 0.0
 		if elapsed.Seconds() > 0.02 {
 			speedBytesSec = float64(trans) / elapsed.Seconds()
+		}
+		p.mu.Unlock()
+
+		if updateCb != nil {
+			updateCb(ProgressSnapshot{
+				TotalFiles:       totalFiles,
+				CompletedFiles:   done,
+				TotalBytes:       totalB,
+				TransferredBytes: trans,
+				Percent:          100,
+				SpeedBytesSec:    int64(speedBytesSec),
+				ActiveFiles:      nil,
+			})
 		}
 
 		out := p.getWriter()
 		if p.isTTY {
 			bar := strings.Repeat("=", 20)
 			fmt.Fprintf(out, "\r[%s] 100.0%% (%s, %d/%d files, %s) in %s\n",
-				bar, FormatSize(trans), done, p.totalFiles, FormatSpeed(speedBytesSec), elapsed.Truncate(10*time.Millisecond))
+				bar, FormatSize(trans), done, totalFiles, FormatSpeed(speedBytesSec), elapsed.Truncate(10*time.Millisecond))
 		} else {
 			fmt.Fprintf(out, "[cworker] Transferred %d/%d files (%s) in %s (%s)\n",
-				done, p.totalFiles, FormatSize(trans), elapsed.Truncate(10*time.Millisecond), FormatSpeed(speedBytesSec))
+				done, totalFiles, FormatSize(trans), elapsed.Truncate(10*time.Millisecond), FormatSpeed(speedBytesSec))
 		}
 	})
 }

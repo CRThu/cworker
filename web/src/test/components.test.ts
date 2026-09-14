@@ -1,12 +1,20 @@
 // web/src/test/components.test.ts - Svelte 关键组件集成测试
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { render, fireEvent } from '@testing-library/svelte';
 import KillConfirmModal from '../lib/components/KillConfirmModal.svelte';
 import Sparkline from '../lib/components/Sparkline.svelte';
 import NodesView from '../lib/components/NodesView.svelte';
 import AddNodeModal from '../lib/components/AddNodeModal.svelte';
 import CleanJobsModal from '../lib/components/CleanJobsModal.svelte';
+import RunJobModal from '../lib/components/RunJobModal.svelte';
 import type { JobInfo } from '../lib/types';
+
+vi.mock('../lib/api', () => ({
+  getRoots: vi.fn().mockResolvedValue(['C:/', 'D:/']),
+  listDir: vi.fn().mockResolvedValue([
+    { name: 'projects', is_dir: true, size: 0, mod_time: '' },
+  ]),
+}));
 
 describe('KillConfirmModal', () => {
   const mockJob: JobInfo = {
@@ -226,3 +234,41 @@ describe('CleanJobsModal multi-node selection and text optimization', () => {
     expect(queryByText(/运行中 \(RUNNING\) 任务受底层保护/i)).toBeNull();
   });
 });
+
+describe('RunJobModal with directory browse', () => {
+  it('should render browse button and open directory picker modal', async () => {
+    const { container, getByText } = render(RunJobModal, {
+      props: {
+        open: true,
+        nodes: [{ name: 'worker-1', address: '127.0.0.1:19000', status: 'ONLINE', active_jobs: 0 }],
+      },
+    });
+
+    const browseBtn = container.querySelector('.btn-browse') as HTMLButtonElement;
+    expect(browseBtn).not.toBeNull();
+    expect(browseBtn.textContent).toContain('浏览');
+
+    // 点击浏览按钮
+    await fireEvent.click(browseBtn);
+    await new Promise(r => setTimeout(r, 20));
+
+    // 验证目录选择模态框已渲染
+    const picker = container.querySelector('.dir-picker-box');
+    expect(picker).not.toBeNull();
+    expect(getByText(/选择工作目录/)).toBeTruthy();
+
+    // 在目录选择器中点击确定选择
+    const confirmBtn = picker?.querySelector('.btn-primary') as HTMLButtonElement;
+    expect(confirmBtn).not.toBeNull();
+    await fireEvent.click(confirmBtn);
+
+    // 验证模态框已关闭
+    await new Promise(r => setTimeout(r, 20));
+    expect(container.querySelector('.dir-picker-box')).toBeNull();
+
+    // 验证工作目录输入框成功回填路径
+    const dirInput = container.querySelector('#run-job-dir') as HTMLInputElement;
+    expect(dirInput.value).toBe('C:/');
+  });
+});
+

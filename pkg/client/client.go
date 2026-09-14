@@ -1129,6 +1129,8 @@ func (c *Client) UploadDir(ctx context.Context, node, remoteBaseDir, localBaseDi
 
 	if tracker == nil {
 		tracker = NewProgressTracker(int64(len(files)), totalBytes)
+	} else {
+		tracker.SetTotals(int64(len(files)), totalBytes)
 	}
 
 	// 阶段二：远端先建立完整的子目录骨架 (保证空目录 100% 守恒)
@@ -1182,6 +1184,11 @@ concurrencyLoop:
 
 			localFilePath := filepath.Join(cleanLocal, filepath.FromSlash(entry.relPath))
 			remoteFilePath := pathutil.JoinRemotePath(remoteBaseDir, entry.relPath)
+
+			if tracker != nil {
+				tracker.StartFile(entry.relPath)
+				defer tracker.EndFile(entry.relPath)
+			}
 
 			f, err := os.Open(localFilePath)
 			if err != nil {
@@ -1281,6 +1288,8 @@ func (c *Client) DownloadDir(ctx context.Context, node, remoteBaseDir, localBase
 
 	if tracker == nil {
 		tracker = NewProgressTracker(int64(len(files)), totalBytes)
+	} else {
+		tracker.SetTotals(int64(len(files)), totalBytes)
 	}
 
 	// 阶段二：本地先创建全部子目录骨架 (保证空目录存在且路径绝不逃逸)
@@ -1342,6 +1351,11 @@ concurrencyLoop:
 				return
 			}
 
+			if tracker != nil {
+				tracker.StartFile(file.relPath)
+				defer tracker.EndFile(file.relPath)
+			}
+
 			if err := c.DownloadToLocalFile(ctx, node, file.remotePath, localFilePath, tracker); err != nil {
 				errMu.Lock()
 				if firstErr == nil {
@@ -1359,16 +1373,13 @@ concurrencyLoop:
 	}
 
 	wg.Wait()
-	if tracker != nil {
-		tracker.Finish()
-	}
 	if firstErr != nil {
 		return firstErr
 	}
 	return ctx.Err()
 }
 
-// RelayCopyDir 跨机递归中继拷贝目录 (内存管道直连对穿，零磁盘中转与路径安全校验)
+// RelayCopyDir 将远端节点目录通过本机内存中继复制至另一个远端节点目录
 func (c *Client) RelayCopyDir(ctx context.Context, srcNode, srcBaseDir, dstNode, dstBaseDir string, concurrency int, tracker *ProgressTracker) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -1376,9 +1387,10 @@ func (c *Client) RelayCopyDir(ctx context.Context, srcNode, srcBaseDir, dstNode,
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+
 	entries, err := c.ListDirWithContext(ctx, srcNode, srcBaseDir, true)
 	if err != nil {
-		return fmt.Errorf("list src dir failed: %w", err)
+		return fmt.Errorf("list remote source dir failed: %w", err)
 	}
 
 	type relayFile struct {
@@ -1396,7 +1408,6 @@ func (c *Client) RelayCopyDir(ctx context.Context, srcNode, srcBaseDir, dstNode,
 			continue
 		}
 
-		// 严密防御跨节点路径注入
 		if !isSafeRelativePath(rel) {
 			return fmt.Errorf("security: illegal path traversal in remote entry: %q", e.Path)
 		}
@@ -1415,6 +1426,8 @@ func (c *Client) RelayCopyDir(ctx context.Context, srcNode, srcBaseDir, dstNode,
 
 	if tracker == nil {
 		tracker = NewProgressTracker(int64(len(files)), totalBytes)
+	} else {
+		tracker.SetTotals(int64(len(files)), totalBytes)
 	}
 
 	// 目的端预建目录
@@ -1463,6 +1476,11 @@ concurrencyLoop:
 			case <-ctx.Done():
 				return
 			default:
+			}
+
+			if tracker != nil {
+				tracker.StartFile(item.srcPath)
+				defer tracker.EndFile(item.srcPath)
 			}
 
 			if err := c.RelayCopyWithContext(ctx, srcNode, item.srcPath, dstNode, item.dstPath, tracker); err != nil {

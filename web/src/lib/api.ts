@@ -1,5 +1,5 @@
 // web/src/lib/api.ts - 统一后端交互契约客户端
-import type { OverviewData, NodeInfo, KnownNode, JobInfo, FileItem, TransferRequest } from './types';
+import type { OverviewData, NodeInfo, KnownNode, JobInfo, FileItem, TransferRequest, TransferStreamFrame } from './types';
 
 async function handleResponse<T>(res: Response): Promise<T> {
   if (!res.ok) {
@@ -88,14 +88,59 @@ export async function listDir(node: string, path: string): Promise<FileItem[]> {
   return handleResponse<FileItem[]>(res);
 }
 
-export async function transfer(req: TransferRequest): Promise<void> {
-  const res = await fetch('/api/ui/fs/transfer', {
+export async function transfer(
+  req: TransferRequest,
+  onProgress?: (frame: TransferStreamFrame) => void
+): Promise<void> {
+  const url = onProgress ? '/api/ui/fs/transfer?stream=true' : '/api/ui/fs/transfer';
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (onProgress) {
+    headers['Accept'] = 'application/x-ndjson';
+  }
+
+  const res = await fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify(req),
   });
+
   if (!res.ok) {
-    throw new Error(await res.text());
+    const text = await res.text();
+    throw new Error(text || `HTTP Error ${res.status}`);
+  }
+
+  if (!onProgress || !res.body) {
+    return;
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder('utf-8');
+  let buffer = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      const frame: TransferStreamFrame = JSON.parse(trimmed);
+      if (frame.type === 'error') {
+        throw new Error(frame.error || '传输失败');
+      }
+      onProgress(frame);
+    }
+  }
+
+  if (buffer.trim()) {
+    const frame: TransferStreamFrame = JSON.parse(buffer.trim());
+    if (frame.type === 'error') {
+      throw new Error(frame.error || '传输失败');
+    }
+    onProgress(frame);
   }
 }
 
