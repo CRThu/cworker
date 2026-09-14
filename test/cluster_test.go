@@ -519,10 +519,9 @@ func TestCluster_ConcurrencyStress_NoDeadlock(t *testing.T) {
 		t.Fatalf("stress-node not online in cluster: %+v", nodes)
 	}
 
-	// 等待所有后台被 kill 的进程完全退出并释放 Windows 日志文件锁
-	time.Sleep(800 * time.Millisecond)
+	// 确定性等待所有被 kill 的进程完全退出并安全释放 Windows 日志文件锁 (防 TempDir 清理文件占用)
+	w.WaitAllJobs(5 * time.Second)
 	cancel()
-	time.Sleep(100 * time.Millisecond)
 }
 
 // TestCluster_FaultInjection_InterruptedUpload 故障注入：文件传输中途网络中断防孤儿垃圾文件泄漏

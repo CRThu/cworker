@@ -207,6 +207,25 @@ func (w *Worker) Start(ctx context.Context) error {
 	return w.server.Shutdown(context.Background())
 }
 
+// WaitAllJobs 等待 Worker 管辖的所有后台任务彻底终结并释放操作系统文件锁
+func (w *Worker) WaitAllJobs(timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	w.mu.RLock()
+	jobs := make([]*process.ManagedJob, 0, len(w.jobs))
+	for _, j := range w.jobs {
+		jobs = append(jobs, j)
+	}
+	w.mu.RUnlock()
+
+	for _, j := range jobs {
+		remain := time.Until(deadline)
+		if remain <= 0 {
+			break
+		}
+		_ = j.WaitExit(remain)
+	}
+}
+
 // 统一鉴权中间件 (采用常数时间比较防御侧信道时序攻击)
 func (w *Worker) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(rw http.ResponseWriter, r *http.Request) {

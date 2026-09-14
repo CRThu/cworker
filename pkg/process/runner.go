@@ -23,6 +23,7 @@ type ManagedJob struct {
 	jobObj      *JobObject
 	logFile     *os.File
 	broadcaster *logstream.Broadcaster
+	done        chan struct{}
 
 	lastCpuMs time.Duration
 	lastTime  time.Time
@@ -90,6 +91,7 @@ func StartJob(req protocol.RunJobRequest, jobID string, nodeName string, logRoot
 		jobObj:      jobObj,
 		logFile:     logFile,
 		broadcaster: broadcaster,
+		done:        make(chan struct{}),
 		lastTime:    time.Now(),
 	}
 
@@ -100,6 +102,7 @@ func StartJob(req protocol.RunJobRequest, jobID string, nodeName string, logRoot
 }
 
 func (j *ManagedJob) waitExit() {
+	defer close(j.done)
 	err := j.cmd.Wait()
 
 	j.mu.Lock()
@@ -132,6 +135,19 @@ func (j *ManagedJob) waitExit() {
 	}
 	if j.broadcaster != nil {
 		j.broadcaster.Close()
+	}
+}
+
+// WaitExit 等待任务完全退出并安全释放所有底层句柄 (包括进程树、日志文件锁与 Win32 句柄)
+func (j *ManagedJob) WaitExit(timeout time.Duration) bool {
+	if j == nil || j.done == nil {
+		return true
+	}
+	select {
+	case <-j.done:
+		return true
+	case <-time.After(timeout):
+		return false
 	}
 }
 
