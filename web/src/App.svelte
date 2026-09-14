@@ -231,7 +231,7 @@
     <div class="sidebar-header">
       <span class="logo-badge">🥕</span>
       <div class="brand-title">
-        cworker <span class="console-tag">v{overview?.version || '1.2.0'}</span>
+        cworker {#if overview?.version}<span class="console-tag" title={overview?.build_date ? `构建日期: ${overview.build_date}` : undefined}>{overview.version.startsWith('v') ? overview.version : `v${overview.version}`}</span>{/if}
       </div>
     </div>
 

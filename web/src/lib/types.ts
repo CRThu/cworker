@@ -51,6 +51,7 @@ export interface LocalCardInfo {
 
 export interface OverviewData {
   version?: string;
+  build_date?: string;
   nodes_count: number;
   online_count: number;
   active_jobs: number;

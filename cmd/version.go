@@ -11,8 +11,8 @@ import (
 var (
 	// Version 当前软件发布版本号 (以 protocol.Version 为契约权威)
 	Version = protocol.Version
-	// BuildDate 构建日期
-	BuildDate = "2026-09-11"
+	// BuildDate 构建日期 (以 protocol.BuildDate 为契约权威)
+	BuildDate = protocol.BuildDate
 )
 
 var versionCmd = &cobra.Command{

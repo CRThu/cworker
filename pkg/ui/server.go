@@ -179,6 +179,7 @@ func (s *Server) Close() error {
 // OverviewData 概览聚合结构
 type OverviewData struct {
 	Version         string               `json:"version"`
+	BuildDate       string               `json:"build_date"`
 	NodesCount      int                  `json:"nodes_count"`
 	OnlineCount     int                  `json:"online_count"`
 	ActiveJobs      int                  `json:"active_jobs"`
@@ -236,6 +237,7 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 
 	resp := OverviewData{
 		Version:        s.cfg.Version,
+		BuildDate:      protocol.BuildDate,
 		NodesCount:     len(nodes),
 		OnlineCount:    onlineCount,
 		ActiveJobs:     activeJobs,
