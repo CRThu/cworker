@@ -5,9 +5,9 @@ import "time"
 // 核心系统契约与协议常量 (SSOT 单一事实来源)
 const (
 	// Version 当前软件系统发布版本契约 (SSOT 单一事实来源)
-	Version = "1.4.1"
+	Version = "1.5.0"
 	// BuildDate 构建与发布日期契约 (SSOT 单一事实来源)
-	BuildDate = "2026-09-14"
+	BuildDate = "2026-09-15"
 	// DefaultPort Worker 默认监听端口
 	DefaultPort = 19000
 	// DefaultPortStr Worker 默认监听端口字符串形式
