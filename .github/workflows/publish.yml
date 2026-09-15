@@ -44,3 +44,4 @@ jobs:
           files: |
             bin/cw.exe
             bin/cw.exe.sha256
+            install.ps1

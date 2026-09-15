@@ -12,6 +12,7 @@
 <p align="center">
   <a href="#-核心特性">核心特性</a> •
   <a href="#-架构拓扑">架构拓扑</a> •
+  <a href="#-快速安装">快速安装</a> •
   <a href="#-快速开始">快速开始</a> •
   <a href="#-命令行速查">CLI 速查</a> •
   <a href="#-节点账本与-tailscale-组网">网络与账本</a> •
@@ -90,6 +91,33 @@ flowchart TD
     CLI == "3. 实时日志流 (WebSocket)" ==> WorkerA
     WorkerA == "4. 跨机流式直传 (cw cp A B)" ===> CLI ===> WorkerB
 ```
+
+---
+
+## 📥 快速安装
+
+### 方式 1：PowerShell 一键在线安装（官方推荐）
+
+在 PowerShell 中执行以下命令一键完成安装与环境变量配置：
+
+```powershell
+# 官方直连（推荐海外或已开启代理环境）
+irm https://raw.githubusercontent.com/crthu/cworker/main/install.ps1 | iex
+
+# CDN 加速（推荐国内网络直连环境，秒级拉取）
+irm https://fastly.jsdelivr.net/gh/crthu/cworker@main/install.ps1 | iex
+```
+
+> 自动拉取最新 `cw.exe` 并部署至 `%USERPROFILE%\.cworker\bin`，配置用户 `PATH` 并即刻生效。后续可直接通过 `cw update` 自升级。
+
+### 方式 2：手动下载 Releases 单文件自举（离线或手动部署）
+
+1. 前往 [GitHub Releases](https://github.com/crthu/cworker/releases/latest) 下载独立单文件 `cw.exe`；
+2. 放置于任意目录，以管理员身份运行一次：
+   ```powershell
+   .\cw.exe service install
+   ```
+   它会自动将自身部署至 `%USERPROFILE%\.cworker\bin`、配置用户 `PATH`、放行防火墙并注册为开机自启系统服务。
 
 ---
 

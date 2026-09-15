@@ -411,7 +411,78 @@ describe('DualPaneFiles in-situ operations and keyboard shortcuts', () => {
 
     expect(api.transfer).toHaveBeenCalled();
   });
+
+  it('should format progress banner properly for single large file transfer (no redundant file count, valid progress width)', async () => {
+    vi.mocked(api.transfer).mockImplementation(async (req, onProgress) => {
+      if (onProgress) {
+        onProgress({
+          type: 'progress',
+          total_files: 1,
+          completed_files: 0,
+          total_bytes: 5242880000,
+          transferred_bytes: 1310720000,
+          speed_bps: 114000000,
+          percent: 25,
+        });
+      }
+      await new Promise(r => setTimeout(r, 50));
+    });
+
+    const { container } = render(DualPaneFiles, {
+      props: { nodes: mockNodes },
+    });
+    await new Promise(r => setTimeout(r, 20));
+
+    const transferBtn = container.querySelector('.btn-action-icon[title="传到右侧"]') as HTMLButtonElement;
+    expect(transferBtn).not.toBeNull();
+    await fireEvent.click(transferBtn);
+    await new Promise(r => setTimeout(r, 20));
+
+    const banner = container.querySelector('.progress-banner');
+    expect(banner).not.toBeNull();
+    // 单大文件模式下不应显示 "(0/1 项)"
+    expect(banner?.textContent).not.toContain('0/1 项');
+    expect(banner?.textContent).toContain('25%');
+    const fill = container.querySelector('.progress-fill') as HTMLElement;
+    expect(fill?.style.width).toBe('25%');
+  });
+
+  it('should format progress banner properly for multi-file transfer (shows completed/total items)', async () => {
+    vi.mocked(api.transfer).mockImplementation(async (req, onProgress) => {
+      if (onProgress) {
+        onProgress({
+          type: 'progress',
+          total_files: 10,
+          completed_files: 3,
+          total_bytes: 50000000,
+          transferred_bytes: 25000000,
+          speed_bps: 10000000,
+          percent: 50,
+        });
+      }
+      await new Promise(r => setTimeout(r, 50));
+    });
+
+    const { container } = render(DualPaneFiles, {
+      props: { nodes: mockNodes },
+    });
+    await new Promise(r => setTimeout(r, 20));
+
+    const transferBtn = container.querySelector('.btn-action-icon[title="传到右侧"]') as HTMLButtonElement;
+    expect(transferBtn).not.toBeNull();
+    await fireEvent.click(transferBtn);
+    await new Promise(r => setTimeout(r, 20));
+
+    const banner = container.querySelector('.progress-banner');
+    expect(banner).not.toBeNull();
+    // 多文件模式下必须显示 "(3/10 项)"
+    expect(banner?.textContent).toContain('(3/10 项)');
+    expect(banner?.textContent).toContain('50%');
+    const fill = container.querySelector('.progress-fill') as HTMLElement;
+    expect(fill?.style.width).toBe('50%');
+  });
 });
+
 
 
 

@@ -808,6 +808,7 @@ func (s *Server) handleFsTransfer(w http.ResponseWriter, r *http.Request) {
 			if _, err := s.cli.ListDirWithContext(ctx, dstNode, dstPath); err == nil {
 				dstPath = pathutil.JoinRemotePath(dstPath, pathutil.SafeBaseName(srcPath))
 			}
+			tracker.SetTotals(1, 0)
 			tracker.StartFile(pathutil.SafeBaseName(srcPath))
 			err := s.cli.RelayCopyWithContext(ctx, srcNode, srcPath, dstNode, dstPath, tracker)
 			tracker.EndFile(pathutil.SafeBaseName(srcPath))
@@ -815,6 +816,7 @@ func (s *Server) handleFsTransfer(w http.ResponseWriter, r *http.Request) {
 				handleTransferError(http.StatusInternalServerError, "relay copy file failed: "+err.Error())
 				return
 			}
+			tracker.AddFile()
 		}
 	} else if srcNode == "" && dstNode != "" {
 		// 2. 本地到远端上传
@@ -850,6 +852,7 @@ func (s *Server) handleFsTransfer(w http.ResponseWriter, r *http.Request) {
 			if _, err := s.cli.ListDirWithContext(ctx, dstNode, dstPath); err == nil {
 				dstPath = pathutil.JoinRemotePath(dstPath, pathutil.SafeBaseName(cleanSrc))
 			}
+			tracker.SetTotals(1, fi.Size())
 			tracker.StartFile(pathutil.SafeBaseName(cleanSrc))
 			r := client.NewCountingReader(f, tracker)
 			uploadErr := s.cli.UploadFileWithContext(ctx, dstNode, dstPath, r)
@@ -858,6 +861,7 @@ func (s *Server) handleFsTransfer(w http.ResponseWriter, r *http.Request) {
 				handleTransferError(http.StatusInternalServerError, "upload file failed: "+uploadErr.Error())
 				return
 			}
+			tracker.AddFile()
 		}
 	} else if srcNode != "" && dstNode == "" {
 		// 3. 远端到本地下载
@@ -883,6 +887,7 @@ func (s *Server) handleFsTransfer(w http.ResponseWriter, r *http.Request) {
 			if fi, err := os.Stat(cleanDst); err == nil && fi.IsDir() {
 				cleanDst = filepath.Join(cleanDst, pathutil.SafeBaseName(srcPath))
 			}
+			tracker.SetTotals(1, 0)
 			tracker.StartFile(pathutil.SafeBaseName(srcPath))
 			err := s.cli.DownloadToLocalFile(ctx, srcNode, srcPath, cleanDst, tracker)
 			tracker.EndFile(pathutil.SafeBaseName(srcPath))
@@ -890,6 +895,7 @@ func (s *Server) handleFsTransfer(w http.ResponseWriter, r *http.Request) {
 				handleTransferError(http.StatusInternalServerError, "download file failed: "+err.Error())
 				return
 			}
+			tracker.AddFile()
 		}
 	} else {
 		// 4. 本地到本地拷贝
@@ -910,6 +916,10 @@ func (s *Server) handleFsTransfer(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		} else {
+			if dstFi, err := os.Stat(cleanDst); err == nil && dstFi.IsDir() {
+				cleanDst = filepath.Join(cleanDst, pathutil.SafeBaseName(cleanSrc))
+			}
+			tracker.SetTotals(1, fi.Size())
 			tracker.StartFile(pathutil.SafeBaseName(cleanSrc))
 			err := s.cli.LocalCopyFile(cleanSrc, cleanDst, tracker)
 			tracker.EndFile(pathutil.SafeBaseName(cleanSrc))
@@ -917,8 +927,11 @@ func (s *Server) handleFsTransfer(w http.ResponseWriter, r *http.Request) {
 				handleTransferError(http.StatusInternalServerError, "copy file failed: "+err.Error())
 				return
 			}
+			tracker.AddFile()
 		}
 	}
+
+	tracker.Finish()
 
 	if isStream {
 		sendStreamFrame(map[string]any{

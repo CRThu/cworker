@@ -276,7 +276,7 @@
         },
         (frame) => {
           if (frame.type === 'progress') {
-            const filesText = frame.total_files && frame.total_files > 0
+            const filesText = frame.total_files && frame.total_files > 1
               ? ` (${frame.completed_files ?? 0}/${frame.total_files} 项)`
               : '';
             const sizeText = frame.total_bytes && frame.total_bytes > 0

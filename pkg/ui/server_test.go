@@ -655,7 +655,81 @@ func TestServer_HandleFsTransfer_StreamingNDJSON_BulkFiles(t *testing.T) {
 	}
 }
 
+// TestServer_HandleFsTransfer_StreamingNDJSON_SingleFile 验证单大文件传输时流式进度帧包含正确的总文件数 (1)、总字节量 (>0) 与递增的百分比
+func TestServer_HandleFsTransfer_StreamingNDJSON_SingleFile(t *testing.T) {
+	srv, tempDir, cleanup := setupTestEnv(t)
+	defer cleanup()
+	handler := srv.Handler()
 
+	srcFile := filepath.Join(tempDir, "single_large_source.bin")
+	dstFile := filepath.Join(tempDir, "single_large_dest.bin")
+
+	// 生成 128KB 包含随机模式的测试大文件
+	fileSize := int64(128 * 1024)
+	content := make([]byte, fileSize)
+	for i := range content {
+		content[i] = byte(i % 256)
+	}
+	if err := os.WriteFile(srcFile, content, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	payload := fmt.Sprintf(`{"src_path":%q,"dst_path":%q,"recursive":false}`, srcFile, dstFile)
+	req := httptest.NewRequest(http.MethodPost, "/api/ui/fs/transfer?stream=true", strings.NewReader(payload))
+	req.Header.Set("Accept", "application/x-ndjson")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for single file streaming transfer, got %d: %s", w.Code, w.Body.String())
+	}
+
+	lines := strings.Split(strings.TrimSpace(w.Body.String()), "\n")
+	if len(lines) == 0 {
+		t.Fatal("expected NDJSON output for single file transfer")
+	}
+
+	var hasProgress bool
+	var hasDone bool
+	for _, l := range lines {
+		var m map[string]any
+		if err := json.Unmarshal([]byte(l), &m); err != nil {
+			t.Fatalf("invalid json line %s: %v", l, err)
+		}
+		if m["type"] == "progress" {
+			hasProgress = true
+			tf, okTf := m["total_files"].(float64)
+			tb, okTb := m["total_bytes"].(float64)
+			if !okTf || int64(tf) != 1 {
+				t.Fatalf("expected total_files=1 in progress frame, got %v", m["total_files"])
+			}
+			if !okTb || int64(tb) != fileSize {
+				t.Fatalf("expected total_bytes=%d in progress frame, got %v", fileSize, m["total_bytes"])
+			}
+		} else if m["type"] == "done" {
+			hasDone = true
+			if pct, ok := m["percent"].(float64); !ok || int(pct) != 100 {
+				t.Fatalf("expected done frame percent 100, got %v", m["percent"])
+			}
+		}
+	}
+
+	if !hasProgress {
+		t.Fatal("expected at least one progress frame in single file transfer stream")
+	}
+	if !hasDone {
+		t.Fatalf("expected done frame in single file transfer stream, got: %s", w.Body.String())
+	}
+
+	// 验证文件落盘且内容一致
+	copiedData, err := os.ReadFile(dstFile)
+	if err != nil {
+		t.Fatalf("failed to read copied single file: %v", err)
+	}
+	if !bytes.Equal(copiedData, content) {
+		t.Fatal("copied single file content mismatch")
+	}
+}
 
 // TestServer_WorkerIntegration 真实拉起 Worker 节点进行全链路集成测试 (Run -> PS -> Stream -> Kill -> Clean)
 func TestServer_WorkerIntegration(t *testing.T) {
@@ -902,6 +976,31 @@ func TestServer_WorkerIntegration(t *testing.T) {
 		t.Fatalf("local to remote transfer failed: %v", err)
 	}
 	respTransUp.Body.Close()
+
+	// 9.1b 单文件 Local -> Remote (带 stream=true 验证真实 Worker 上传流式进度帧)
+	respTransUpStream, err := clientHTTP.Post(uiServer.URL+"/api/ui/fs/transfer?stream=true", "application/json", bytes.NewReader(transferUpPayload))
+	if err != nil || respTransUpStream.StatusCode != http.StatusOK {
+		t.Fatalf("local to remote stream transfer failed: %v", err)
+	}
+	upStreamBytes, _ := io.ReadAll(respTransUpStream.Body)
+	respTransUpStream.Body.Close()
+	upLines := strings.Split(strings.TrimSpace(string(upStreamBytes)), "\n")
+	var upHasProgress bool
+	for _, l := range upLines {
+		var m map[string]any
+		if json.Unmarshal([]byte(l), &m) == nil && m["type"] == "progress" {
+			upHasProgress = true
+			if tf, ok := m["total_files"].(float64); !ok || int64(tf) != 1 {
+				t.Fatalf("expected total_files=1 in remote upload progress frame, got %v", m["total_files"])
+			}
+			if tb, ok := m["total_bytes"].(float64); !ok || int64(tb) != int64(len("local to remote data")) {
+				t.Fatalf("expected total_bytes=%d in remote upload progress frame, got %v", len("local to remote data"), m["total_bytes"])
+			}
+		}
+	}
+	if !upHasProgress {
+		t.Fatalf("expected progress frame in remote upload stream, got: %s", string(upStreamBytes))
+	}
 
 	// 9.2 目录 Local -> Remote (测试 recursive: false 触发 400，以及 recursive: true 成功)
 	localDirSrc := filepath.Join(tempDir, "local_dir_upload")

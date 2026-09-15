@@ -218,11 +218,20 @@ func (p *ProgressTracker) SetTTY(isTTY bool) {
 }
 
 // SetTotalBytes 动态设置预期的总字节数 (例如在收到 X-File-Size 头后)
+// 保护规则：若当前 Tracker 已规划为多文件 (TotalFiles > 1) 或已有预设的有效总大小 (> 0)，
+// 则忽略单文件响应头的写入，防止并发子任务或单文件大小覆盖全局目录传输总大小。
 func (p *ProgressTracker) SetTotalBytes(bytes int64) {
 	if p == nil || bytes < 0 {
 		return
 	}
+	p.mu.Lock()
+	if p.totalFiles > 1 || atomic.LoadInt64(&p.totalBytes) > 0 {
+		p.mu.Unlock()
+		return
+	}
 	atomic.StoreInt64(&p.totalBytes, bytes)
+	p.mu.Unlock()
+	p.maybeRender(false)
 }
 
 func (p *ProgressTracker) TotalBytes() int64 {

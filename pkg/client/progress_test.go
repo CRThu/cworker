@@ -278,4 +278,123 @@ func TestProgressTracker_SnapshotAndCallbacks(t *testing.T) {
 	}
 }
 
+// TestProgressTracker_SingleLargeFile_Progress 测试单大文件传输的生命周期：
+// 从未知大小 (totalBytes=0) 到 HTTP 头回填大小，再到按真实字节平滑推进百分比，以及防止重复覆盖。
+func TestProgressTracker_SingleLargeFile_Progress(t *testing.T) {
+	// 初始状态：1 个文件，大小未知 (例如远端下载或中继首包未达)
+	tracker := NewProgressTracker(1, 0)
+	tracker.SetTTY(false)
+
+	tracker.AddBytes(1024 * 1024) // 已传 1MB
+	snap0 := tracker.Snapshot()
+	if snap0.TotalBytes != 0 || snap0.Percent != 0 {
+		t.Fatalf("expected 0 total bytes and 0%%, got total=%d percent=%d", snap0.TotalBytes, snap0.Percent)
+	}
+
+	// 模拟首包响应到达，回填 10GB 真实文件大小
+	const tenGB = int64(10 * 1024 * 1024 * 1024)
+	tracker.SetTotalBytes(tenGB)
+
+	if tracker.TotalBytes() != tenGB {
+		t.Fatalf("expected total bytes %d, got %d", tenGB, tracker.TotalBytes())
+	}
+
+	// 传输到 2.5GB (25%)
+	const twoPointFiveGB = int64(2560 * 1024 * 1024)
+	tracker.AddBytes(twoPointFiveGB - 1024*1024)
+	snap1 := tracker.Snapshot()
+	if snap1.Percent != 25 {
+		t.Fatalf("expected 25%% for 2.5GB/10GB, got %d%%", snap1.Percent)
+	}
+	if snap1.TransferredBytes != twoPointFiveGB {
+		t.Fatalf("expected transferred bytes %d, got %d", twoPointFiveGB, snap1.TransferredBytes)
+	}
+
+	// 验证防覆盖：已有有效大小时，再次调用 SetTotalBytes (例如中途某未知小包) 应被忽略
+	tracker.SetTotalBytes(2048)
+	if tracker.TotalBytes() != tenGB {
+		t.Fatalf("expected total bytes protected at %d, but was overwritten to %d", tenGB, tracker.TotalBytes())
+	}
+
+	// 传满剩余 7.5GB 并完成文件
+	tracker.AddBytes(tenGB - twoPointFiveGB)
+	tracker.AddFile()
+	tracker.Finish()
+	snapEnd := tracker.Snapshot()
+	if snapEnd.CompletedFiles != 1 || snapEnd.Percent != 100 || snapEnd.TransferredBytes != tenGB {
+		t.Fatalf("expected finished single file with 100%%, got %+v", snapEnd)
+	}
+}
+
+// TestProgressTracker_MultiFile_TotalBytesProtection 测试多文件批量传输时，
+// 全局总大小 (totalBytes) 绝对禁止被并发子文件的 SetTotalBytes 覆盖篡改。
+func TestProgressTracker_MultiFile_TotalBytesProtection(t *testing.T) {
+	const totalDirBytes = int64(50 * 1024 * 1024) // 50MB 目录总大小
+	const totalFiles = int64(20)                  // 20 个文件
+
+	tracker := NewProgressTracker(totalFiles, totalDirBytes)
+	tracker.SetTTY(false)
+
+	// 模拟并发多协程传输各个子文件，各个子协程收到子文件响应头并尝试调用 SetTotalBytes
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(fileIdx int) {
+			defer wg.Done()
+			// 尝试用单个小文件大小 (例如 1KB) 破坏全局分母
+			tracker.SetTotalBytes(1024)
+			// 传输该文件数据
+			tracker.AddBytes(1024 * 1024) // 1MB
+			tracker.AddFile()
+		}(i)
+	}
+	wg.Wait()
+
+	// 核心断言：全局总大小必须依然是 50MB，绝不能被任何子文件的 1024 篡改！
+	if tracker.TotalBytes() != totalDirBytes {
+		t.Fatalf("CRITICAL BUG: directory totalBytes corrupted! expected %d, got %d", totalDirBytes, tracker.TotalBytes())
+	}
+
+	snap := tracker.Snapshot()
+	if snap.TotalFiles != totalFiles {
+		t.Fatalf("expected total files %d, got %d", totalFiles, snap.TotalFiles)
+	}
+	if snap.CompletedFiles != 10 {
+		t.Fatalf("expected 10 completed files, got %d", snap.CompletedFiles)
+	}
+	// 10MB / 50MB = 20%
+	if snap.Percent != 20 {
+		t.Fatalf("expected 20%% based on real byte size (10MB/50MB), got %d%%", snap.Percent)
+	}
+}
+
+// TestProgressTracker_FallbackToFileCountWhenZeroBytes 测试全空文件 (totalBytes == 0) 时，
+// 平滑回退为按已完成文件数比例计算进度。
+func TestProgressTracker_FallbackToFileCountWhenZeroBytes(t *testing.T) {
+	tracker := NewProgressTracker(5, 0)
+	tracker.SetTTY(false)
+
+	snap0 := tracker.Snapshot()
+	if snap0.Percent != 0 {
+		t.Fatalf("expected 0%% initially, got %d%%", snap0.Percent)
+	}
+
+	tracker.AddFile()
+	tracker.AddFile()
+	snap1 := tracker.Snapshot()
+	// 2/5 = 40%
+	if snap1.Percent != 40 {
+		t.Fatalf("expected 40%% for 2/5 files when totalBytes==0, got %d%%", snap1.Percent)
+	}
+
+	tracker.AddFile()
+	tracker.AddFile()
+	tracker.AddFile()
+	snap2 := tracker.Snapshot()
+	if snap2.Percent != 100 {
+		t.Fatalf("expected 100%% for 5/5 files, got %d%%", snap2.Percent)
+	}
+}
+
+
 
