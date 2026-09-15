@@ -108,8 +108,10 @@
           {#each nodes as n, idx (n.name + '-' + idx)}
             {@const isOnline = n.status === 'ONLINE'}
             {@const cpu = isOnline && n.metrics ? n.metrics.cpu_percent : 0}
+            {@const cores = isOnline && n.metrics && n.metrics.cpu_cores ? n.metrics.cpu_cores : 0}
+            {@const cpuStr = cores > 0 ? `${Math.round(cpu * cores)}% / ${cores * 100}%` : `${cpu.toFixed(1)}%`}
             {@const memTotalMB = isOnline && n.metrics ? n.metrics.mem_total_mb : 0}
-            {@const memUsedMB = isOnline && n.metrics ? (n.metrics.mem_total_mb - n.metrics.mem_free_mb) : 0}
+            {@const memUsedMB = isOnline && n.metrics ? Math.max(0, n.metrics.mem_total_mb - n.metrics.mem_free_mb) : 0}
             {@const memPercent = memTotalMB > 0 ? (memUsedMB / memTotalMB) * 100 : 0}
             {@const known = knownMap[n.name.toLowerCase()]}
             {@const token = known?.token || ''}
@@ -134,7 +136,7 @@
                 {#if isOnline}
                   <div class="metric-with-sparkline">
                     <Sparkline values={cpuHistory} color="#f97316" width={70} height={20} />
-                    <span class="metric-val mono">{cpu.toFixed(1)}%</span>
+                    <span class="metric-val mono">{cpuStr}</span>
                   </div>
                 {:else}
                   <span class="dim-text">-</span>

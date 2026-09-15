@@ -932,29 +932,20 @@ func (s *Server) handleFsTransfer(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
 }
 
-// getAvailableDrives 探测本地 Windows 可用盘符
-func getAvailableDrives() []string {
-	var roots []string
-	for _, letter := range "ABCDEFGHIJKLMNOPQRSTUVWXYZ" {
-		path := string(letter) + ":\\"
-		if _, err := os.Stat(path); err == nil {
-			roots = append(roots, string(letter)+":/")
-		}
-	}
-	if len(roots) == 0 {
-		roots = []string{"C:/"}
-	}
-	return roots
-}
-
-// handleFsRoots 获取可用根目录/盘符列表
+// handleFsRoots 获取可用根目录/盘符列表 (支持本地与指定远端 Worker)
 func (s *Server) handleFsRoots(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	roots := getAvailableDrives()
+	node := r.URL.Query().Get("node")
+	roots, err := s.cli.GetRootsWithContext(r.Context(), node)
+	if err != nil {
+		http.Error(w, "get roots failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(roots)
 }

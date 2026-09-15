@@ -3,6 +3,7 @@ package pathutil
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -118,4 +119,19 @@ func SafeBaseName(p string) string {
 		return ""
 	}
 	return base
+}
+
+// GetAvailableDrives 探测本地 Windows 可用盘符，返回如 ["C:/", "D:/"]
+func GetAvailableDrives() []string {
+	var roots []string
+	for _, letter := range "ABCDEFGHIJKLMNOPQRSTUVWXYZ" {
+		path := string(letter) + ":\\"
+		if _, err := os.Stat(path); err == nil {
+			roots = append(roots, string(letter)+":/")
+		}
+	}
+	if len(roots) == 0 {
+		roots = []string{"C:/"}
+	}
+	return roots
 }

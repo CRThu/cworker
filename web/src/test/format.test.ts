@@ -1,6 +1,5 @@
-// web/src/test/format.test.ts - 格式化与随机命名工具单元测试
-import { describe, it, expect } from 'vitest';
-import { formatBytes, formatUptime, generateJobName } from '../lib/utils/format';
+import { describe, it, expect, vi } from 'vitest';
+import { formatBytes, formatUptime, generateJobName, copyToClipboard } from '../lib/utils/format';
 
 describe('formatBytes', () => {
   it('should format 0 bytes correctly', () => {
@@ -46,5 +45,30 @@ describe('generateJobName', () => {
       set.add(generateJobName());
     }
     expect(set.size).toBeGreaterThanOrEqual(18);
+  });
+});
+
+describe('copyToClipboard', () => {
+  it('should return false for empty text', async () => {
+    expect(await copyToClipboard('')).toBe(false);
+  });
+
+  it('should use navigator.clipboard when available in secure context', async () => {
+    const writeTextMock = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText: writeTextMock } });
+    (window as any).isSecureContext = true;
+
+    const res = await copyToClipboard('test copy');
+    expect(res).toBe(true);
+    expect(writeTextMock).toHaveBeenCalledWith('test copy');
+  });
+
+  it('should fallback to execCommand when clipboard API is unavailable', async () => {
+    (window as any).isSecureContext = false;
+    document.execCommand = vi.fn().mockReturnValue(true);
+
+    const res = await copyToClipboard('fallback copy');
+    expect(res).toBe(true);
+    expect(document.execCommand).toHaveBeenCalledWith('copy');
   });
 });

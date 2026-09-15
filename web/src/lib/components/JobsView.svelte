@@ -8,6 +8,10 @@
 
   export let jobs: JobInfo[] = [];
   export let nodes: NodeInfo[] = [];
+  export let onOpenRun: (() => void) | undefined = undefined;
+  export let onOpenClean: (() => void) | undefined = undefined;
+  export let onViewLogs: ((job: JobInfo) => void) | undefined = undefined;
+  export let onKillJob: ((job: JobInfo) => void) | undefined = undefined;
 
   const dispatch = createEventDispatcher();
 
@@ -42,10 +46,12 @@
   });
 
   function openRunModal() {
+    if (onOpenRun) onOpenRun();
     dispatch('openRun');
   }
 
   function openCleanModal() {
+    if (onOpenClean) onOpenClean();
     dispatch('openClean');
   }
 
@@ -60,10 +66,12 @@
   }
 
   function handleViewLogs(job: JobInfo) {
+    if (onViewLogs) onViewLogs(job);
     dispatch('viewLogs', job);
   }
 
   function handleKill(job: JobInfo) {
+    if (onKillJob) onKillJob(job);
     dispatch('killJob', job);
   }
 </script>

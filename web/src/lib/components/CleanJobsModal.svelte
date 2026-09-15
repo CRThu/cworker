@@ -6,6 +6,8 @@
 
   export let open: boolean = false;
   export let nodes: NodeInfo[] = [];
+  export let onSubmit: ((detail: any) => void) | undefined = undefined;
+  export let onClose: (() => void) | undefined = undefined;
 
   const dispatch = createEventDispatcher();
 
@@ -16,16 +18,19 @@
   $: nodeNames = nodes.map(n => n.name);
 
   function handleClose() {
+    if (onClose) onClose();
     dispatch('close');
   }
 
   function handleSubmit() {
-    dispatch('submit', {
+    const payload = {
       nodes: selectedNodes.length > 0 ? selectedNodes : undefined,
       node: selectedNodes.length === 1 ? selectedNodes[0] : (selectedNodes.length === 0 ? '' : undefined),
       all: cleanAll,
       days: cleanAll ? 0 : days,
-    });
+    };
+    if (onSubmit) onSubmit(payload);
+    dispatch('submit', payload);
   }
 </script>
 

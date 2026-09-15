@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -135,11 +136,67 @@ func NewWorker(cfg Config) (*Worker, error) {
 		localIP = cfg.BindAddr
 	}
 
-	return &Worker{
+	w := &Worker{
 		cfg:     cfg,
 		jobs:    make(map[string]*process.ManagedJob),
 		localIP: localIP,
-	}, nil
+	}
+	w.hydrateJobsFromDisk()
+	return w, nil
+}
+
+// hydrateJobsFromDisk 从本地磁盘 ~/.cworker/jobs 扫描历史任务，执行冷启动加载与异常中断自愈
+func (w *Worker) hydrateJobsFromDisk() {
+	jobsDir := filepath.Join(w.cfg.DataDir, "jobs")
+	entries, err := os.ReadDir(jobsDir)
+	if err != nil {
+		return
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		jobID := entry.Name()
+		if !isValidJobID(jobID) {
+			continue
+		}
+		jobDir := filepath.Join(jobsDir, jobID)
+
+		info, err := process.LoadJobMeta(jobDir)
+		if err == nil && info != nil {
+			// 掉电/异常关机自愈：若原记录为 RUNNING，但 Worker 重启了，说明旧进程已被 Win32 Job Object 内核斩杀
+			if info.Status == protocol.JobStatusRunning {
+				info.Status = protocol.JobStatusStopped
+				info.ExitCode = -1
+				now := time.Now()
+				info.EndTime = &now
+				_ = process.SaveJobMeta(jobDir, *info)
+			}
+			w.jobs[jobID] = process.NewHistoricJob(*info, jobDir)
+		} else {
+			// 若 job.json 不存在但存在 output.log (兼容旧版本遗留数据)
+			logPath := filepath.Join(jobDir, "output.log")
+			if stat, err := os.Stat(logPath); err == nil && !stat.IsDir() {
+				modTime := stat.ModTime()
+				syntheticInfo := protocol.JobInfo{
+					ID:        jobID,
+					Name:      jobID,
+					Node:      w.cfg.Name,
+					Command:   "unknown",
+					Status:    protocol.JobStatusStopped,
+					StartTime: modTime,
+					EndTime:   &modTime,
+					ExitCode:  -1,
+				}
+				_ = process.SaveJobMeta(jobDir, syntheticInfo)
+				w.jobs[jobID] = process.NewHistoricJob(syntheticInfo, jobDir)
+			}
+		}
+	}
 }
 
 func (w *Worker) Token() string { return w.cfg.Token }
@@ -167,7 +224,8 @@ func (w *Worker) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/v1/jobs/logs", w.authMiddleware(w.handleGetLogs))
 	mux.HandleFunc("/api/v1/jobs/stream", w.authMiddleware(w.handleStreamLogs))
 
-	// 文件六件套正交端点
+	// 文件七件套正交端点
+	mux.HandleFunc("/api/v1/fs/roots", w.authMiddleware(w.handleFsRoots))
 	mux.HandleFunc("/api/v1/fs/upload", w.authMiddleware(w.handleFsUpload))
 	mux.HandleFunc("/api/v1/fs/download", w.authMiddleware(w.handleFsDownload))
 	mux.HandleFunc("/api/v1/fs/ls", w.authMiddleware(w.handleFsList))
@@ -204,7 +262,33 @@ func (w *Worker) Start(ctx context.Context) error {
 	)
 
 	<-ctx.Done()
+	w.StopAllJobs(5 * time.Second)
 	return w.server.Shutdown(context.Background())
+}
+
+// StopAllJobs 终结当前 Worker 管辖的所有活跃任务并释放系统句柄与文件锁
+func (w *Worker) StopAllJobs(timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	w.mu.RLock()
+	jobs := make([]*process.ManagedJob, 0, len(w.jobs))
+	for _, j := range w.jobs {
+		jobs = append(jobs, j)
+	}
+	w.mu.RUnlock()
+
+	for _, j := range jobs {
+		if j.IsLive() {
+			_ = j.Kill()
+		}
+	}
+
+	for _, j := range jobs {
+		remain := time.Until(deadline)
+		if remain <= 0 {
+			break
+		}
+		_ = j.WaitExit(remain)
+	}
 }
 
 // WaitAllJobs 等待 Worker 管辖的所有后台任务彻底终结并释放操作系统文件锁
@@ -271,6 +355,7 @@ func (w *Worker) collectNodeInfo() protocol.NodeInfo {
 		Status:  protocol.NodeStatusOnline,
 		Metrics: protocol.NodeMetrics{
 			CPUPercent: cpuPercent,
+			CPUCores:   runtime.NumCPU(),
 			MemFreeMB:  freeMB,
 			MemTotalMB: totalMB,
 		},
@@ -386,11 +471,13 @@ func (w *Worker) handleCleanJobs(rw http.ResponseWriter, r *http.Request) {
 
 	cleanedCount := 0
 	var freedBytes int64
+	cleanedDirs := make(map[string]bool)
 
 	now := time.Now()
+	// 1. 遍历内存中登记的任务
 	for jobID, job := range w.jobs {
 		info := job.GetInfo()
-		// 严禁清理正在运行中的任务
+		// 严禁清理正在运行中的活跃任务
 		if info.Status == protocol.JobStatusRunning {
 			continue
 		}
@@ -398,8 +485,12 @@ func (w *Worker) handleCleanJobs(rw http.ResponseWriter, r *http.Request) {
 		shouldClean := false
 		if req.All {
 			shouldClean = true
-		} else if req.Days > 0 && info.EndTime != nil {
-			if now.Sub(*info.EndTime) >= time.Duration(req.Days)*24*time.Hour {
+		} else if req.Days > 0 {
+			checkTime := info.StartTime
+			if info.EndTime != nil {
+				checkTime = *info.EndTime
+			}
+			if now.Sub(checkTime) >= time.Duration(req.Days)*24*time.Hour {
 				shouldClean = true
 			}
 		}
@@ -408,10 +499,47 @@ func (w *Worker) handleCleanJobs(rw http.ResponseWriter, r *http.Request) {
 			delete(w.jobs, jobID)
 			cleanedCount++
 
-			// 同步删除磁盘上的 jobs/<jobID> 日志文件夹
 			jobDir := filepath.Join(w.cfg.DataDir, "jobs", jobID)
 			freedBytes += getDirSize(jobDir)
 			_ = os.RemoveAll(jobDir)
+			cleanedDirs[jobID] = true
+		}
+	}
+
+	// 2. 扫描磁盘上的孤儿目录 (彻底清除未在内存中但符合清理条件的磁盘残余)
+	jobsDir := filepath.Join(w.cfg.DataDir, "jobs")
+	if entries, err := os.ReadDir(jobsDir); err == nil {
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+			jobID := entry.Name()
+			if cleanedDirs[jobID] {
+				continue
+			}
+			// 如果内存中仍处于活跃 RUNNING 状态，严格保护绝不清理
+			if j, exists := w.jobs[jobID]; exists && j.GetInfo().Status == protocol.JobStatusRunning {
+				continue
+			}
+
+			jobDir := filepath.Join(jobsDir, jobID)
+			shouldClean := false
+			if req.All {
+				shouldClean = true
+			} else if req.Days > 0 {
+				if fi, err := entry.Info(); err == nil {
+					if now.Sub(fi.ModTime()) >= time.Duration(req.Days)*24*time.Hour {
+						shouldClean = true
+					}
+				}
+			}
+
+			if shouldClean {
+				delete(w.jobs, jobID)
+				cleanedCount++
+				freedBytes += getDirSize(jobDir)
+				_ = os.RemoveAll(jobDir)
+			}
 		}
 	}
 
@@ -606,8 +734,8 @@ func (w *Worker) handleStreamLogs(rw http.ResponseWriter, r *http.Request) {
 		_ = f.Close()
 	}
 
-	// 2. 若任务已结束，推送完历史日志即可正常关闭
-	if job.GetInfo().Status != protocol.JobStatusRunning {
+	// 2. 若任务已结束或广播器未就绪 (例如历史任务)，推送完历史日志即可正常关闭
+	if job.GetInfo().Status != protocol.JobStatusRunning || job.Broadcaster() == nil {
 		return
 	}
 
@@ -630,7 +758,18 @@ func (w *Worker) handleStreamLogs(rw http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// 远端文件五件套正交独立处理器
+// 远端文件七件套正交独立处理器
+
+func (w *Worker) handleFsRoots(rw http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(rw, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	roots := pathutil.GetAvailableDrives()
+	rw.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(rw).Encode(roots)
+}
 
 func (w *Worker) handleFsUpload(rw http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut && r.Method != http.MethodPost {

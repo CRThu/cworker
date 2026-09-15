@@ -7,6 +7,7 @@ import NodesView from '../lib/components/NodesView.svelte';
 import AddNodeModal from '../lib/components/AddNodeModal.svelte';
 import CleanJobsModal from '../lib/components/CleanJobsModal.svelte';
 import RunJobModal from '../lib/components/RunJobModal.svelte';
+import MyCardModal from '../lib/components/MyCardModal.svelte';
 import type { JobInfo } from '../lib/types';
 
 vi.mock('../lib/api', () => ({
@@ -192,6 +193,81 @@ describe('NodesView component layout and interactions', () => {
     expect(memCard?.querySelector('.stat-value')?.textContent?.trim()).toBe('26.0G / 31.6G');
     expect(memCard?.querySelector('.stat-sub')?.textContent?.trim()).toBe('可分配 / 总量');
   });
+
+  it('should render friendly empty state message when nodes list is empty', () => {
+    const { container } = render(NodesView, {
+      props: {
+        nodes: [],
+        knownNodes: [],
+      },
+    });
+
+    const emptyCell = container.querySelector('.empty-cell');
+    expect(emptyCell).not.toBeNull();
+    expect(emptyCell?.textContent).toContain('当前账本中暂无 Worker 节点。点击右上角 "+ 添加节点" 进行添加。');
+  });
+
+  it('should render CPU as used% / total% when cpu_cores is available', () => {
+    const { container } = render(NodesView, {
+      props: {
+        nodes: [
+          {
+            name: 'NODE-16C',
+            address: '100.93.237.16:19000',
+            status: 'ONLINE',
+            active_jobs: 1,
+            metrics: { cpu_percent: 20.0, cpu_cores: 16, mem_total_mb: 32768, mem_free_mb: 16384 },
+          },
+        ],
+        knownNodes: [],
+      },
+    });
+
+    const cpuCell = container.querySelector('tbody tr td:nth-child(4)');
+    expect(cpuCell?.textContent).toContain('320% / 1600%');
+  });
+
+  it('should safely fall back to single percentage when cpu_cores is not provided (legacy worker)', () => {
+    const { container } = render(NodesView, {
+      props: {
+        nodes: [
+          {
+            name: 'NODE-LEGACY',
+            address: '100.93.237.16:19000',
+            status: 'ONLINE',
+            active_jobs: 0,
+            metrics: { cpu_percent: 10.6, mem_total_mb: 8192, mem_free_mb: 4096 },
+          },
+        ],
+        knownNodes: [],
+      },
+    });
+
+    const cpuCell = container.querySelector('tbody tr td:nth-child(4)');
+    expect(cpuCell?.textContent).toContain('10.6%');
+    expect(cpuCell?.textContent).not.toContain('/');
+  });
+
+  it('should render dash for offline nodes without NaN or 0%/0%', () => {
+    const { container } = render(NodesView, {
+      props: {
+        nodes: [
+          {
+            name: 'NODE-DOWN',
+            address: '100.93.237.200:19000',
+            status: 'OFFLINE',
+            active_jobs: 0,
+          },
+        ],
+        knownNodes: [],
+      },
+    });
+
+    const cpuCell = container.querySelector('tbody tr td:nth-child(4)');
+    const memCell = container.querySelector('tbody tr td:nth-child(5)');
+    expect(cpuCell?.textContent?.trim()).toBe('-');
+    expect(memCell?.textContent?.trim()).toBe('-');
+  });
 });
 
 describe('AddNodeModal validation and computer name support', () => {
@@ -211,6 +287,41 @@ describe('AddNodeModal validation and computer name support', () => {
     const tokenInput = container.querySelector('input[type="password"]') as HTMLInputElement;
     expect(tokenInput).not.toBeNull();
     expect(tokenInput.hasAttribute('required')).toBe(true);
+  });
+
+  it('should dispatch submit event with trimmed values and close event on cancel', async () => {
+    let submitted: any = null;
+    let closed = false;
+    const { container } = render(AddNodeModal, {
+      props: {
+        open: true,
+        onSubmit: (p: any) => { submitted = p; },
+        onClose: () => { closed = true; },
+      },
+    });
+
+    const nameInput = container.querySelector('#add-node-name') as HTMLInputElement;
+    const targetInput = container.querySelector('#add-node-target') as HTMLInputElement;
+    const tokenInput = container.querySelector('#add-node-token') as HTMLInputElement;
+    const form = container.querySelector('form') as HTMLFormElement;
+
+    // 填写输入
+    await fireEvent.input(nameInput, { target: { value: '  new-node  ' } });
+    await fireEvent.input(targetInput, { target: { value: '  192.168.1.88:19000  ' } });
+    await fireEvent.input(tokenInput, { target: { value: '  secret-token  ' } });
+
+    await fireEvent.submit(form);
+
+    expect(submitted).toEqual({
+      name: 'new-node',
+      target: '192.168.1.88:19000',
+      token: 'secret-token',
+    });
+
+    // 点击取消按钮
+    const cancelBtn = container.querySelector('.modal-footer .btn-secondary') as HTMLButtonElement;
+    await fireEvent.click(cancelBtn);
+    expect(closed).toBe(true);
   });
 });
 
@@ -232,6 +343,47 @@ describe('CleanJobsModal multi-node selection and text optimization', () => {
 
     // 验证废弃说教文案已彻底移除
     expect(queryByText(/运行中 \(RUNNING\) 任务受底层保护/i)).toBeNull();
+  });
+
+  it('should dispatch submit event with selected nodes, days, and cleanAll options', async () => {
+    let submittedPayload: any = null;
+    const { container } = render(CleanJobsModal, {
+      props: {
+        open: true,
+        nodes: [
+          { name: 'worker-1', address: '127.0.0.1:19000', status: 'ONLINE', active_jobs: 0 },
+          { name: 'worker-2', address: '127.0.0.1:19001', status: 'ONLINE', active_jobs: 1 },
+        ],
+        onSubmit: (payload: any) => {
+          submittedPayload = payload;
+        },
+      },
+    });
+
+    const submitBtn = container.querySelector('button[type="submit"]') as HTMLButtonElement;
+    expect(submitBtn).not.toBeNull();
+    await fireEvent.click(submitBtn);
+
+    // 默认：全部节点、days = 7、all = false
+    expect(submittedPayload).toEqual({
+      nodes: undefined,
+      node: '',
+      all: false,
+      days: 7,
+    });
+
+    // 切换为清理全部已结束任务
+    const radios = container.querySelectorAll('input[type="radio"]') as NodeListOf<HTMLInputElement>;
+    expect(radios.length).toBe(2);
+    await fireEvent.click(radios[1]);
+    await fireEvent.click(submitBtn);
+
+    expect(submittedPayload).toEqual({
+      nodes: undefined,
+      node: '',
+      all: true,
+      days: 0,
+    });
   });
 });
 
@@ -269,6 +421,120 @@ describe('RunJobModal with directory browse', () => {
     // 验证工作目录输入框成功回填路径
     const dirInput = container.querySelector('#run-job-dir') as HTMLInputElement;
     expect(dirInput.value).toBe('C:/');
+  });
+
+  it('should randomize name and dispatch submit event on command submit', async () => {
+    let submitted: any = null;
+    let closed = false;
+    const { container } = render(RunJobModal, {
+      props: {
+        open: true,
+        nodes: [{ name: 'worker-1', address: '127.0.0.1:19000', status: 'ONLINE', active_jobs: 0 }],
+        onSubmit: (p: any) => { submitted = p; },
+        onClose: () => { closed = true; },
+      },
+    });
+
+    // 点击随机生成按钮
+    const randBtn = container.querySelector('.btn-text-sm') as HTMLButtonElement;
+    await fireEvent.click(randBtn);
+
+    // 输入命令
+    const cmdInput = container.querySelector('#run-job-cmd') as HTMLInputElement;
+    await fireEvent.input(cmdInput, { target: { value: 'python test.py' } });
+
+    const form = container.querySelector('form') as HTMLFormElement;
+    await fireEvent.submit(form);
+
+    expect(submitted).not.toBeNull();
+    expect(submitted.node).toBe('worker-1');
+    expect(submitted.command).toBe('python test.py');
+
+    // 点击取消
+    const cancelBtn = container.querySelector('.modal-footer .btn-secondary') as HTMLButtonElement;
+    await fireEvent.click(cancelBtn);
+    expect(closed).toBe(true);
+  });
+});
+
+describe('MyCardModal identity and pairing command', () => {
+  it('should render hostname, default port, token, and pairing command', () => {
+    const { container, getByText } = render(MyCardModal, {
+      props: {
+        open: true,
+        card: {
+          name: 'DESKTOP-4090',
+          ip: '127.0.0.1',
+          port: 19000,
+          token: 'token-identity-xyz-1234567890',
+        },
+      },
+    });
+
+    expect(getByText('DESKTOP-4090')).toBeTruthy();
+    expect(getByText('19000')).toBeTruthy();
+
+    // 验证一键配对命令格式
+    const cmdInput = container.querySelector('#my-card-cmd') as HTMLInputElement;
+    expect(cmdInput).not.toBeNull();
+    expect(cmdInput.value).toBe('cw node add DESKTOP-4090 --token token-identity-xyz-1234567890');
+  });
+
+  it('should fallback gracefully when token is empty', () => {
+    const { container, getByText } = render(MyCardModal, {
+      props: {
+        open: true,
+        card: {
+          name: 'LOCAL-NODE',
+          ip: '127.0.0.1',
+          port: 19000,
+          token: '',
+        },
+      },
+    });
+
+    expect(getByText('LOCAL-NODE')).toBeTruthy();
+    const cmdInput = container.querySelector('#my-card-cmd') as HTMLInputElement;
+    expect(cmdInput.value).toBe('cw node add LOCAL-NODE');
+  });
+
+  it('should copy token and pairing cmd to clipboard and close modal on cancel', async () => {
+    let closed = false;
+    const { container } = render(MyCardModal, {
+      props: {
+        open: true,
+        card: {
+          name: 'LOCAL-NODE',
+          ip: '127.0.0.1',
+          port: 19000,
+          token: 'ed25519-token-secret-12345678901234567890',
+        },
+        onClose: () => { closed = true; },
+      },
+    });
+
+    const writeTextMock = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText: writeTextMock } });
+    (window as any).isSecureContext = true;
+
+    // 点击复制 Token
+    const copyTokenBtn = Array.from(container.querySelectorAll('button')).find(b => b.textContent?.includes('复制 Token')) as HTMLButtonElement;
+    expect(copyTokenBtn).toBeDefined();
+    await fireEvent.click(copyTokenBtn);
+    expect(writeTextMock).toHaveBeenCalledWith('ed25519-token-secret-12345678901234567890');
+    expect(copyTokenBtn.textContent).toContain('已复制');
+
+    // 点击复制命令
+    const copyCmdBtn = Array.from(container.querySelectorAll('button')).find(b => b.textContent?.includes('复制命令')) as HTMLButtonElement;
+    expect(copyCmdBtn).toBeDefined();
+    await fireEvent.click(copyCmdBtn);
+    expect(writeTextMock).toHaveBeenCalledWith('cw node add LOCAL-NODE --token ed25519-token-secret-12345678901234567890');
+    expect(copyCmdBtn.textContent).toContain('已复制');
+
+    // 点击关闭
+    const closeBtn = container.querySelector('.modal-footer .btn-secondary') as HTMLButtonElement;
+    await fireEvent.click(closeBtn);
+    expect(closed).toBe(true);
   });
 });
 

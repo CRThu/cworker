@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,6 +19,7 @@ import (
 
 	"cworker/pkg/client"
 	"cworker/pkg/pathutil"
+	"cworker/pkg/process"
 	"cworker/pkg/protocol"
 	"cworker/pkg/worker"
 )
@@ -117,12 +119,25 @@ func TestCluster_FullLifecycle(t *testing.T) {
 
 	foundAlpha := false
 	foundBeta := false
+	expectedCores := runtime.NumCPU()
 	for _, n := range nodes {
 		if n.Name == "node-alpha" && n.Status == protocol.NodeStatusOnline {
 			foundAlpha = true
+			if n.Metrics.CPUCores != expectedCores {
+				t.Fatalf("expected node-alpha CPUCores %d, got %d", expectedCores, n.Metrics.CPUCores)
+			}
+			if n.Metrics.MemTotalMB == 0 {
+				t.Fatalf("expected node-alpha MemTotalMB > 0")
+			}
 		}
 		if n.Name == "node-beta" && n.Status == protocol.NodeStatusOnline {
 			foundBeta = true
+			if n.Metrics.CPUCores != expectedCores {
+				t.Fatalf("expected node-beta CPUCores %d, got %d", expectedCores, n.Metrics.CPUCores)
+			}
+			if n.Metrics.MemTotalMB == 0 {
+				t.Fatalf("expected node-beta MemTotalMB > 0")
+			}
 		}
 	}
 	if !foundAlpha || !foundBeta {
@@ -759,4 +774,161 @@ func TestCluster_CleanJobs_EndToEnd(t *testing.T) {
 	// 终止长常驻任务，释放句柄
 	_, _ = cli.KillJob(jobLongAlpha.ID)
 }
+
+// TestCluster_WorkerRebootAndHydrationInCluster 模拟 Worker 真实闪退/断电重启后的全集群端到端水合、日志回放与清理
+func TestCluster_WorkerRebootAndHydrationInCluster(t *testing.T) {
+	dataDir := t.TempDir()
+	cliDataDir := t.TempDir()
+	t.Setenv("USERPROFILE", cliDataDir)
+
+	port1 := getFreePort(t)
+	w1, err := worker.NewWorker(worker.Config{
+		Name:     "node-reboot",
+		BindAddr: "127.0.0.1",
+		Port:     port1,
+		DataDir:  dataDir,
+	})
+	if err != nil {
+		t.Fatalf("NewWorker 1 failed: %v", err)
+	}
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	go func() { _ = w1.Start(ctx1) }()
+	time.Sleep(200 * time.Millisecond)
+
+	cli := client.NewClient()
+	_ = cli.SaveKnownNode(protocol.KnownNode{
+		Name:   "node-reboot",
+		Target: fmt.Sprintf("127.0.0.1:%d", port1),
+		Token:  w1.Token(),
+	})
+
+	// 1. 派发一个正常结束的短任务
+	jobComp, err := cli.RunJob(protocol.RunJobRequest{
+		Node:    "node-reboot",
+		Name:    "task-comp",
+		Command: "cmd.exe /c echo e2e_comp_done",
+	}, "")
+	if err != nil {
+		t.Fatalf("run comp job failed: %v", err)
+	}
+
+	// 2. 派发一个长运行任务 (模拟运行途中遭遇异常断电)
+	jobUnclosed, err := cli.RunJob(protocol.RunJobRequest{
+		Node:    "node-reboot",
+		Name:    "task-unclosed",
+		Command: "ping 127.0.0.1 -n 50",
+	}, "")
+	if err != nil {
+		t.Fatalf("run unclosed job failed: %v", err)
+	}
+
+	time.Sleep(500 * time.Millisecond)
+
+	// 3. 模拟异常关闭 / 服务崩溃 (取消上下文使旧 Worker 终止退出并释放文件锁)
+	cancel1()
+	time.Sleep(500 * time.Millisecond)
+
+	// 模拟断电崩溃现场：物理进程已消亡，但磁盘 job.json 仍停留在 RUNNING 状态
+	unclosedDir := filepath.Join(dataDir, "jobs", jobUnclosed.ID)
+	_ = process.SaveJobMeta(unclosedDir, protocol.JobInfo{
+		ID:        jobUnclosed.ID,
+		Name:      "task-unclosed",
+		Command:   "ping 127.0.0.1 -n 50",
+		Status:    protocol.JobStatusRunning,
+		StartTime: time.Now().Add(-10 * time.Second),
+		PID:       12345,
+	})
+
+	// 4. 重启 Worker 实例（指向同一个物理数据目录 dataDir）
+	port2 := getFreePort(t)
+	w2, err := worker.NewWorker(worker.Config{
+		Name:     "node-reboot",
+		BindAddr: "127.0.0.1",
+		Port:     port2,
+		DataDir:  dataDir,
+		Token:    w1.Token(),
+	})
+	if err != nil {
+		t.Fatalf("NewWorker 2 failed: %v", err)
+	}
+
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	go func() { _ = w2.Start(ctx2) }()
+	time.Sleep(200 * time.Millisecond)
+
+	// 更新客户端账本指向新端口
+	_ = cli.SaveKnownNode(protocol.KnownNode{
+		Name:   "node-reboot",
+		Target: fmt.Sprintf("127.0.0.1:%d", port2),
+		Token:  w1.Token(),
+	})
+
+	// 5. 跨网络发起 ListJobs 查询：断言旧任务全部被冷启动水合且状态自愈
+	jobs, err := cli.ListJobs("node-reboot")
+	if err != nil {
+		t.Fatalf("ListJobs failed on rebooted worker: %v", err)
+	}
+	if len(jobs) != 2 {
+		t.Fatalf("expected 2 jobs after reboot, got %d", len(jobs))
+	}
+
+	var foundComp, foundUnclosed bool
+	for _, j := range jobs {
+		if j.ID == jobComp.ID {
+			foundComp = true
+			if j.Status != protocol.JobStatusCompleted {
+				t.Errorf("jobComp status = %s, want COMPLETED", j.Status)
+			}
+		}
+		if j.ID == jobUnclosed.ID {
+			foundUnclosed = true
+			if j.Status != protocol.JobStatusStopped {
+				t.Errorf("jobUnclosed status = %s, want STOPPED", j.Status)
+			}
+			if j.ExitCode != -1 {
+				t.Errorf("jobUnclosed exit code = %d, want -1", j.ExitCode)
+			}
+		}
+	}
+	if !foundComp || !foundUnclosed {
+		t.Fatalf("expected both jobs to be found, got comp=%v, unclosed=%v", foundComp, foundUnclosed)
+	}
+
+	// 6. 验证跨机拉取历史日志端点正常回放
+	logs, err := cli.GetLogs(jobComp.ID, 10)
+	if err != nil {
+		t.Fatalf("GetLogs failed: %v", err)
+	}
+	if !strings.Contains(logs, "e2e_comp_done") {
+		t.Errorf("expected log content, got: %s", logs)
+	}
+
+	// 7. 全量清理该节点上的历史任务
+	cleanRes, err := cli.CleanJobs("node-reboot", 0, true)
+	if err != nil {
+		t.Fatalf("CleanJobs failed: %v", err)
+	}
+	if res, ok := cleanRes["node-reboot"]; !ok || res.CleanedCount != 2 {
+		t.Fatalf("expected 2 cleaned jobs, got: %+v", cleanRes)
+	}
+
+	// 8. 验证清理后列表归零，磁盘目录彻底销毁
+	jobsAfterClean, err := cli.ListJobs("node-reboot")
+	if err != nil {
+		t.Fatalf("ListJobs after clean failed: %v", err)
+	}
+	if len(jobsAfterClean) != 0 {
+		t.Fatalf("expected 0 jobs after clean, got %d", len(jobsAfterClean))
+	}
+
+	if _, err := os.Stat(filepath.Join(dataDir, "jobs", jobComp.ID)); !os.IsNotExist(err) {
+		t.Error("jobComp directory should be completely deleted from disk")
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, "jobs", jobUnclosed.ID)); !os.IsNotExist(err) {
+		t.Error("jobUnclosed directory should be completely deleted from disk")
+	}
+}
+
 

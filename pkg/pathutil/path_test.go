@@ -2,6 +2,7 @@ package pathutil
 
 import (
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -220,5 +221,24 @@ func TestSafeBaseName(t *testing.T) {
 		if got := SafeBaseName(tc.input); got != tc.expected {
 			t.Errorf("SafeBaseName(%q) = %q; want %q", tc.input, got, tc.expected)
 		}
+	}
+}
+
+func TestGetAvailableDrives(t *testing.T) {
+	drives := GetAvailableDrives()
+	if len(drives) == 0 {
+		t.Fatal("expected at least one drive, got 0")
+	}
+	foundC := false
+	for _, d := range drives {
+		if !strings.HasSuffix(d, ":/") {
+			t.Errorf("expected drive format 'X:/', got %q", d)
+		}
+		if strings.EqualFold(d, "C:/") {
+			foundC = true
+		}
+	}
+	if !foundC {
+		t.Logf("drives found: %v (C:/ not detected, running in non-standard environment)", drives)
 	}
 }

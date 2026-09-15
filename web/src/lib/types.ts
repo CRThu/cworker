@@ -5,6 +5,7 @@ export type JobStatus = 'RUNNING' | 'COMPLETED' | 'FAILED' | 'STOPPED';
 
 export interface HostMetrics {
   cpu_percent: number;
+  cpu_cores?: number;
   mem_total_mb: number;
   mem_free_mb: number;
 }

@@ -1,6 +1,7 @@
 package process
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -15,10 +16,52 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+// JobMetaFileName 统一任务元数据持久化文件名 (SSOT)
+const JobMetaFileName = "job.json"
+
+// SaveJobMeta 将 JobInfo 原子持久化至指定任务目录下的 job.json
+func SaveJobMeta(jobDir string, info protocol.JobInfo) error {
+	data, err := json.MarshalIndent(info, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal job meta failed: %w", err)
+	}
+
+	tmpFile := filepath.Join(jobDir, JobMetaFileName+".tmp")
+	targetFile := filepath.Join(jobDir, JobMetaFileName)
+
+	if err := os.WriteFile(tmpFile, data, 0644); err != nil {
+		return fmt.Errorf("write tmp job meta failed: %w", err)
+	}
+
+	// 兼容 Windows 下原子重命名替换
+	if err := os.Rename(tmpFile, targetFile); err != nil {
+		_ = os.Remove(targetFile)
+		if err := os.Rename(tmpFile, targetFile); err != nil {
+			return fmt.Errorf("rename job meta failed: %w", err)
+		}
+	}
+	return nil
+}
+
+// LoadJobMeta 从任务目录读取 job.json
+func LoadJobMeta(jobDir string) (*protocol.JobInfo, error) {
+	targetFile := filepath.Join(jobDir, JobMetaFileName)
+	data, err := os.ReadFile(targetFile)
+	if err != nil {
+		return nil, err
+	}
+	var info protocol.JobInfo
+	if err := json.Unmarshal(data, &info); err != nil {
+		return nil, fmt.Errorf("unmarshal job meta failed: %w", err)
+	}
+	return &info, nil
+}
+
 // ManagedJob 统一维护单个被管任务的全部运行时状态与物理资源句柄
 type ManagedJob struct {
 	mu          sync.Mutex
 	info        protocol.JobInfo
+	jobDir      string
 	cmd         *exec.Cmd
 	jobObj      *JobObject
 	logFile     *os.File
@@ -27,6 +70,27 @@ type ManagedJob struct {
 
 	lastCpuMs time.Duration
 	lastTime  time.Time
+}
+
+// NewHistoricJob 为冷启动恢复的历史任务构建只读托管句柄
+func NewHistoricJob(info protocol.JobInfo, jobDir string) *ManagedJob {
+	done := make(chan struct{})
+	close(done)
+	return &ManagedJob{
+		info:   info,
+		jobDir: jobDir,
+		done:   done,
+	}
+}
+
+// IsLive 检查当前任务是否为活动中/正在被当前 Worker 管辖的物理进程句柄
+func (j *ManagedJob) IsLive() bool {
+	if j == nil {
+		return false
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.cmd != nil && j.jobObj != nil && j.info.Status == protocol.JobStatusRunning
 }
 
 // StartJob 在 Worker 本地启动命令，关联 Job Object 并建立多路日志重定向
@@ -87,6 +151,7 @@ func StartJob(req protocol.RunJobRequest, jobID string, nodeName string, logRoot
 			PID:       cmd.Process.Pid,
 			StartTime: time.Now(),
 		},
+		jobDir:      jobLogDir,
 		cmd:         cmd,
 		jobObj:      jobObj,
 		logFile:     logFile,
@@ -94,6 +159,9 @@ func StartJob(req protocol.RunJobRequest, jobID string, nodeName string, logRoot
 		done:        make(chan struct{}),
 		lastTime:    time.Now(),
 	}
+
+	// 原子落盘初始元数据 (RUNNING)
+	_ = SaveJobMeta(jobLogDir, job.info)
 
 	// 异步监听进程生命周期退出
 	go job.waitExit()
@@ -106,8 +174,6 @@ func (j *ManagedJob) waitExit() {
 	err := j.cmd.Wait()
 
 	j.mu.Lock()
-	defer j.mu.Unlock()
-
 	now := time.Now()
 	j.info.EndTime = &now
 
@@ -125,6 +191,12 @@ func (j *ManagedJob) waitExit() {
 			j.info.Status = protocol.JobStatusCompleted
 		}
 	}
+
+	// 持久化最终退出状态
+	if j.jobDir != "" {
+		_ = SaveJobMeta(j.jobDir, j.info)
+	}
+	j.mu.Unlock()
 
 	// 释放资源
 	if j.jobObj != nil {
@@ -156,6 +228,10 @@ func (j *ManagedJob) Kill() error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 
+	if j.cmd == nil || j.jobObj == nil {
+		return errors.New("cannot kill non-live or historical job")
+	}
+
 	if j.info.Status != protocol.JobStatusRunning {
 		return nil
 	}
@@ -163,6 +239,10 @@ func (j *ManagedJob) Kill() error {
 	j.info.Status = protocol.JobStatusStopped
 	now := time.Now()
 	j.info.EndTime = &now
+
+	if j.jobDir != "" {
+		_ = SaveJobMeta(j.jobDir, j.info)
+	}
 
 	if j.jobObj != nil {
 		_ = j.jobObj.Terminate(1)

@@ -6,6 +6,7 @@
 
   export let open: boolean = false;
   export let card: LocalCardInfo | null = null;
+  export let onClose: (() => void) | undefined = undefined;
 
   const dispatch = createEventDispatcher();
   let tokenCopied = false;
@@ -16,6 +17,7 @@
   $: pairingCmd = token ? `cw node add ${hostname} --token ${token}` : `cw node add ${hostname}`;
 
   function handleClose() {
+    if (onClose) onClose();
     dispatch('close');
   }
 

@@ -3,9 +3,11 @@ package cmd
 import (
 	"bufio"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"strings"
+	"text/tabwriter"
 
 	"cworker/pkg/client"
 	"cworker/pkg/protocol"
@@ -18,7 +20,60 @@ var (
 
 var nodeCmd = &cobra.Command{
 	Use:   "node",
-	Short: "管理本地已知节点记忆账本 (添加/移除远端 Worker)",
+	Short: "查看集群节点状态或管理本地已知节点记忆账本",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runNodeList()
+	},
+}
+
+var nodeLsCmd = &cobra.Command{
+	Use:     "ls",
+	Aliases: []string{"list"},
+	Short:   "查看集群中所有 Worker 节点的在线状态与实时硬件负载",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runNodeList()
+	},
+}
+
+func runNodeList() error {
+	cli := client.NewClient()
+	nodes, err := cli.ListNodes()
+	if err != nil {
+		return err
+	}
+
+	if len(nodes) == 0 {
+		fmt.Println("No active workers discovered in cluster.")
+		return nil
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 2, 8, 2, ' ', 0)
+	fmt.Fprintln(w, "NAME\tSTATUS\tADDRESS\tCPU\tMEM\tJOBS")
+	for _, n := range nodes {
+		var cpuStr string
+		if n.Metrics.CPUCores > 0 {
+			usedPercent := int(math.Round(n.Metrics.CPUPercent * float64(n.Metrics.CPUCores)))
+			totalPercent := n.Metrics.CPUCores * 100
+			cpuStr = fmt.Sprintf("%d%% / %d%%", usedPercent, totalPercent)
+		} else {
+			cpuStr = fmt.Sprintf("%.1f%%", n.Metrics.CPUPercent)
+		}
+
+		var memUsedMB uint64
+		if n.Metrics.MemTotalMB > n.Metrics.MemFreeMB {
+			memUsedMB = n.Metrics.MemTotalMB - n.Metrics.MemFreeMB
+		}
+		var memStr string
+		if n.Metrics.MemTotalMB >= 1024 {
+			memStr = fmt.Sprintf("%.1fG / %.1fG", float64(memUsedMB)/1024.0, float64(n.Metrics.MemTotalMB)/1024.0)
+		} else {
+			memStr = fmt.Sprintf("%dM / %dM", memUsedMB, n.Metrics.MemTotalMB)
+		}
+
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\n",
+			n.Name, n.Status, n.Address, cpuStr, memStr, n.ActiveJobs)
+	}
+	return w.Flush()
 }
 
 var nodeAddCmd = &cobra.Command{
@@ -97,6 +152,7 @@ var nodeRmCmd = &cobra.Command{
 func init() {
 	nodeAddCmd.Flags().StringVar(&nodeToken, "token", "", "远端 Worker 认证 Token (首次配对使用)")
 
+	nodeCmd.AddCommand(nodeLsCmd)
 	nodeCmd.AddCommand(nodeAddCmd)
 	nodeCmd.AddCommand(nodeRmCmd)
 	RootCmd.AddCommand(nodeCmd)

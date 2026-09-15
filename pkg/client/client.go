@@ -236,32 +236,9 @@ func (c *Client) doRequestWithContext(ctx context.Context, rt *ResolvedTarget, m
 	return c.httpClient.Do(req)
 }
 
-// getEffectiveKnownNodes 获取已知节点账本。若本地账本为空，默认回退探查本机 (SSOT 单一事实来源)
-func (c *Client) getEffectiveKnownNodes() (map[string]protocol.KnownNode, error) {
-	nodes, err := c.LoadKnownNodes()
-	if err != nil {
-		return nil, err
-	}
-	if len(nodes) == 0 {
-		hostname, _ := os.Hostname()
-		var localToken string
-		if b, err := os.ReadFile(filepath.Join(c.dataDir, protocol.TokenFileName)); err == nil {
-			localToken = strings.TrimSpace(string(b))
-		}
-		nodes = map[string]protocol.KnownNode{
-			strings.ToLower(hostname): {
-				Name:   hostname,
-				Target: "127.0.0.1:" + protocol.DefaultPortStr,
-				Token:  localToken,
-			},
-		}
-	}
-	return nodes, nil
-}
-
 // ListNodes 并发对账本中所有已知节点进行动态 DNS 解析与实时测活
 func (c *Client) ListNodes() ([]protocol.NodeInfo, error) {
-	nodes, err := c.getEffectiveKnownNodes()
+	nodes, err := c.LoadKnownNodes()
 	if err != nil {
 		return nil, err
 	}
@@ -398,7 +375,7 @@ func (c *Client) ListJobs(targetNode ...string) ([]protocol.JobInfo, error) {
 		return jobs, nil
 	}
 
-	knownNodes, err := c.getEffectiveKnownNodes()
+	knownNodes, err := c.LoadKnownNodes()
 	if err != nil {
 		return nil, err
 	}
@@ -442,7 +419,7 @@ func (c *Client) ListJobs(targetNode ...string) ([]protocol.JobInfo, error) {
 
 // KillJob 终止任务
 func (c *Client) KillJob(jobID string) (*protocol.JobInfo, error) {
-	knownNodes, err := c.getEffectiveKnownNodes()
+	knownNodes, err := c.LoadKnownNodes()
 	if err != nil {
 		return nil, err
 	}
@@ -523,7 +500,7 @@ func (c *Client) CleanJobs(targetNode string, days int, all bool) (map[string]pr
 	}
 
 	// 全集群并发清理
-	knownNodes, err := c.getEffectiveKnownNodes()
+	knownNodes, err := c.LoadKnownNodes()
 	if err != nil {
 		return nil, err
 	}
@@ -560,7 +537,7 @@ func (c *Client) CleanJobs(targetNode string, days int, all bool) (map[string]pr
 
 func (c *Client) resolveTargetForJob(node string, jobID string) (*ResolvedTarget, error) {
 	if node != "" {
-		knownNodes, _ := c.getEffectiveKnownNodes()
+		knownNodes, _ := c.LoadKnownNodes()
 		if kn, ok := knownNodes[strings.ToLower(node)]; ok {
 			return c.ResolveWorker(kn.Name, kn.Token)
 		}
@@ -635,7 +612,7 @@ func (c *Client) StreamLogsNode(ctx context.Context, node string, jobID string, 
 }
 
 func (c *Client) findJobWorker(jobID string) (*ResolvedTarget, error) {
-	knownNodes, err := c.getEffectiveKnownNodes()
+	knownNodes, err := c.LoadKnownNodes()
 	if err != nil {
 		return nil, err
 	}
@@ -886,6 +863,46 @@ func (c *Client) DownloadToLocalFile(ctx context.Context, node, remotePath, loca
 		return nil
 	})
 	return err
+}
+
+// GetRoots 获取指定节点（或本地）可用盘符列表
+func (c *Client) GetRoots(node string) ([]string, error) {
+	return c.GetRootsWithContext(context.Background(), node)
+}
+
+// GetRootsWithContext 获取指定节点（或本地）可用盘符列表
+func (c *Client) GetRootsWithContext(ctx context.Context, node string) ([]string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if node == "" {
+		return pathutil.GetAvailableDrives(), nil
+	}
+
+	rt, err := c.ResolveWorker(node, "")
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.doRequestWithContext(ctx, rt, http.MethodGet, "/api/v1/fs/roots", nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("get roots failed (%d): %s", resp.StatusCode, string(body))
+	}
+
+	var roots []string
+	if err := json.NewDecoder(resp.Body).Decode(&roots); err != nil {
+		return nil, err
+	}
+	if len(roots) == 0 {
+		roots = []string{"C:/"}
+	}
+	return roots, nil
 }
 
 func (c *Client) ListDir(node, remotePath string, recursive ...bool) ([]protocol.FileInfo, error) {

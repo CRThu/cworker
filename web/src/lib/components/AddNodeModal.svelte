@@ -3,6 +3,8 @@
   import { createEventDispatcher } from 'svelte';
 
   export let open: boolean = false;
+  export let onSubmit: ((detail: any) => void) | undefined = undefined;
+  export let onClose: (() => void) | undefined = undefined;
 
   const dispatch = createEventDispatcher();
 
@@ -11,16 +13,19 @@
   let token: string = '';
 
   function handleClose() {
+    if (onClose) onClose();
     dispatch('close');
   }
 
   function handleSubmit() {
     if (!name.trim() || !target.trim() || !token.trim()) return;
-    dispatch('submit', {
+    const payload = {
       name: name.trim(),
       target: target.trim(),
       token: token.trim(),
-    });
+    };
+    if (onSubmit) onSubmit(payload);
+    dispatch('submit', payload);
     name = '';
     target = '';
     token = '';

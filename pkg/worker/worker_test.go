@@ -174,6 +174,26 @@ func TestWorker_FsHandlers(t *testing.T) {
 	if _, err := os.Stat(targetFilePath); !os.IsNotExist(err) {
 		t.Fatalf("file should have been deleted, but still exists")
 	}
+
+	// 6. 测试 roots
+	rootsReq := httptest.NewRequest(http.MethodGet, "/api/v1/fs/roots", nil)
+	rootsRec := httptest.NewRecorder()
+	w.handleFsRoots(rootsRec, rootsReq)
+	if rootsRec.Code != http.StatusOK {
+		t.Fatalf("handleFsRoots failed: %d", rootsRec.Code)
+	}
+	var roots []string
+	if err := json.NewDecoder(rootsRec.Body).Decode(&roots); err != nil || len(roots) == 0 {
+		t.Fatalf("failed to decode roots or empty: %v", err)
+	}
+
+	// 6.1 测试 roots 非法 Method
+	badRootsReq := httptest.NewRequest(http.MethodPost, "/api/v1/fs/roots", nil)
+	badRootsRec := httptest.NewRecorder()
+	w.handleFsRoots(badRootsRec, badRootsReq)
+	if badRootsRec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 MethodNotAllowed for POST roots, got %d", badRootsRec.Code)
+	}
 }
 
 func TestWorker_FsHash(t *testing.T) {
@@ -1282,5 +1302,417 @@ func TestWorker_RefreshToken(t *testing.T) {
 		t.Fatalf("expected loaded token %s, got %s", t2, loaded)
 	}
 }
+
+func TestWorker_CollectNodeInfo(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "cw_worker_nodeinfo_*")
+	if err != nil {
+		t.Fatalf("create temp dir failed: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	w, err := NewWorker(Config{
+		Name:    "node-test",
+		Port:    9992,
+		DataDir: tempDir,
+	})
+	if err != nil {
+		t.Fatalf("NewWorker failed: %v", err)
+	}
+
+	info := w.collectNodeInfo()
+	if info.Name != "node-test" {
+		t.Fatalf("expected node name 'node-test', got '%s'", info.Name)
+	}
+	if info.Metrics.CPUCores <= 0 {
+		t.Fatalf("expected positive CPUCores, got %d", info.Metrics.CPUCores)
+	}
+	if info.Metrics.MemTotalMB == 0 {
+		t.Fatalf("expected non-zero MemTotalMB")
+	}
+}
+
+func TestWorker_FsRoots_AuthMiddleware(t *testing.T) {
+	w := &Worker{
+		cfg: Config{
+			Token: "secure-roots-token-1234",
+		},
+	}
+	handler := w.authMiddleware(w.handleFsRoots)
+
+	// 1. 无 Token 访问 -> 401
+	reqNoAuth := httptest.NewRequest(http.MethodGet, "/api/v1/fs/roots", nil)
+	recNoAuth := httptest.NewRecorder()
+	handler(recNoAuth, reqNoAuth)
+	if recNoAuth.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without auth, got %d", recNoAuth.Code)
+	}
+
+	// 2. 错误 Token 访问 -> 401
+	reqBadAuth := httptest.NewRequest(http.MethodGet, "/api/v1/fs/roots", nil)
+	reqBadAuth.Header.Set("Authorization", "Bearer wrong-token")
+	recBadAuth := httptest.NewRecorder()
+	handler(recBadAuth, reqBadAuth)
+	if recBadAuth.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for bad token, got %d", recBadAuth.Code)
+	}
+
+	// 3. Header Bearer Token 正确访问 -> 200
+	reqGoodHeader := httptest.NewRequest(http.MethodGet, "/api/v1/fs/roots", nil)
+	reqGoodHeader.Header.Set("Authorization", "Bearer secure-roots-token-1234")
+	recGoodHeader := httptest.NewRecorder()
+	handler(recGoodHeader, reqGoodHeader)
+	if recGoodHeader.Code != http.StatusOK {
+		t.Fatalf("expected 200 with Bearer token, got %d", recGoodHeader.Code)
+	}
+
+	// 4. Query param token 正确访问 -> 200
+	reqGoodQuery := httptest.NewRequest(http.MethodGet, "/api/v1/fs/roots?token=secure-roots-token-1234", nil)
+	recGoodQuery := httptest.NewRecorder()
+	handler(recGoodQuery, reqGoodQuery)
+	if recGoodQuery.Code != http.StatusOK {
+		t.Fatalf("expected 200 with query token, got %d", recGoodQuery.Code)
+	}
+}
+
+func TestWorker_HydrateJobsAndRebootSimulation(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "cw_worker_hydrate_test_*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	jobsDir := filepath.Join(tempDir, "jobs")
+	_ = os.MkdirAll(jobsDir, 0755)
+
+	// 1. 模拟已正常完成的任务 job-completed
+	jobCompDir := filepath.Join(jobsDir, "job-comp-1")
+	_ = os.MkdirAll(jobCompDir, 0755)
+	_ = os.WriteFile(filepath.Join(jobCompDir, "output.log"), []byte("comp task log\n"), 0644)
+	compTime := time.Now().Add(-1 * time.Hour)
+	_ = process.SaveJobMeta(jobCompDir, protocol.JobInfo{
+		ID:        "job-comp-1",
+		Name:      "task-comp",
+		Command:   "echo comp",
+		Status:    protocol.JobStatusCompleted,
+		StartTime: compTime,
+		EndTime:   &compTime,
+		ExitCode:  0,
+	})
+
+	// 2. 模拟断电/崩溃遗留的任务 job-crash-running (原状态为 RUNNING)
+	jobCrashDir := filepath.Join(jobsDir, "job-crash-2")
+	_ = os.MkdirAll(jobCrashDir, 0755)
+	_ = os.WriteFile(filepath.Join(jobCrashDir, "output.log"), []byte("running interrupted output\n"), 0644)
+	crashStartTime := time.Now().Add(-30 * time.Minute)
+	_ = process.SaveJobMeta(jobCrashDir, protocol.JobInfo{
+		ID:        "job-crash-2",
+		Name:      "task-crash",
+		Command:   "ping 127.0.0.1 -n 100",
+		Status:    protocol.JobStatusRunning,
+		StartTime: crashStartTime,
+		PID:       99999,
+	})
+
+	// 3. 模拟旧版本遗留的孤儿任务 job-legacy-3 (仅有 output.log，无 job.json)
+	jobLegacyDir := filepath.Join(jobsDir, "job-legacy-3")
+	_ = os.MkdirAll(jobLegacyDir, 0755)
+	_ = os.WriteFile(filepath.Join(jobLegacyDir, "output.log"), []byte("legacy log content\n"), 0644)
+
+	// 4. 初始化 Worker (模拟服务冷启动 / 重启拉起)
+	w, err := NewWorker(Config{
+		Name:    "test-reboot-node",
+		DataDir: tempDir,
+		Token:   "test-token",
+		Port:    19098,
+	})
+	if err != nil {
+		t.Fatalf("NewWorker failed: %v", err)
+	}
+
+	// 5. 校验内存中恢复的状态
+	w.mu.RLock()
+	totalJobs := len(w.jobs)
+	jobComp := w.jobs["job-comp-1"]
+	jobCrash := w.jobs["job-crash-2"]
+	jobLegacy := w.jobs["job-legacy-3"]
+	w.mu.RUnlock()
+
+	if totalJobs != 3 {
+		t.Fatalf("expected 3 hydrated jobs, got %d", totalJobs)
+	}
+
+	// 校验已完成任务保持不变
+	if jobComp == nil || jobComp.GetInfo().Status != protocol.JobStatusCompleted {
+		t.Errorf("job-comp-1 status unexpected: %+v", jobComp)
+	}
+
+	// 校验未完成的 RUNNING 任务被自愈为 STOPPED，且退出码为 -1
+	if jobCrash == nil {
+		t.Fatal("job-crash-2 not found in memory")
+	}
+	infoCrash := jobCrash.GetInfo()
+	if infoCrash.Status != protocol.JobStatusStopped {
+		t.Errorf("job-crash-2 status = %s, want STOPPED", infoCrash.Status)
+	}
+	if infoCrash.ExitCode != -1 {
+		t.Errorf("job-crash-2 exit code = %d, want -1", infoCrash.ExitCode)
+	}
+	if infoCrash.EndTime == nil {
+		t.Error("job-crash-2 EndTime should be set")
+	}
+
+	// 验证磁盘上的 job.json 是否已同步更新为 STOPPED
+	diskMetaCrash, err := process.LoadJobMeta(jobCrashDir)
+	if err != nil {
+		t.Fatalf("failed to load job-crash-2 meta from disk: %v", err)
+	}
+	if diskMetaCrash.Status != protocol.JobStatusStopped || diskMetaCrash.ExitCode != -1 {
+		t.Errorf("disk job.json for job-crash-2 mismatch: %+v", diskMetaCrash)
+	}
+
+	// 校验旧版本无 job.json 的孤儿目录已被合成并补齐 job.json
+	if jobLegacy == nil || jobLegacy.GetInfo().Status != protocol.JobStatusStopped {
+		t.Errorf("job-legacy-3 status unexpected: %+v", jobLegacy)
+	}
+	if _, err := os.Stat(filepath.Join(jobLegacyDir, "job.json")); err != nil {
+		t.Errorf("expected job.json to be synthesized for legacy job: %v", err)
+	}
+
+	// 6. 测试 handleListJobs 列表接口能正确返回全部 3 个历史任务
+	listReq := httptest.NewRequest(http.MethodGet, "/api/v1/jobs/ps", nil)
+	listRec := httptest.NewRecorder()
+	w.handleListJobs(listRec, listReq)
+	if listRec.Code != http.StatusOK {
+		t.Fatalf("handleListJobs failed: %d", listRec.Code)
+	}
+	var jobsList []protocol.JobInfo
+	_ = json.NewDecoder(listRec.Body).Decode(&jobsList)
+	if len(jobsList) != 3 {
+		t.Fatalf("expected 3 jobs in list endpoint, got %d", len(jobsList))
+	}
+
+	// 7. 测试 handleGetLogs 能读取历史日志
+	logsReq := httptest.NewRequest(http.MethodGet, "/api/v1/jobs/logs?job_id=job-crash-2", nil)
+	logsRec := httptest.NewRecorder()
+	w.handleGetLogs(logsRec, logsReq)
+	if logsRec.Code != http.StatusOK {
+		t.Fatalf("handleGetLogs failed: %d", logsRec.Code)
+	}
+	if !strings.Contains(logsRec.Body.String(), "running interrupted output") {
+		t.Errorf("expected log content in response, got: %s", logsRec.Body.String())
+	}
+}
+
+func TestWorker_CleanJobs_OrphanAndStopped(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "cw_worker_clean_orphan_test_*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	w, err := NewWorker(Config{
+		Name:    "clean-test-node",
+		DataDir: tempDir,
+		Token:   "clean-token",
+		Port:    19097,
+	})
+	if err != nil {
+		t.Fatalf("NewWorker failed: %v", err)
+	}
+
+	// 1. 派发一个正在运行的活跃任务
+	runBody, _ := json.Marshal(protocol.RunJobRequest{
+		Name:    "active-clean-test",
+		Command: "ping 127.0.0.1 -n 30",
+	})
+	runReq := httptest.NewRequest(http.MethodPost, "/api/v1/jobs/run", bytes.NewReader(runBody))
+	runRec := httptest.NewRecorder()
+	w.handleRunJob(runRec, runReq)
+	var activeJob protocol.JobInfo
+	_ = json.NewDecoder(runRec.Body).Decode(&activeJob)
+
+	defer func() {
+		killBody, _ := json.Marshal(protocol.KillJobRequest{JobID: activeJob.ID})
+		killReq := httptest.NewRequest(http.MethodPost, "/api/v1/jobs/kill", bytes.NewReader(killBody))
+		killRec := httptest.NewRecorder()
+		w.handleKillJob(killRec, killReq)
+	}()
+
+	// 2. 人工塞入一个历史 STOPPED 任务 (模拟重启恢复的非活跃任务)
+	stoppedDir := filepath.Join(tempDir, "jobs", "job-clean-stopped")
+	_ = os.MkdirAll(stoppedDir, 0755)
+	_ = os.WriteFile(filepath.Join(stoppedDir, "output.log"), []byte("stopped log data\n"), 0644)
+	stInfo := protocol.JobInfo{
+		ID:        "job-clean-stopped",
+		Name:      "stopped-task",
+		Status:    protocol.JobStatusStopped,
+		StartTime: time.Now().Add(-10 * time.Minute),
+		ExitCode:  -1,
+	}
+	_ = process.SaveJobMeta(stoppedDir, stInfo)
+	w.mu.Lock()
+	w.jobs["job-clean-stopped"] = process.NewHistoricJob(stInfo, stoppedDir)
+	w.mu.Unlock()
+
+	// 3. 在磁盘塞入一个完全未进内存的孤儿任务目录
+	orphanDir := filepath.Join(tempDir, "jobs", "job-clean-orphan")
+	_ = os.MkdirAll(orphanDir, 0755)
+	_ = os.WriteFile(filepath.Join(orphanDir, "output.log"), []byte("orphan file data\n"), 0644)
+
+	// 4. 执行全量 clean
+	cleanBody, _ := json.Marshal(protocol.CleanJobsRequest{All: true})
+	cleanReq := httptest.NewRequest(http.MethodPost, "/api/v1/jobs/clean", bytes.NewReader(cleanBody))
+	cleanRec := httptest.NewRecorder()
+	w.handleCleanJobs(cleanRec, cleanReq)
+	if cleanRec.Code != http.StatusOK {
+		t.Fatalf("handleCleanJobs failed: %d", cleanRec.Code)
+	}
+
+	var resp protocol.CleanJobsResponse
+	_ = json.NewDecoder(cleanRec.Body).Decode(&resp)
+
+	// 必须清理 2 个任务 (stopped 任务 + 孤儿任务)
+	if resp.CleanedCount != 2 {
+		t.Fatalf("expected 2 cleaned jobs, got %d", resp.CleanedCount)
+	}
+
+	// 验证活跃任务受到严格保护
+	w.mu.RLock()
+	_, activeExists := w.jobs[activeJob.ID]
+	w.mu.RUnlock()
+	if !activeExists {
+		t.Error("active running job should not be cleaned!")
+	}
+	if _, err := os.Stat(filepath.Join(tempDir, "jobs", activeJob.ID)); err != nil {
+		t.Error("active running job folder should still exist!")
+	}
+
+	// 验证历史任务与孤儿目录已在物理磁盘上被删除
+	if _, err := os.Stat(stoppedDir); !os.IsNotExist(err) {
+		t.Error("stopped job dir should be deleted from disk")
+	}
+	if _, err := os.Stat(orphanDir); !os.IsNotExist(err) {
+		t.Error("orphan job dir should be deleted from disk")
+	}
+}
+
+func TestWorker_StreamLogs_WebSocket_HistoricalAndFallback(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "cw_worker_ws_hist_*")
+	if err != nil {
+		t.Fatalf("create temp dir failed: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	w := &Worker{
+		cfg: Config{
+			Name:    "ws-hist-node",
+			DataDir: tempDir,
+		},
+		jobs: make(map[string]*process.ManagedJob),
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(w.handleStreamLogs))
+	defer server.Close()
+
+	// 1. 测试历史任务（在内存中，但 Broadcaster 为 nil，状态为 STOPPED）
+	jobDir1 := filepath.Join(tempDir, "jobs", "job-hist-1")
+	_ = os.MkdirAll(jobDir1, 0755)
+	_ = os.WriteFile(filepath.Join(jobDir1, "output.log"), []byte("historical log output line 1\nline 2\n"), 0644)
+	info1 := protocol.JobInfo{
+		ID:        "job-hist-1",
+		Name:      "hist-task",
+		Status:    protocol.JobStatusStopped,
+		StartTime: time.Now().Add(-10 * time.Minute),
+		ExitCode:  -1,
+	}
+	w.jobs["job-hist-1"] = process.NewHistoricJob(info1, jobDir1)
+
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel1()
+
+	wsURL1 := strings.Replace(server.URL, "http://", "ws://", 1) + "?job_id=job-hist-1"
+	conn1, _, err := websocket.Dial(ctx1, wsURL1, nil)
+	if err != nil {
+		t.Fatalf("dial historical job websocket failed: %v", err)
+	}
+	defer conn1.Close(websocket.StatusNormalClosure, "")
+
+	_, msg1, err := conn1.Read(ctx1)
+	if err != nil {
+		t.Fatalf("read from historical websocket failed: %v", err)
+	}
+	if !strings.Contains(string(msg1), "historical log output line 1") {
+		t.Fatalf("unexpected message: %s", string(msg1))
+	}
+
+	// 2. 测试不在内存中（!exists），但磁盘上存在 output.log 的历史孤儿任务
+	jobDir2 := filepath.Join(tempDir, "jobs", "job-orphan-2")
+	_ = os.MkdirAll(jobDir2, 0755)
+	_ = os.WriteFile(filepath.Join(jobDir2, "output.log"), []byte("orphan disk log content\n"), 0644)
+
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel2()
+
+	wsURL2 := strings.Replace(server.URL, "http://", "ws://", 1) + "?job_id=job-orphan-2"
+	conn2, _, err := websocket.Dial(ctx2, wsURL2, nil)
+	if err != nil {
+		t.Fatalf("dial orphan job websocket failed: %v", err)
+	}
+	defer conn2.Close(websocket.StatusNormalClosure, "")
+
+	_, msg2, err := conn2.Read(ctx2)
+	if err != nil {
+		t.Fatalf("read from orphan websocket failed: %v", err)
+	}
+	if !strings.Contains(string(msg2), "orphan disk log content") {
+		t.Fatalf("unexpected message: %s", string(msg2))
+	}
+}
+
+func TestWorker_HydrateJobs_CorruptedMetaFallback(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "cw_worker_hydrate_corrupt_*")
+	if err != nil {
+		t.Fatalf("create temp dir failed: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// 在磁盘中构造一个 job.json 损坏（非法 JSON）但包含有效 output.log 的历史任务目录
+	corruptDir := filepath.Join(tempDir, "jobs", "job-corrupt-001")
+	_ = os.MkdirAll(corruptDir, 0755)
+	_ = os.WriteFile(filepath.Join(corruptDir, "job.json"), []byte("{invalid json corrupt content..."), 0644)
+	_ = os.WriteFile(filepath.Join(corruptDir, "output.log"), []byte("log of corrupted job\n"), 0644)
+
+	w, err := NewWorker(Config{
+		Name:    "corrupt-test-node",
+		DataDir: tempDir,
+		Port:    19098,
+	})
+	if err != nil {
+		t.Fatalf("NewWorker failed: %v", err)
+	}
+
+	w.mu.RLock()
+	job, exists := w.jobs["job-corrupt-001"]
+	w.mu.RUnlock()
+
+	if !exists {
+		t.Fatal("corrupted job was not hydrated using fallback!")
+	}
+	info := job.GetInfo()
+	if info.Status != protocol.JobStatusStopped || info.ExitCode != -1 {
+		t.Fatalf("expected STOPPED with exit code -1, got status=%s code=%d", info.Status, info.ExitCode)
+	}
+
+	// 验证 job.json 已被自愈重写为合法的 JSON
+	repairedMeta, err := process.LoadJobMeta(corruptDir)
+	if err != nil {
+		t.Fatalf("failed to load repaired job.json: %v", err)
+	}
+	if repairedMeta.Status != protocol.JobStatusStopped || repairedMeta.ExitCode != -1 {
+		t.Fatalf("unexpected repaired metadata: %+v", repairedMeta)
+	}
+}
+
+
 
 

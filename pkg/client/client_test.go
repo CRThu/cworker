@@ -1023,26 +1023,83 @@ func TestClient_GetLogs_ErrorPropagation(t *testing.T) {
 	}
 }
 
-func TestClient_SSOT_LocalhostFallback(t *testing.T) {
+func TestClient_SSOT_EmptyLedgerReturnsEmpty(t *testing.T) {
 	tempDir := t.TempDir()
 	cli := NewClient()
 	cli.dataDir = tempDir
 
-	// 当账本为空时，getEffectiveKnownNodes 自动注入本机配置
-	nodes, err := cli.getEffectiveKnownNodes()
+	// 当账本为空时，LoadKnownNodes 严格遵从 SSOT 返回空映射，不伪造隐式节点
+	nodes, err := cli.LoadKnownNodes()
 	if err != nil {
-		t.Fatalf("getEffectiveKnownNodes failed: %v", err)
+		t.Fatalf("LoadKnownNodes failed: %v", err)
 	}
-	if len(nodes) != 1 {
-		t.Fatalf("expected exactly 1 node (localhost), got %d", len(nodes))
+	if len(nodes) != 0 {
+		t.Fatalf("expected exactly 0 nodes (empty ledger), got %d", len(nodes))
 	}
-	hostname, _ := os.Hostname()
-	kn, ok := nodes[strings.ToLower(hostname)]
-	if !ok {
-		t.Fatalf("expected entry for hostname %q, got: %+v", hostname, nodes)
+}
+
+func TestClient_GetRoots_Local(t *testing.T) {
+	cli := NewClient()
+	roots, err := cli.GetRoots("")
+	if err != nil {
+		t.Fatalf("GetRoots failed: %v", err)
 	}
-	if kn.Target != "127.0.0.1:19000" {
-		t.Fatalf("expected target 127.0.0.1:19000, got: %s", kn.Target)
+	if len(roots) == 0 {
+		t.Fatal("expected at least 1 root drive for local, got 0")
+	}
+}
+
+func TestClient_GetRoots_Remote(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/fs/roots" {
+			rw.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(rw).Encode([]string{"C:/", "D:/"})
+			return
+		}
+		http.NotFound(rw, r)
+	}))
+	defer server.Close()
+
+	cli := NewClient()
+	cli.dataDir = t.TempDir()
+	u, _ := url.Parse(server.URL)
+	_ = cli.SaveKnownNode(protocol.KnownNode{
+		Name:   "mock-remote",
+		Target: u.Host,
+	})
+
+	roots, err := cli.GetRoots("mock-remote")
+	if err != nil {
+		t.Fatalf("GetRoots remote failed: %v", err)
+	}
+	if len(roots) != 2 || roots[0] != "C:/" || roots[1] != "D:/" {
+		t.Fatalf("unexpected remote roots: %v", roots)
+	}
+}
+
+func TestClient_GetRoots_Error(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		http.Error(rw, "internal server error", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	cli := NewClient()
+	cli.dataDir = t.TempDir()
+	targetHost := strings.TrimPrefix(server.URL, "http://")
+	_ = cli.SaveKnownNode(protocol.KnownNode{
+		Name:   "err-roots-node",
+		Target: targetHost,
+	})
+
+	_, err := cli.GetRoots("err-roots-node")
+	if err == nil {
+		t.Fatal("expected error on 500 response, got nil")
+	}
+
+	// 目标节点解析失败或无法连通
+	_, err = cli.GetRoots("invalid-target:99999")
+	if err == nil {
+		t.Fatal("expected error on bad host port, got nil")
 	}
 }
 
@@ -1229,15 +1286,6 @@ func TestClient_LoadKnownNodes_CorruptedJson(t *testing.T) {
 	}
 	if nodes != nil {
 		t.Fatalf("expected nil nodes on corruption, got: %v", nodes)
-	}
-
-	// 验证 getEffectiveKnownNodes 在账本损坏时向上透传错误
-	effNodes, effErr := cli.getEffectiveKnownNodes()
-	if effErr == nil {
-		t.Fatal("expected error on getEffectiveKnownNodes with corrupted ledger")
-	}
-	if effNodes != nil {
-		t.Fatalf("expected nil effNodes, got: %v", effNodes)
 	}
 }
 

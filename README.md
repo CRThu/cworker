@@ -122,7 +122,7 @@ cw node add desktop-4090 --token "目标机_Token"
 
 ```powershell
 # 1. 探测已知节点健康状态与实时负载
-cw nodes
+cw node
 
 # 2. 派发后台任务 (支持指定工作目录 --dir 与任务名 --name)
 cw run -n desktop-4090 --dir "D:\projects\ml" "python train.py --epochs 100"
@@ -145,7 +145,7 @@ cw kill job-58a90e40
 | 命令 | 说明 |
 | :--- | :--- |
 | `cw show [--refresh]` | 输出本机名片（计算机名、IP 列表、服务状态及配对命令）；`--refresh` 可轮换 Token |
-| `cw nodes` | 并发探测所有已知节点在线状态及整机负载 |
+| `cw node` / `cw node ls` | 并发探测所有已知节点在线状态及整机负载 |
 | `cw node add <name> [target] [--token xxx]` | 登记新节点至本地账本（省略 `target` 时自动推导为 `<name>:19000`） |
 | `cw node rm <name>` | 从已知节点账本中注销节点 |
 | `cw worker [--port port]` | 前台启动节点服务（适用于临时调试排查） |

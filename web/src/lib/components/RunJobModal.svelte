@@ -8,6 +8,8 @@
 
   export let open: boolean = false;
   export let nodes: NodeInfo[] = [];
+  export let onSubmit: ((detail: any) => void) | undefined = undefined;
+  export let onClose: (() => void) | undefined = undefined;
 
   const dispatch = createEventDispatcher();
 
@@ -29,17 +31,20 @@
   }
 
   function handleClose() {
+    if (onClose) onClose();
     dispatch('close');
   }
 
   function handleSubmit() {
     if (!jobCmd.trim()) return;
-    dispatch('submit', {
+    const payload = {
       node: targetNode,
       name: jobName.trim() || generateJobName(),
       dir: jobDir.trim(),
       command: jobCmd.trim(),
-    });
+    };
+    if (onSubmit) onSubmit(payload);
+    dispatch('submit', payload);
     jobCmd = '';
     jobName = '';
     jobDir = '';

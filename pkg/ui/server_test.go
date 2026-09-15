@@ -1296,3 +1296,276 @@ func TestServer_HandleFsRootsMkdirRm(t *testing.T) {
 	}
 }
 
+func TestServer_HandleFsRoots(t *testing.T) {
+	srv, _, cleanup := setupTestEnv(t)
+	defer cleanup()
+
+	handler := srv.Handler()
+
+	// 1. 本地盘符测试
+	reqLocal := httptest.NewRequest(http.MethodGet, "/api/ui/fs/roots", nil)
+	wLocal := httptest.NewRecorder()
+	handler.ServeHTTP(wLocal, reqLocal)
+	if wLocal.Code != http.StatusOK {
+		t.Fatalf("expected 200 for local roots, got %d", wLocal.Code)
+	}
+	var localRoots []string
+	if err := json.NewDecoder(wLocal.Body).Decode(&localRoots); err != nil || len(localRoots) == 0 {
+		t.Fatalf("expected non-empty roots, got %v (err=%v)", localRoots, err)
+	}
+
+	// 2. 模拟远端 Worker 盘符测试
+	remoteWorker := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/fs/roots" {
+			rw.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(rw).Encode([]string{"E:/", "F:/"})
+			return
+		}
+		http.NotFound(rw, r)
+	}))
+	defer remoteWorker.Close()
+
+	targetHost := strings.TrimPrefix(remoteWorker.URL, "http://")
+	_ = srv.cli.SaveKnownNode(protocol.KnownNode{
+		Name:   "worker-roots-test",
+		Target: targetHost,
+	})
+
+	reqRemote := httptest.NewRequest(http.MethodGet, "/api/ui/fs/roots?node=worker-roots-test", nil)
+	wRemote := httptest.NewRecorder()
+	handler.ServeHTTP(wRemote, reqRemote)
+	if wRemote.Code != http.StatusOK {
+		t.Fatalf("expected 200 for remote roots, got %d, body: %s", wRemote.Code, wRemote.Body.String())
+	}
+	var remoteRoots []string
+	if err := json.NewDecoder(wRemote.Body).Decode(&remoteRoots); err != nil {
+		t.Fatalf("decode remote roots failed: %v", err)
+	}
+	if len(remoteRoots) != 2 || remoteRoots[0] != "E:/" || remoteRoots[1] != "F:/" {
+		t.Fatalf("expected [E:/, F:/], got %v", remoteRoots)
+	}
+
+	// 3. 非法 Method
+	reqPost := httptest.NewRequest(http.MethodPost, "/api/ui/fs/roots", nil)
+	wPost := httptest.NewRecorder()
+	handler.ServeHTTP(wPost, reqPost)
+	if wPost.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 for POST /api/ui/fs/roots, got %d", wPost.Code)
+	}
+}
+
+func TestServer_HandleOverview_WithCPUCores(t *testing.T) {
+	srv, _, cleanup := setupTestEnv(t)
+	defer cleanup()
+
+	handler := srv.Handler()
+
+	workerServer := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			rw.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(rw).Encode(protocol.NodeInfo{
+				Name:       "worker-core-test",
+				Status:     protocol.NodeStatusOnline,
+				ActiveJobs: 1,
+				Metrics: protocol.NodeMetrics{
+					CPUPercent: 12.5,
+					CPUCores:   16,
+					MemFreeMB:  8192,
+					MemTotalMB: 16384,
+				},
+			})
+			return
+		}
+		http.NotFound(rw, r)
+	}))
+	defer workerServer.Close()
+
+	targetHost := strings.TrimPrefix(workerServer.URL, "http://")
+	_ = srv.cli.SaveKnownNode(protocol.KnownNode{
+		Name:   "worker-core-test",
+		Target: targetHost,
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/ui/overview", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for /api/ui/overview, got %d", w.Code)
+	}
+
+	var overview OverviewData
+	if err := json.NewDecoder(w.Body).Decode(&overview); err != nil {
+		t.Fatalf("decode overview failed: %v", err)
+	}
+
+	if overview.OnlineCount != 1 {
+		t.Fatalf("expected 1 online node, got %d", overview.OnlineCount)
+	}
+	if len(overview.Nodes) != 1 {
+		t.Fatalf("expected 1 node, got %d", len(overview.Nodes))
+	}
+	if overview.Nodes[0].Metrics.CPUCores != 16 {
+		t.Fatalf("expected CPUCores 16, got %d", overview.Nodes[0].Metrics.CPUCores)
+	}
+	if overview.Nodes[0].Metrics.CPUPercent != 12.5 {
+		t.Fatalf("expected CPUPercent 12.5, got %f", overview.Nodes[0].Metrics.CPUPercent)
+	}
+}
+
+func TestServer_HandleJobs_HistoricalAndClean(t *testing.T) {
+	srv, _, cleanup := setupTestEnv(t)
+	defer cleanup()
+
+	handler := srv.Handler()
+
+	mockJobs := []protocol.JobInfo{
+		{
+			ID:        "job-ui-1",
+			Name:      "task-live",
+			Node:      "worker-ui",
+			Status:    protocol.JobStatusRunning,
+			StartTime: time.Now(),
+		},
+		{
+			ID:        "job-ui-2",
+			Name:      "task-stopped-hist",
+			Node:      "worker-ui",
+			Status:    protocol.JobStatusStopped,
+			ExitCode:  -1,
+			StartTime: time.Now().Add(-5 * time.Minute),
+		},
+	}
+
+	workerServer := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		rw.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v1/jobs/ps":
+			_ = json.NewEncoder(rw).Encode(mockJobs)
+		case "/api/v1/jobs/clean":
+			_ = json.NewEncoder(rw).Encode(protocol.CleanJobsResponse{
+				CleanedCount: 1,
+				FreedBytes:   2048,
+			})
+		default:
+			http.NotFound(rw, r)
+		}
+	}))
+	defer workerServer.Close()
+
+	targetHost := strings.TrimPrefix(workerServer.URL, "http://")
+	_ = srv.cli.SaveKnownNode(protocol.KnownNode{
+		Name:   "worker-ui",
+		Target: targetHost,
+	})
+
+	// 1. 查询全部任务
+	reqAll := httptest.NewRequest(http.MethodGet, "/api/ui/jobs", nil)
+	wAll := httptest.NewRecorder()
+	handler.ServeHTTP(wAll, reqAll)
+	if wAll.Code != http.StatusOK {
+		t.Fatalf("expected 200 for /api/ui/jobs, got %d", wAll.Code)
+	}
+	var jobsAll []protocol.JobInfo
+	_ = json.NewDecoder(wAll.Body).Decode(&jobsAll)
+	if len(jobsAll) != 2 {
+		t.Fatalf("expected 2 jobs, got %d", len(jobsAll))
+	}
+
+	// 2. 按 STOPPED 状态过滤
+	reqStopped := httptest.NewRequest(http.MethodGet, "/api/ui/jobs?status=STOPPED", nil)
+	wStopped := httptest.NewRecorder()
+	handler.ServeHTTP(wStopped, reqStopped)
+	if wStopped.Code != http.StatusOK {
+		t.Fatalf("expected 200 for filtered jobs, got %d", wStopped.Code)
+	}
+	var jobsStopped []protocol.JobInfo
+	_ = json.NewDecoder(wStopped.Body).Decode(&jobsStopped)
+	if len(jobsStopped) != 1 || jobsStopped[0].ID != "job-ui-2" {
+		t.Fatalf("expected 1 stopped job, got: %+v", jobsStopped)
+	}
+
+	// 3. 执行任务清理 POST /api/ui/jobs/clean
+	cleanBody := `{"all": true}`
+	reqClean := httptest.NewRequest(http.MethodPost, "/api/ui/jobs/clean", strings.NewReader(cleanBody))
+	wClean := httptest.NewRecorder()
+	handler.ServeHTTP(wClean, reqClean)
+	if wClean.Code != http.StatusOK {
+		t.Fatalf("expected 200 for /api/ui/jobs/clean, got %d", wClean.Code)
+	}
+
+	// 4. 测试错误方法拦截 (GET /api/ui/jobs/clean -> 405)
+	reqCleanGet := httptest.NewRequest(http.MethodGet, "/api/ui/jobs/clean", nil)
+	wCleanGet := httptest.NewRecorder()
+	handler.ServeHTTP(wCleanGet, reqCleanGet)
+	if wCleanGet.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 for GET /api/ui/jobs/clean, got %d", wCleanGet.Code)
+	}
+}
+
+func TestServer_HandleStreamLogs_FallbackToDisk(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv("USERPROFILE", tempDir)
+
+	// 启动一个 Mock Worker，其 /api/v1/jobs/stream 建立后不写数据立即关闭（written == 0），
+	// 但其 /api/v1/jobs/logs 返回历史磁盘日志
+	mockWorker := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/v1/jobs/stream") {
+			conn, err := websocket.Accept(rw, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+			if err == nil {
+				_ = conn.Close(websocket.StatusNormalClosure, "finished")
+			}
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/v1/jobs/logs") {
+			rw.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			_, _ = rw.Write([]byte("historical disk log from mock worker\n"))
+			return
+		}
+		http.NotFound(rw, r)
+	}))
+	defer mockWorker.Close()
+
+	cli := client.NewClient()
+	_ = cli.SaveKnownNode(protocol.KnownNode{
+		Name:   "node-mock",
+		Target: strings.TrimPrefix(mockWorker.URL, "http://"),
+	})
+
+	srv := NewServer(Config{
+		BindAddr: "127.0.0.1",
+		Port:     -1,
+		Client:   cli,
+	})
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = srv.Start(ctx) }()
+
+	for i := 0; i < 50; i++ {
+		time.Sleep(50 * time.Millisecond)
+		if srv.Addr() != "" {
+			break
+		}
+	}
+
+	wsURL := strings.Replace(srv.URL(), "http://", "ws://", 1) + "/api/ui/jobs/stream?node=node-mock&job_id=job-fallback-1"
+	wsCtx, wsCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer wsCancel()
+
+	conn, _, err := websocket.Dial(wsCtx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("websocket dial failed: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+
+	_, msg, err := conn.Read(wsCtx)
+	if err != nil {
+		t.Fatalf("websocket read fallback failed: %v", err)
+	}
+	if !strings.Contains(string(msg), "historical disk log from mock worker") {
+		t.Fatalf("expected fallback log, got: %s", string(msg))
+	}
+}
+
+

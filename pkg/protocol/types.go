@@ -45,6 +45,7 @@ const (
 // NodeMetrics 封装节点的系统级实时硬件负载
 type NodeMetrics struct {
 	CPUPercent float64 `json:"cpu_percent"`
+	CPUCores   int     `json:"cpu_cores"`
 	MemFreeMB  uint64  `json:"mem_free_mb"`
 	MemTotalMB uint64  `json:"mem_total_mb"`
 }

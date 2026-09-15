@@ -53,9 +53,9 @@
 ## 二、标准 Agent 任务调度动线（Best Practices）
 
 ### 1. 集群就绪探测
-在派发重要任务前，Agent 应先执行 `cw nodes` 确认目标机器是否在线以及硬件负载（CPU% 与可用内存）：
+在派发重要任务前，Agent 应先执行 `cw node` 确认目标机器是否在线以及硬件负载（CPU 算力与内存已用/总量）：
 ```bash
-cw nodes
+cw node
 ```
 
 ### 2. 任务派发与凭证提取
@@ -135,3 +135,25 @@ cw ui --port 19001 --no-open
   * `/d/projects/foo`
 * **冒号隔离机制**：
   Agent 在构造 `node:path` 格式时，第一段冒号前必须是节点名（如 `DESKTOP-PC:D:/path`），系统能自动防范 Windows 盘符冒号误切。
+
+---
+
+## 四、工程开发与工具链规范（开发者与 Agent 红线）
+
+1. **前端工具链统一使用 Bun（严禁 npm / yarn / pnpm）**：
+   * 前端位于 `web/` 目录，依赖管理单一事实来源为 `web/bun.lock`；
+   * **依赖安装**：在 `web/` 目录下执行 `bun install`；
+   * **产物编译**：执行 `bun run build`（产物输出至 `pkg/ui/dist/`，供 Go embed 内嵌打包）；
+   * **单元测试**：执行 `bun run test`（调用 Vitest + JSDOM 进行组件与逻辑全量测试）；
+   * **类型与模板校验**：执行 `bun run check`（执行 svelte-check 与 tsc）；
+   * **红线**：严禁在前端目录执行 `npm install`、`npm test` 或生成 `package-lock.json`！
+
+2. **后端工具链规范**：
+   * Go 1.21+ 官方工具链；
+   * **全量测试**：`go test ./...`；
+   * **独立编译**：`go build -ldflags="-s -w" -o .\bin\cw.exe .`。
+
+3. **全链路统一构建入口**：
+   * 根目录下维护的 `.\build.bat`：自动按序触发 Bun 前端编译、Go 产物链接与系统打包；
+   * 测试运行：`.\build.bat test`。
+

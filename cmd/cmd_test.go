@@ -105,9 +105,12 @@ func TestCmd_Nodes(t *testing.T) {
 
 	t.Setenv("USERPROFILE", tempDir)
 
-	// 空账本时执行 cw nodes
-	if err := nodesCmd.RunE(nodesCmd, []string{}); err != nil {
-		t.Fatalf("nodesCmd failed: %v", err)
+	// 空账本时执行 cw node 及 cw node ls
+	if err := nodeCmd.RunE(nodeCmd, []string{}); err != nil {
+		t.Fatalf("nodeCmd failed: %v", err)
+	}
+	if err := nodeLsCmd.RunE(nodeLsCmd, []string{}); err != nil {
+		t.Fatalf("nodeLsCmd failed: %v", err)
 	}
 }
 
@@ -575,15 +578,25 @@ func TestCmd_Commands_WithMockServer(t *testing.T) {
 		t.Fatalf("unexpected logs output: %s", logsOut)
 	}
 
-	// 7. 测试 nodesCmd.RunE (活跃集群排版)
+	// 7. 测试 nodeCmd.RunE 及 nodeLsCmd.RunE (活跃集群排版)
 	nodesOut, err := captureStdout(func() error {
-		return nodesCmd.RunE(nodesCmd, []string{})
+		return nodeCmd.RunE(nodeCmd, []string{})
 	})
 	if err != nil {
-		t.Fatalf("nodesCmd.RunE failed: %v", err)
+		t.Fatalf("nodeCmd.RunE failed: %v", err)
 	}
 	if !strings.Contains(nodesOut, "mock-node") || !strings.Contains(nodesOut, "ONLINE") || !strings.Contains(nodesOut, "12.8%") {
 		t.Fatalf("unexpected nodes output: %s", nodesOut)
+	}
+
+	nodeLsOut, err := captureStdout(func() error {
+		return nodeLsCmd.RunE(nodeLsCmd, []string{})
+	})
+	if err != nil {
+		t.Fatalf("nodeLsCmd.RunE failed: %v", err)
+	}
+	if !strings.Contains(nodeLsOut, "mock-node") || !strings.Contains(nodeLsOut, "ONLINE") || !strings.Contains(nodeLsOut, "12.8%") {
+		t.Fatalf("unexpected node ls output: %s", nodeLsOut)
 	}
 
 	// 8. 测试 psCmd.RunE (多任务表格排版、耗时计算与超长截断)
@@ -784,6 +797,12 @@ func TestCmd_Clean_ExecutionFlow(t *testing.T) {
 	cleanDays = 0
 	cleanNode = "clean-node"
 	cleanYes = true
+	defer func() {
+		cleanNode = ""
+		cleanAll = false
+		cleanDays = 0
+		cleanYes = false
+	}()
 
 	out, err := captureStdout(func() error {
 		return cleanCmd.RunE(cleanCmd, []string{})
@@ -863,6 +882,11 @@ func TestCmd_Ps_ExecutionFlow(t *testing.T) {
 	psNode = "ps-node"
 	psAll = false
 	psLimit = 20
+	defer func() {
+		psNode = ""
+		psAll = false
+		psLimit = 20
+	}()
 
 	out, err := captureStdout(func() error {
 		return psCmd.RunE(psCmd, []string{})
@@ -973,6 +997,362 @@ func TestCmd_ExitErrorAndFormatBytes(t *testing.T) {
 		}
 	}
 }
+
+func TestCmd_NodeListFormatting(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "cw_cmd_nodelist_*")
+	if err != nil {
+		t.Fatalf("create temp dir failed: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+	t.Setenv("USERPROFILE", tempDir)
+
+	// Mock 包含 4 类不同特性的节点服务
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		rw.Header().Set("Content-Type", "application/json")
+		token := r.Header.Get("Authorization")
+
+		switch token {
+		case "Bearer tok-modern":
+			_ = json.NewEncoder(rw).Encode(protocol.NodeInfo{
+				Name:       "node-modern",
+				Address:    "127.0.0.1:19001",
+				Status:     protocol.NodeStatusOnline,
+				ActiveJobs: 1,
+				Metrics: protocol.NodeMetrics{
+					CPUPercent: 11.42857,
+					CPUCores:   28,
+					MemFreeMB:  49152,
+					MemTotalMB: 65536,
+				},
+			})
+		case "Bearer tok-legacy":
+			// 旧版本 Worker：未上报 CPUCores (默认为 0)
+			_ = json.NewEncoder(rw).Encode(protocol.NodeInfo{
+				Name:       "node-legacy",
+				Address:    "127.0.0.1:19002",
+				Status:     protocol.NodeStatusOnline,
+				ActiveJobs: 0,
+				Metrics: protocol.NodeMetrics{
+					CPUPercent: 8.5,
+					CPUCores:   0,
+					MemFreeMB:  10240,
+					MemTotalMB: 16384,
+				},
+			})
+		case "Bearer tok-small":
+			// 小内存节点 (< 1024MB)，单位应显示为 M
+			_ = json.NewEncoder(rw).Encode(protocol.NodeInfo{
+				Name:       "node-small",
+				Address:    "127.0.0.1:19003",
+				Status:     protocol.NodeStatusOnline,
+				ActiveJobs: 0,
+				Metrics: protocol.NodeMetrics{
+					CPUPercent: 50.0,
+					CPUCores:   2,
+					MemFreeMB:  128,
+					MemTotalMB: 512,
+				},
+			})
+		case "Bearer tok-overflow":
+			// 异常内存保护：Free > Total，确保非负归零且不 panic
+			_ = json.NewEncoder(rw).Encode(protocol.NodeInfo{
+				Name:       "node-overflow",
+				Address:    "127.0.0.1:19004",
+				Status:     protocol.NodeStatusOnline,
+				ActiveJobs: 0,
+				Metrics: protocol.NodeMetrics{
+					CPUPercent: 0.0,
+					CPUCores:   4,
+					MemFreeMB:  4096,
+					MemTotalMB: 2048,
+				},
+			})
+		default:
+			rw.WriteHeader(http.StatusUnauthorized)
+		}
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	cli := client.NewClient()
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "node-modern", Target: u.Host, Token: "tok-modern"})
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "node-legacy", Target: u.Host, Token: "tok-legacy"})
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "node-small", Target: u.Host, Token: "tok-small"})
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "node-overflow", Target: u.Host, Token: "tok-overflow"})
+
+	origStdout := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+
+	err = runNodeList()
+	w.Close()
+	os.Stdout = origStdout
+	if err != nil {
+		t.Fatalf("runNodeList failed: %v", err)
+	}
+
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, r)
+	out := buf.String()
+
+	// 1. 表头验证：去除多余修饰
+	if !strings.Contains(out, "CPU") || !strings.Contains(out, "MEM") {
+		t.Fatalf("expected clean CPU and MEM headers, got:\n%s", out)
+	}
+	if strings.Contains(out, "FREE/TOTAL") {
+		t.Fatalf("should not contain FREE/TOTAL, got:\n%s", out)
+	}
+	if strings.Contains(out, "CPU(%)") {
+		t.Fatalf("should not contain CPU(%%), got:\n%s", out)
+	}
+
+	// 2. node-modern: 320% / 2800% 算力与 16.0G / 64.0G 内存
+	if !strings.Contains(out, "320% / 2800%") {
+		t.Fatalf("expected '320%% / 2800%%' for node-modern, got:\n%s", out)
+	}
+	if !strings.Contains(out, "16.0G / 64.0G") {
+		t.Fatalf("expected '16.0G / 64.0G' for node-modern, got:\n%s", out)
+	}
+
+	// 3. node-legacy: 核心数为 0 安全降级为 8.5%，内存 6.0G / 16.0G
+	if !strings.Contains(out, "8.5%") {
+		t.Fatalf("expected '8.5%%' for legacy node, got:\n%s", out)
+	}
+	if !strings.Contains(out, "6.0G / 16.0G") {
+		t.Fatalf("expected '6.0G / 16.0G' for legacy node, got:\n%s", out)
+	}
+
+	// 4. node-small: 100% / 200% 算力与 384M / 512M (<1024M 采用 M 单位)
+	if !strings.Contains(out, "100% / 200%") {
+		t.Fatalf("expected '100%% / 200%%' for small node, got:\n%s", out)
+	}
+	if !strings.Contains(out, "384M / 512M") {
+		t.Fatalf("expected '384M / 512M' for small node, got:\n%s", out)
+	}
+
+	// 5. node-overflow: 0% / 400% 算力与 0.0G / 2.0G 非负安全防御
+	if !strings.Contains(out, "0% / 400%") {
+		t.Fatalf("expected '0%% / 400%%' for overflow node, got:\n%s", out)
+	}
+	if !strings.Contains(out, "0.0G / 2.0G") {
+		t.Fatalf("expected '0.0G / 2.0G' for overflow node, got:\n%s", out)
+	}
+}
+
+func TestCmd_Ps_WithJobsAndSorting(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "cw_cmd_ps_*")
+	if err != nil {
+		t.Fatalf("create temp dir failed: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+	t.Setenv("USERPROFILE", tempDir)
+
+	mockJobs := []protocol.JobInfo{
+		{
+			ID:        "job-live-1",
+			Node:      "worker-ps",
+			Name:      "task-live",
+			Status:    protocol.JobStatusRunning,
+			Command:   "ping 127.0.0.1 -n 10",
+			StartTime: time.Now().Add(-10 * time.Second),
+			Metrics: protocol.JobMetrics{
+				CPUPercent: 15.5,
+				MemoryMB:   128,
+			},
+		},
+		{
+			ID:        "job-stopped-2",
+			Node:      "worker-ps",
+			Name:      "task-stopped",
+			Status:    protocol.JobStatusStopped,
+			Command:   "very_long_command_that_exceeds_thirty_five_runes_limit_for_truncation_check",
+			StartTime: time.Now().Add(-1 * time.Hour),
+			ExitCode:  -1,
+		},
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/jobs/ps" {
+			rw.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(rw).Encode(mockJobs)
+			return
+		}
+		http.NotFound(rw, r)
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	cli := client.NewClient()
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "worker-ps", Target: u.Host, Token: "tok-ps"})
+
+	// 1. 测试常规 ps 输出
+	if err := psCmd.RunE(psCmd, []string{}); err != nil {
+		t.Fatalf("psCmd failed: %v", err)
+	}
+
+	// 2. 测试指定节点 --node
+	psNode = "worker-ps"
+	defer func() { psNode = "" }()
+	if err := psCmd.RunE(psCmd, []string{}); err != nil {
+		t.Fatalf("psCmd with --node failed: %v", err)
+	}
+
+	// 3. 测试 sortJobsForDisplay
+	unsorted := []protocol.JobInfo{
+		{ID: "j1", Status: protocol.JobStatusCompleted, StartTime: time.Now().Add(-5 * time.Minute)},
+		{ID: "j2", Status: protocol.JobStatusRunning, StartTime: time.Now().Add(-10 * time.Minute)},
+		{ID: "j3", Status: protocol.JobStatusRunning, StartTime: time.Now().Add(-1 * time.Minute)},
+	}
+	sortJobsForDisplay(unsorted)
+	if unsorted[0].ID != "j3" || unsorted[1].ID != "j2" || unsorted[2].ID != "j1" {
+		t.Fatalf("sortJobsForDisplay order incorrect: %+v", unsorted)
+	}
+}
+
+func TestCmd_Logs(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "cw_cmd_logs_*")
+	if err != nil {
+		t.Fatalf("create temp dir failed: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+	t.Setenv("USERPROFILE", tempDir)
+
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/jobs/logs" {
+			rw.Header().Set("Content-Type", "text/plain")
+			_, _ = rw.Write([]byte("simulated job output line 1\nsimulated job output line 2\n"))
+			return
+		}
+		http.NotFound(rw, r)
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	cli := client.NewClient()
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "worker-logs", Target: u.Host, Token: "tok-logs"})
+
+	if err := logsCmd.RunE(logsCmd, []string{"job-logs-123"}); err != nil {
+		t.Fatalf("logsCmd failed: %v", err)
+	}
+}
+
+func TestCmd_Kill(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "cw_cmd_kill_*")
+	if err != nil {
+		t.Fatalf("create temp dir failed: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+	t.Setenv("USERPROFILE", tempDir)
+
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/jobs/kill" {
+			rw.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(rw).Encode(protocol.JobInfo{
+				ID:       "job-kill-123",
+				Status:   protocol.JobStatusStopped,
+				ExitCode: 1,
+			})
+			return
+		}
+		http.NotFound(rw, r)
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	cli := client.NewClient()
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "worker-kill", Target: u.Host, Token: "tok-kill"})
+
+	if err := killCmd.RunE(killCmd, []string{"job-kill-123"}); err != nil {
+		t.Fatalf("killCmd failed: %v", err)
+	}
+}
+
+func TestCmd_Clean(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "cw_cmd_clean_*")
+	if err != nil {
+		t.Fatalf("create temp dir failed: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+	t.Setenv("USERPROFILE", tempDir)
+
+	// 1. 无参数应拦截校验报错
+	if err := cleanCmd.RunE(cleanCmd, []string{}); err == nil {
+		t.Fatal("expected error when running cleanCmd without --all or --days, got nil")
+	}
+
+	// 2. 带 mock worker 执行全量 clean
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/jobs/clean" {
+			rw.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(rw).Encode(protocol.CleanJobsResponse{
+				CleanedCount: 3,
+				FreedBytes:   4096,
+			})
+			return
+		}
+		http.NotFound(rw, r)
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	cli := client.NewClient()
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "worker-clean", Target: u.Host, Token: "tok-clean"})
+
+	cleanAll = true
+	cleanYes = true
+	defer func() {
+		cleanAll = false
+		cleanYes = false
+	}()
+
+	if err := cleanCmd.RunE(cleanCmd, []string{}); err != nil {
+		t.Fatalf("cleanCmd failed: %v", err)
+	}
+}
+
+func TestCmd_Run(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "cw_cmd_run_*")
+	if err != nil {
+		t.Fatalf("create temp dir failed: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+	t.Setenv("USERPROFILE", tempDir)
+
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/jobs/run" {
+			rw.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(rw).Encode(protocol.JobInfo{
+				ID:     "job-run-123",
+				Node:   "worker-run",
+				Name:   "test-run",
+				PID:    9998,
+				Status: protocol.JobStatusRunning,
+			})
+			return
+		}
+		http.NotFound(rw, r)
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	cli := client.NewClient()
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "worker-run", Target: u.Host, Token: "tok-run"})
+
+	runNodeName = "worker-run"
+	runJobName = "test-run"
+	defer func() {
+		runNodeName = ""
+		runJobName = ""
+		runDir = ""
+		runToken = ""
+	}()
+
+	if err := runCmd.RunE(runCmd, []string{"python", "train.py"}); err != nil {
+		t.Fatalf("runCmd failed: %v", err)
+	}
+}
+
+
 
 
 

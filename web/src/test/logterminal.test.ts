@@ -1,5 +1,5 @@
 // web/src/test/logterminal.test.ts - 日志流式抽屉与任务视图交互集成测试
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { render, fireEvent } from '@testing-library/svelte';
 import LogTerminal from '../lib/components/LogTerminal.svelte';
 import JobsView from '../lib/components/JobsView.svelte';
@@ -32,7 +32,7 @@ describe('LogTerminal real-time log streaming and retention', () => {
 
   beforeEach(() => {
     MockWebSocket.instances = [];
-    (global as any).WebSocket = MockWebSocket;
+    (globalThis as any).WebSocket = MockWebSocket;
   });
 
   it('should connect to websocket stream and display incoming text with ANSI colors', async () => {
@@ -70,7 +70,7 @@ describe('LogTerminal real-time log streaming and retention', () => {
       ok: true,
       text: () => Promise.resolve('Fallback historical log content from disk\n'),
     });
-    (global as any).fetch = mockFetch;
+    (globalThis as any).fetch = mockFetch;
 
     const { container } = render(LogTerminal, {
       props: {
@@ -190,21 +190,33 @@ describe('JobsView filtering, status pills and action dispatches', () => {
       start_time: new Date(Date.now() - 90000).toISOString(),
       end_time: new Date(Date.now() - 85000).toISOString(),
     },
+    {
+      id: 'job-104',
+      name: 'delta-reboot-stopped',
+      node: 'node-C',
+      command: 'ping 127.0.0.1 -n 50',
+      status: 'STOPPED',
+      exit_code: -1,
+      pid: 1004,
+      start_time: new Date(Date.now() - 120000).toISOString(),
+      end_time: new Date(Date.now() - 110000).toISOString(),
+    },
   ];
 
   const mockNodes: NodeInfo[] = [
     { name: 'node-A', address: '10.0.0.1:19000', status: 'ONLINE', active_jobs: 1 },
     { name: 'node-B', address: '10.0.0.2:19000', status: 'ONLINE', active_jobs: 0 },
+    { name: 'node-C', address: '10.0.0.3:19000', status: 'ONLINE', active_jobs: 0 },
   ];
 
-  it('should filter jobs by status pills', async () => {
+  it('should filter jobs by status pills including STOPPED', async () => {
     const { container, getByText } = render(JobsView, {
       props: { jobs: mockJobs, nodes: mockNodes },
     });
 
-    // 默认展示全部 3 个任务
+    // 默认展示全部 4 个任务
     let rows = container.querySelectorAll('tbody tr');
-    expect(rows.length).toBe(3);
+    expect(rows.length).toBe(4);
 
     // 点击 "运行中" Pill
     const statusPills = container.querySelectorAll('.status-pills .pill-btn');
@@ -221,11 +233,19 @@ describe('JobsView filtering, status pills and action dispatches', () => {
     expect(rows.length).toBe(1);
     expect(rows[0].textContent).toContain('job-102');
 
+    // 点击 "已终止" Pill
+    const stoppedPill = statusPills[4]; // 全部, 运行中, 已完成, 失败, 已终止
+    await fireEvent.click(stoppedPill);
+    rows = container.querySelectorAll('tbody tr');
+    expect(rows.length).toBe(1);
+    expect(rows[0].textContent).toContain('job-104');
+    expect(rows[0].textContent).toContain('已终止');
+
     // 点击 "全部" Pill 还原
     const allPill = statusPills[0];
     await fireEvent.click(allPill);
     rows = container.querySelectorAll('tbody tr');
-    expect(rows.length).toBe(3);
+    expect(rows.length).toBe(4);
   });
 
   it('should filter jobs in 0ms with instant search query', async () => {
@@ -251,6 +271,57 @@ describe('JobsView filtering, status pills and action dispatches', () => {
     // 清空搜索
     await fireEvent.input(searchInput, { target: { value: '' } });
     rows = container.querySelectorAll('tbody tr');
-    expect(rows.length).toBe(3);
+    expect(rows.length).toBe(4);
+  });
+
+  it('should dispatch openRun, openClean, onViewLogs, and onKillJob correctly', async () => {
+    let runOpened = false;
+    let cleanOpened = false;
+    let viewedJob: any = null;
+    let killedJob: any = null;
+
+    const { container } = render(JobsView, {
+      props: {
+        jobs: mockJobs,
+        nodes: mockNodes,
+        onOpenRun: () => { runOpened = true; },
+        onOpenClean: () => { cleanOpened = true; },
+        onViewLogs: (job: JobInfo) => { viewedJob = job; },
+        onKillJob: (job: JobInfo) => { killedJob = job; },
+      },
+    });
+
+    // 1. 点击操作栏 "派发任务" 按钮
+    const runBtn = Array.from(container.querySelectorAll('.action-group button')).find(b => b.textContent?.includes('派发任务')) as HTMLElement;
+    expect(runBtn).toBeDefined();
+    await fireEvent.click(runBtn);
+    expect(runOpened).toBe(true);
+
+    // 2. 点击操作栏 "清理" 按钮
+    const cleanBtn = Array.from(container.querySelectorAll('.action-group button')).find(b => b.textContent?.includes('清理')) as HTMLElement;
+    expect(cleanBtn).toBeDefined();
+    await fireEvent.click(cleanBtn);
+    expect(cleanOpened).toBe(true);
+
+    // 3. 点击表格中第 4 行（STOPPED 任务 job-104）的 "日志" 按钮
+    const rows = container.querySelectorAll('tbody tr');
+    const stoppedRow = rows[3];
+    const logBtn = stoppedRow.querySelector('.btn-secondary') as HTMLElement;
+    expect(logBtn).not.toBeNull();
+    await fireEvent.click(logBtn);
+    expect(viewedJob).toBeDefined();
+    expect(viewedJob?.id).toBe('job-104');
+
+    // 验证 STOPPED 任务行中没有 "终止" 按钮
+    const stoppedKillBtn = stoppedRow.querySelector('.btn-danger');
+    expect(stoppedKillBtn).toBeNull();
+
+    // 4. 点击表格中第 1 行（RUNNING 任务 job-101）的 "终止" 按钮
+    const runningRow = rows[0];
+    const killBtn = runningRow.querySelector('.btn-danger') as HTMLElement;
+    expect(killBtn).not.toBeNull();
+    await fireEvent.click(killBtn);
+    expect(killedJob).toBeDefined();
+    expect(killedJob?.id).toBe('job-101');
   });
 });

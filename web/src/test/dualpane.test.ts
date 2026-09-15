@@ -224,6 +224,194 @@ describe('DualPaneFiles in-situ operations and keyboard shortcuts', () => {
     expect(container.querySelector('.progress-files-detail')).toBeNull();
     expect(container.querySelector('.progress-file-chips')).toBeNull();
   });
+
+  it('should call getRoots with selected node when switching node in left pane', async () => {
+    const { container } = render(DualPaneFiles, {
+      props: { nodes: mockNodes },
+    });
+
+    await new Promise(r => setTimeout(r, 20));
+
+    // 初始渲染时：左侧默认为空字符串（本地），右侧默认选择首个在线节点 'local-node'
+    expect(api.getRoots).toHaveBeenCalledWith('');
+    expect(api.getRoots).toHaveBeenCalledWith('local-node');
+
+    // 切换左侧选择到 'remote-node'
+    const leftSelect = container.querySelector('#left-node-select') as HTMLSelectElement;
+    expect(leftSelect).not.toBeNull();
+    leftSelect.value = 'remote-node';
+    await fireEvent.change(leftSelect);
+
+    await new Promise(r => setTimeout(r, 20));
+    // 验证向后端获取盘符时正确传递了目标远端节点名
+    expect(api.getRoots).toHaveBeenCalledWith('remote-node');
+  });
+
+  it('should switch drive on drive chip click, drill into folder on link click, and navigate up', async () => {
+    const { container, getByText } = render(DualPaneFiles, {
+      props: { nodes: mockNodes },
+    });
+
+    await new Promise(r => setTimeout(r, 20));
+
+    // 1. 点击盘符 D:/
+    const dChip = Array.from(container.querySelectorAll('.drive-chips .drive-chip')).find(c => c.textContent?.trim() === 'D:/') as HTMLButtonElement;
+    expect(dChip).toBeDefined();
+    await fireEvent.click(dChip);
+    expect(api.listDir).toHaveBeenCalledWith('', 'D:/');
+
+    // 2. 点击左栏文件夹链接 docs 进入下级目录
+    const leftPane = container.querySelectorAll('.file-pane')[0];
+    const docsLink = leftPane.querySelector('.dir-link') as HTMLButtonElement;
+    expect(docsLink).not.toBeNull();
+    await fireEvent.click(docsLink);
+    expect(api.listDir).toHaveBeenCalledWith('', 'D:/docs');
+
+    // 3. 点击返回上一级按钮
+    const upBtn = container.querySelector('.pane-path-row .btn-nav-icon[title="返回上一级"]') as HTMLButtonElement;
+    expect(upBtn).not.toBeNull();
+    await fireEvent.click(upBtn);
+    expect(api.listDir).toHaveBeenCalledWith('', 'D:/');
+  });
+
+  it('should open context menu on right click on file row and container, and perform actions', async () => {
+    const { container, getByText } = render(DualPaneFiles, {
+      props: { nodes: mockNodes },
+    });
+
+    await new Promise(r => setTimeout(r, 20));
+
+    // 1. 在首个文件行上右键触发上下文菜单
+    const firstRow = container.querySelector('tbody tr') as HTMLTableRowElement;
+    expect(firstRow).not.toBeNull();
+    await fireEvent.contextMenu(firstRow, { clientX: 100, clientY: 150 });
+
+    const contextMenu = container.querySelector('.context-menu');
+    expect(contextMenu).not.toBeNull();
+    expect(getByText('发送至对侧')).toBeTruthy();
+    expect(getByText('新建文件夹')).toBeTruthy();
+
+    // 2. 点击发送至对侧
+    const sendMenuItem = getByText('发送至对侧');
+    await fireEvent.click(sendMenuItem);
+    expect(api.transfer).toHaveBeenCalled();
+    expect(container.querySelector('.context-menu')).toBeNull();
+
+    // 3. 在空白容器区域右键触发上下文菜单并点击刷新
+    const paneContainer = container.querySelector('.file-pane') as HTMLElement;
+    await fireEvent.contextMenu(paneContainer, { clientX: 200, clientY: 250 });
+
+    expect(container.querySelector('.context-menu')).not.toBeNull();
+    const refreshMenuItem = getByText('刷新目录');
+    expect(refreshMenuItem).toBeTruthy();
+    await fireEvent.click(refreshMenuItem);
+    expect(api.listDir).toHaveBeenCalled();
+    expect(container.querySelector('.context-menu')).toBeNull();
+
+    // 4. 在空白区域再次右键，按 Escape 关闭上下文菜单
+    await fireEvent.contextMenu(paneContainer, { clientX: 200, clientY: 250 });
+    expect(container.querySelector('.context-menu')).not.toBeNull();
+    await fireEvent.keyDown(window, { key: 'Escape' });
+    expect(container.querySelector('.context-menu')).toBeNull();
+  });
+
+  it('should transfer file from right to left on button click and trigger context delete', async () => {
+    const { container } = render(DualPaneFiles, {
+      props: { nodes: mockNodes },
+    });
+
+    await new Promise(r => setTimeout(r, 20));
+
+    // 1. 右栏点击首行操作列中的 [传到左侧] 按钮
+    const rightPane = container.querySelectorAll('.file-pane')[1];
+    const transferBtn = rightPane.querySelector('.btn-action-icon[title="传到左侧"]') as HTMLButtonElement;
+    expect(transferBtn).not.toBeNull();
+    await fireEvent.click(transferBtn);
+    expect(api.transfer).toHaveBeenCalled();
+
+    // 2. 在右栏首个文件上右键触发删除
+    const rightFirstRow = rightPane.querySelector('tbody tr') as HTMLTableRowElement;
+    await fireEvent.contextMenu(rightFirstRow, { clientX: 300, clientY: 150 });
+    const deleteMenuItem = Array.from(container.querySelectorAll('.context-menu .menu-item')).find(b => b.textContent?.includes('删除')) as HTMLButtonElement;
+    expect(deleteMenuItem).toBeDefined();
+    await fireEvent.click(deleteMenuItem);
+
+    // 验证原地出现二次确认
+    const confirmBox = rightPane.querySelector('.inline-row-confirm');
+    expect(confirmBox).not.toBeNull();
+  });
+
+  it('should confirm inline mkdir when clicking "确定" in inline row', async () => {
+    const { container } = render(DualPaneFiles, {
+      props: { nodes: mockNodes },
+    });
+
+    await new Promise(r => setTimeout(r, 20));
+
+    // 点击左栏工具栏 [新建]
+    const mkdirBtn = container.querySelector('.btn-toolbar-action') as HTMLButtonElement;
+    await fireEvent.click(mkdirBtn);
+
+    const inlineRow = container.querySelector('.inline-mkdir-row');
+    expect(inlineRow).not.toBeNull();
+
+    const confirmBtn = inlineRow?.querySelector('.btn-primary') as HTMLButtonElement;
+    expect(confirmBtn).not.toBeNull();
+    await fireEvent.click(confirmBtn);
+
+    expect(api.makeDir).toHaveBeenCalledWith('', 'C:/新文件夹');
+  });
+
+  it('should open download url when clicking download action icon on file row', async () => {
+    const openSpy = vi.spyOn(window, 'open').mockImplementation(() => null);
+
+    const { container } = render(DualPaneFiles, {
+      props: { nodes: mockNodes },
+    });
+
+    await new Promise(r => setTimeout(r, 20));
+
+    // 找到非目录文件行的下载按钮
+    const downloadBtn = container.querySelector('.btn-action-icon[title="下载"]') as HTMLButtonElement;
+    expect(downloadBtn).not.toBeNull();
+    await fireEvent.click(downloadBtn);
+
+    expect(openSpy).toHaveBeenCalled();
+    expect(openSpy.mock.calls[0][0]).toContain('/api/ui/fs/download?');
+    openSpy.mockRestore();
+  });
+
+  it('should transfer file when dragging from left pane and dropping onto right pane', async () => {
+    const { container } = render(DualPaneFiles, {
+      props: { nodes: mockNodes },
+    });
+
+    await new Promise(r => setTimeout(r, 20));
+
+    const panes = container.querySelectorAll('.file-pane');
+    const leftPane = panes[0];
+    const rightPane = panes[1];
+
+    const leftFirstRow = leftPane.querySelector('tbody tr') as HTMLTableRowElement;
+    expect(leftFirstRow).not.toBeNull();
+
+    // 触发 dragstart
+    const mockDataTransfer = {
+      setData: vi.fn(),
+      effectAllowed: '',
+      dropEffect: '',
+    };
+    await fireEvent.dragStart(leftFirstRow, { dataTransfer: mockDataTransfer });
+
+    // 触发 dragover 在右栏
+    await fireEvent.dragOver(rightPane, { dataTransfer: mockDataTransfer });
+
+    // 触发 drop 在右栏
+    await fireEvent.drop(rightPane);
+
+    expect(api.transfer).toHaveBeenCalled();
+  });
 });
+
 
 
