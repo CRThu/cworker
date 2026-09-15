@@ -47,7 +47,6 @@ type Worker struct {
 	jobs       map[string]*process.ManagedJob
 	server     *http.Server
 	listenAddr string
-	localIP    string
 	lock       *process.SingleInstanceLock
 }
 
@@ -131,15 +130,9 @@ func NewWorker(cfg Config) (*Worker, error) {
 		cfg.Token = token
 	}
 
-	localIP := getLocalIP()
-	if cfg.BindAddr != "" && cfg.BindAddr != "0.0.0.0" {
-		localIP = cfg.BindAddr
-	}
-
 	w := &Worker{
-		cfg:     cfg,
-		jobs:    make(map[string]*process.ManagedJob),
-		localIP: localIP,
+		cfg:  cfg,
+		jobs: make(map[string]*process.ManagedJob),
 	}
 	w.hydrateJobsFromDisk()
 	return w, nil
@@ -257,7 +250,7 @@ func (w *Worker) Start(ctx context.Context) error {
 	slog.Info("worker service listening",
 		"name", w.cfg.Name,
 		"port", w.cfg.Port,
-		"ip", w.localIP,
+		"listen", w.listenAddr,
 		"token_configured", w.cfg.Token != "",
 	)
 
@@ -350,9 +343,8 @@ func (w *Worker) collectNodeInfo() protocol.NodeInfo {
 	cpuPercent := process.GetSystemCPUPercent()
 
 	return protocol.NodeInfo{
-		Name:    w.cfg.Name,
-		Address: fmt.Sprintf("%s:%d", w.localIP, w.cfg.Port),
-		Status:  protocol.NodeStatusOnline,
+		Name:   w.cfg.Name,
+		Status: protocol.NodeStatusOnline,
 		Metrics: protocol.NodeMetrics{
 			CPUPercent: cpuPercent,
 			CPUCores:   runtime.NumCPU(),
@@ -362,20 +354,6 @@ func (w *Worker) collectNodeInfo() protocol.NodeInfo {
 		ActiveJobs: activeCount,
 		LastSeen:   time.Now(),
 	}
-}
-
-func getLocalIP() string {
-	addrs, err := net.InterfaceAddrs()
-	if err == nil {
-		for _, addr := range addrs {
-			if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
-				if ipnet.IP.To4() != nil {
-					return ipnet.IP.String()
-				}
-			}
-		}
-	}
-	return "127.0.0.1"
 }
 
 // HTTP 任务相关处理器

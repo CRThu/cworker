@@ -578,15 +578,19 @@ func TestCmd_Commands_WithMockServer(t *testing.T) {
 		t.Fatalf("unexpected logs output: %s", logsOut)
 	}
 
-	// 7. 测试 nodeCmd.RunE 及 nodeLsCmd.RunE (活跃集群排版)
+	// 7. 测试 nodeCmd.RunE 及 nodeLsCmd.RunE (混合集群排版：同时验证在线与离线节点的 Address SSOT 展示)
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "offline-mock", Target: "127.0.0.1:59995"})
 	nodesOut, err := captureStdout(func() error {
 		return nodeCmd.RunE(nodeCmd, []string{})
 	})
 	if err != nil {
 		t.Fatalf("nodeCmd.RunE failed: %v", err)
 	}
-	if !strings.Contains(nodesOut, "mock-node") || !strings.Contains(nodesOut, "ONLINE") || !strings.Contains(nodesOut, "12.8%") {
-		t.Fatalf("unexpected nodes output: %s", nodesOut)
+	if !strings.Contains(nodesOut, "mock-node") || !strings.Contains(nodesOut, "ONLINE") || !strings.Contains(nodesOut, "12.8%") || !strings.Contains(nodesOut, u.Host) {
+		t.Fatalf("unexpected nodes output for online node: %s", nodesOut)
+	}
+	if !strings.Contains(nodesOut, "offline-mock") || !strings.Contains(nodesOut, "OFFLINE") || !strings.Contains(nodesOut, "127.0.0.1:59995") {
+		t.Fatalf("unexpected nodes output for offline node: %s", nodesOut)
 	}
 
 	nodeLsOut, err := captureStdout(func() error {
@@ -595,9 +599,10 @@ func TestCmd_Commands_WithMockServer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("nodeLsCmd.RunE failed: %v", err)
 	}
-	if !strings.Contains(nodeLsOut, "mock-node") || !strings.Contains(nodeLsOut, "ONLINE") || !strings.Contains(nodeLsOut, "12.8%") {
+	if !strings.Contains(nodeLsOut, "mock-node") || !strings.Contains(nodeLsOut, "ONLINE") || !strings.Contains(nodeLsOut, "12.8%") || !strings.Contains(nodeLsOut, u.Host) {
 		t.Fatalf("unexpected node ls output: %s", nodeLsOut)
 	}
+	_ = cli.RemoveKnownNode("offline-mock")
 
 	// 8. 测试 psCmd.RunE (多任务表格排版、耗时计算与超长截断)
 	psOut, err := captureStdout(func() error {

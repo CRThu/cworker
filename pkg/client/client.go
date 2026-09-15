@@ -253,6 +253,13 @@ func (c *Client) ListNodes() ([]protocol.NodeInfo, error) {
 			defer wg.Done()
 			rt, err := c.ResolveWorker(node.Name, node.Token)
 			if err != nil {
+				mu.Lock()
+				list = append(list, protocol.NodeInfo{
+					Name:    node.Name,
+					Address: node.Target,
+					Status:  protocol.NodeStatusOffline,
+				})
+				mu.Unlock()
 				return
 			}
 
@@ -269,6 +276,8 @@ func (c *Client) ListNodes() ([]protocol.NodeInfo, error) {
 						if node.Name != "" {
 							info.Name = node.Name
 						}
+						// 客户端通信透视：以客户端实际动态 DNS 解析并成功打通的物理通信地址为 SSOT 单一事实来源
+						info.Address = strings.TrimPrefix(strings.TrimPrefix(rt.BaseURL, "http://"), "https://")
 						mu.Lock()
 						list = append(list, info)
 						mu.Unlock()

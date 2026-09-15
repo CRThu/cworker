@@ -123,6 +123,9 @@ func TestCluster_FullLifecycle(t *testing.T) {
 	for _, n := range nodes {
 		if n.Name == "node-alpha" && n.Status == protocol.NodeStatusOnline {
 			foundAlpha = true
+			if n.Address != targetAlpha {
+				t.Fatalf("expected node-alpha address %s, got %s", targetAlpha, n.Address)
+			}
 			if n.Metrics.CPUCores != expectedCores {
 				t.Fatalf("expected node-alpha CPUCores %d, got %d", expectedCores, n.Metrics.CPUCores)
 			}
@@ -132,6 +135,9 @@ func TestCluster_FullLifecycle(t *testing.T) {
 		}
 		if n.Name == "node-beta" && n.Status == protocol.NodeStatusOnline {
 			foundBeta = true
+			if n.Address != targetBeta {
+				t.Fatalf("expected node-beta address %s, got %s", targetBeta, n.Address)
+			}
 			if n.Metrics.CPUCores != expectedCores {
 				t.Fatalf("expected node-beta CPUCores %d, got %d", expectedCores, n.Metrics.CPUCores)
 			}
@@ -159,6 +165,9 @@ func TestCluster_FullLifecycle(t *testing.T) {
 	foundDead := false
 	for _, n := range mixedNodes {
 		if n.Name == "dead-node" && n.Status == protocol.NodeStatusOffline {
+			if n.Address != "127.0.0.1:59997" {
+				t.Fatalf("expected dead-node address '127.0.0.1:59997', got %s", n.Address)
+			}
 			foundDead = true
 		}
 	}

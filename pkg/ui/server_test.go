@@ -190,6 +190,14 @@ func TestServer_HandleNodes(t *testing.T) {
 	if len(knownList) != 1 {
 		t.Fatalf("expected 1 known node, got %d", len(knownList))
 	}
+	nodesList := respData["nodes"].([]interface{})
+	if len(nodesList) != 1 {
+		t.Fatalf("expected 1 node, got %d", len(nodesList))
+	}
+	nodeMap := nodesList[0].(map[string]interface{})
+	if nodeMap["address"] != "192.168.1.50:19000" {
+		t.Fatalf("expected offline node address '192.168.1.50:19000', got %v", nodeMap["address"])
+	}
 
 	// 5. DELETE 缺少参数
 	reqBadDel := httptest.NewRequest(http.MethodDelete, "/api/ui/nodes", nil)
@@ -1503,11 +1511,31 @@ func TestServer_HandleOverview_WithCPUCores(t *testing.T) {
 	if len(overview.Nodes) != 1 {
 		t.Fatalf("expected 1 node, got %d", len(overview.Nodes))
 	}
+	if overview.Nodes[0].Address != targetHost {
+		t.Fatalf("expected node Address %s, got %s", targetHost, overview.Nodes[0].Address)
+	}
 	if overview.Nodes[0].Metrics.CPUCores != 16 {
 		t.Fatalf("expected CPUCores 16, got %d", overview.Nodes[0].Metrics.CPUCores)
 	}
 	if overview.Nodes[0].Metrics.CPUPercent != 12.5 {
 		t.Fatalf("expected CPUPercent 12.5, got %f", overview.Nodes[0].Metrics.CPUPercent)
+	}
+
+	// 验证 /api/ui/nodes 接口同样返回 SSOT 对齐的物理通信地址
+	reqNodes := httptest.NewRequest(http.MethodGet, "/api/ui/nodes", nil)
+	wNodes := httptest.NewRecorder()
+	handler.ServeHTTP(wNodes, reqNodes)
+	if wNodes.Code != http.StatusOK {
+		t.Fatalf("expected 200 for /api/ui/nodes, got %d", wNodes.Code)
+	}
+	var nodesResp struct {
+		Nodes []protocol.NodeInfo `json:"nodes"`
+	}
+	if err := json.NewDecoder(wNodes.Body).Decode(&nodesResp); err != nil {
+		t.Fatalf("decode nodes failed: %v", err)
+	}
+	if len(nodesResp.Nodes) != 1 || nodesResp.Nodes[0].Address != targetHost {
+		t.Fatalf("expected 1 node with address %s, got %+v", targetHost, nodesResp.Nodes)
 	}
 }
 

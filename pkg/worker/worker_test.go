@@ -490,12 +490,6 @@ func TestWorker_EdgeCases(t *testing.T) {
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("expected 404 for ls missing dir, got %d", rec.Code)
 	}
-
-	// 5. getLocalIP 测活
-	ip := getLocalIP()
-	if ip == "" {
-		t.Fatal("expected non-empty local IP")
-	}
 }
 
 func TestWorker_Getters(t *testing.T) {

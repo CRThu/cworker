@@ -225,6 +225,9 @@ func TestClient_Operations(t *testing.T) {
 	if nodes[0].Status != protocol.NodeStatusOnline {
 		t.Fatalf("expected node online, got %s", nodes[0].Status)
 	}
+	if nodes[0].Address != targetHostPort {
+		t.Fatalf("expected node address %s, got %s", targetHostPort, nodes[0].Address)
+	}
 
 	// 2. 测试 UploadFile
 	err = cli.UploadFile("mock-node", "dest.txt", strings.NewReader("upload content"))
@@ -407,6 +410,9 @@ func TestClient_ListNodes_OfflineNode(t *testing.T) {
 	if nodes[0].Status != protocol.NodeStatusOffline {
 		t.Fatalf("expected node status OFFLINE, got %s", nodes[0].Status)
 	}
+	if nodes[0].Address != "127.0.0.1:59998" {
+		t.Fatalf("expected offline node address '127.0.0.1:59998', got %s", nodes[0].Address)
+	}
 }
 
 // TestClient_ListNodes_ProxyImmunity 验证 ListNodes 严格免疫系统外部 HTTP_PROXY 环境变量干扰
@@ -485,6 +491,109 @@ func TestClient_ListNodes_TimeoutFailsafe(t *testing.T) {
 	// 耗时应在 1500ms 左右，大幅小于服务端的 3 秒延迟
 	if elapsed > 2500*time.Millisecond {
 		t.Fatalf("ListNodes timeout took too long: %v (expected ~1500ms)", elapsed)
+	}
+}
+
+// TestClient_ListNodes_AddressSource_SSOT 验证节点的真实物理通信地址始终以客户端动态寻址与握手成功的 BaseURL 为 SSOT，
+// 严禁被远端 Worker 内部网卡自报的无效/虚假地址（如 169.254.x.x 链路本地地址或孤岛 IP）污染
+func TestClient_ListNodes_AddressSource_SSOT(t *testing.T) {
+	// 远端 Worker 模拟：自报了一个完全不可达的 APIPA 假地址
+	deceptiveWorkerIP := "169.254.164.158:19000"
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			rw.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(rw).Encode(protocol.NodeInfo{
+				Name:    "worker-reporting-bad-ip",
+				Address: deceptiveWorkerIP,
+				Status:  protocol.NodeStatusOnline,
+			})
+			return
+		}
+		http.NotFound(rw, r)
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	cli := NewClient()
+	cli.dataDir = t.TempDir()
+
+	_ = cli.SaveKnownNode(protocol.KnownNode{
+		Name:   "worker-node",
+		Target: u.Host,
+		Token:  "test-token",
+	})
+
+	nodes, err := cli.ListNodes()
+	if err != nil {
+		t.Fatalf("ListNodes failed: %v", err)
+	}
+	if len(nodes) != 1 {
+		t.Fatalf("expected 1 node, got %d", len(nodes))
+	}
+
+	n := nodes[0]
+	if n.Status != protocol.NodeStatusOnline {
+		t.Fatalf("expected node status ONLINE, got %s", n.Status)
+	}
+
+	// 核心断言：Address 必须是客户端实际连接的真实物理 HostPort (u.Host)，绝对不能是远端自报的 deceptiveWorkerIP
+	if n.Address != u.Host {
+		t.Fatalf("Address SSOT violation: expected client connect host %s, got %s", u.Host, n.Address)
+	}
+	if n.Address == deceptiveWorkerIP {
+		t.Fatalf("Address SSOT failure: node Address was polluted by remote worker's self-reported IP: %s", deceptiveWorkerIP)
+	}
+}
+
+// TestClient_ListNodes_ResolveError_Offline 验证当节点寻址/解析彻底异常时，优雅降级为 OFFLINE 并保留 Target，绝不挂死或静默丢失
+func TestClient_ListNodes_ResolveError_Offline(t *testing.T) {
+	cli := NewClient()
+	cli.dataDir = t.TempDir()
+
+	_ = cli.SaveKnownNode(protocol.KnownNode{
+		Name:   "unresolvable-node",
+		Target: "nonexistent.domain.that.does.not.exist.at.all:19000",
+		Token:  "some-token",
+	})
+
+	nodes, err := cli.ListNodes()
+	if err != nil {
+		t.Fatalf("ListNodes failed on unresolvable node: %v", err)
+	}
+	if len(nodes) != 1 {
+		t.Fatalf("expected 1 node, got %d", len(nodes))
+	}
+	if nodes[0].Status != protocol.NodeStatusOffline {
+		t.Fatalf("expected OFFLINE, got %s", nodes[0].Status)
+	}
+	if nodes[0].Address != "nonexistent.domain.that.does.not.exist.at.all:19000" {
+		t.Fatalf("expected preserved target, got %s", nodes[0].Address)
+	}
+}
+
+// TestClient_ListNodes_IPv6 验证 IPv6 目标节点的标准括号包裹格式与 Address SSOT 对齐
+func TestClient_ListNodes_IPv6(t *testing.T) {
+	cli := NewClient()
+	cli.dataDir = t.TempDir()
+
+	_ = cli.SaveKnownNode(protocol.KnownNode{
+		Name:   "ipv6-node",
+		Target: "[::1]:59996",
+		Token:  "token",
+	})
+
+	nodes, err := cli.ListNodes()
+	if err != nil {
+		t.Fatalf("ListNodes failed: %v", err)
+	}
+	if len(nodes) != 1 {
+		t.Fatalf("expected 1 node, got %d", len(nodes))
+	}
+	if nodes[0].Status != protocol.NodeStatusOffline {
+		t.Fatalf("expected OFFLINE for unused port, got %s", nodes[0].Status)
+	}
+	if nodes[0].Address != "[::1]:59996" {
+		t.Fatalf("expected [::1]:59996, got %s", nodes[0].Address)
 	}
 }
 
