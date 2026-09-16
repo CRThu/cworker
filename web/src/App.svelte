@@ -21,6 +21,7 @@
     addNode,
     removeNode,
     runJob,
+    dispatchJob,
     killJob,
     cleanJobs,
   } from './lib/api';
@@ -162,14 +163,25 @@
     }
   }
 
-  // 任务派发与终止
+  // 任务派发与终止 (支持单节点或多节点并发派发与容错隔离)
   async function handleRunJob(event: CustomEvent<any>) {
     try {
-      const info = await runJob(event.detail);
-      showToast(`任务已派发: ${info.id} (PID: ${info.pid})`);
-      isRunJobOpen = false;
-      currentTab = 'jobs';
-      refreshData();
+      const { succeeded, failed } = await dispatchJob(event.detail);
+
+      if (succeeded.length > 0) {
+        if (succeeded.length === 1) {
+          showToast(`任务已派发: ${succeeded[0].id} (节点: ${succeeded[0].node || 'local'}, PID: ${succeeded[0].pid})`);
+        } else {
+          showToast(`已成功向 ${succeeded.length} 个节点并发派发任务: ${succeeded.map(s => `${s.node}(${s.id})`).join(', ')}`);
+        }
+        isRunJobOpen = false;
+        currentTab = 'jobs';
+        refreshData();
+      }
+
+      if (failed.length > 0) {
+        showToast(`部分节点派发失败 (${failed.length}): ${failed.map(f => `${f.node}: ${f.error}`).join('; ')}`, 'error');
+      }
     } catch (e: any) {
       showToast(`派发失败: ${e.message}`, 'error');
     }
@@ -181,8 +193,9 @@
 
   async function handleConfirmKill(event: CustomEvent<string>) {
     const jobId = event.detail;
+    const node = killJobTarget?.node;
     try {
-      await killJob(jobId);
+      await killJob(jobId, node);
       showToast(`任务 ${jobId} 已终止，子进程树彻底清理`);
       killJobTarget = null;
       refreshData();

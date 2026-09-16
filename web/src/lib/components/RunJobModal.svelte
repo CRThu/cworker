@@ -1,9 +1,10 @@
-<!-- web/src/lib/components/RunJobModal.svelte - 派发新任务模态框 (默认智能随机命名) -->
+<!-- web/src/lib/components/RunJobModal.svelte - 派发新任务模态框 (支持多节点并发派发、智能随机命名) -->
 <script lang="ts">
   import { createEventDispatcher } from 'svelte';
   import { Folder } from 'lucide-svelte';
   import { generateJobName } from '../utils/format';
   import DirPickerModal from './DirPickerModal.svelte';
+  import MultiSelect from './MultiSelect.svelte';
   import type { NodeInfo } from '../types';
 
   export let open: boolean = false;
@@ -13,21 +14,27 @@
 
   const dispatch = createEventDispatcher();
 
-  let targetNode: string = '';
+  let selectedNodes: string[] = [];
   let jobName: string = '';
   let jobDir: string = '';
   let jobCmd: string = '';
   let showDirPicker: boolean = false;
+  let wasOpen: boolean = false;
 
-  // 模态框打开时自动预填一个随机名称
-  $: if (open) {
+  $: nodeNames = nodes.map(n => n.name);
+
+  // 模态框打开时仅在首次打开时预填随机名称与首选在线节点
+  $: if (open && !wasOpen) {
+    wasOpen = true;
     if (!jobName) {
       jobName = generateJobName();
     }
-    if (!targetNode && nodes.length > 0) {
+    if (nodes.length > 0) {
       const onlineNode = nodes.find(n => n.status === 'ONLINE');
-      targetNode = onlineNode ? onlineNode.name : nodes[0].name;
+      selectedNodes = [onlineNode ? onlineNode.name : nodes[0].name];
     }
+  } else if (!open) {
+    wasOpen = false;
   }
 
   function handleClose() {
@@ -35,10 +42,18 @@
     dispatch('close');
   }
 
+  function handleKeydown(e: KeyboardEvent) {
+    if (open && e.key === 'Escape' && !showDirPicker) {
+      e.preventDefault();
+      handleClose();
+    }
+  }
+
   function handleSubmit() {
-    if (!jobCmd.trim()) return;
+    if (!jobCmd.trim() || selectedNodes.length === 0) return;
     const payload = {
-      node: targetNode,
+      nodes: selectedNodes,
+      node: selectedNodes[0] || '',
       name: jobName.trim() || generateJobName(),
       dir: jobDir.trim(),
       command: jobCmd.trim(),
@@ -55,8 +70,10 @@
   }
 </script>
 
+<svelte:window on:keydown={handleKeydown} />
+
 {#if open}
-  <div class="modal-overlay" on:click|self={handleClose}>
+  <div class="modal-overlay" role="presentation" on:click|self={handleClose}>
     <div class="modal-box">
       <div class="modal-header">
         <h3 class="modal-title">派发新任务</h3>
@@ -66,17 +83,12 @@
       <form on:submit|preventDefault={handleSubmit}>
         <div class="modal-body">
           <div class="form-group">
-            <label for="run-node-select" class="form-label">目标 Worker 节点 *</label>
-            <select id="run-node-select" class="select w-full" bind:value={targetNode} required>
-              {#each nodes as n}
-                <option value={n.name}>
-                  {n.name} ({n.status === 'ONLINE' ? '在线' : '离线'})
-                </option>
-              {/each}
-              {#if nodes.length === 0}
-                <option value="">暂无可用节点</option>
-              {/if}
-            </select>
+            <span class="form-label">目标 Worker 节点 (支持多选) *</span>
+            <MultiSelect
+              options={nodeNames}
+              bind:selected={selectedNodes}
+              placeholder="请选择目标节点"
+            />
           </div>
 
           <div class="form-group">
@@ -130,7 +142,7 @@
 
         <div class="modal-footer">
           <button type="button" class="btn btn-secondary" on:click={handleClose}>取消</button>
-          <button type="submit" class="btn btn-primary" disabled={!jobCmd.trim()}>派发任务</button>
+          <button type="submit" class="btn btn-primary" disabled={!jobCmd.trim() || selectedNodes.length === 0}>派发任务</button>
         </div>
       </form>
     </div>
@@ -138,7 +150,7 @@
 
   <DirPickerModal
     open={showDirPicker}
-    node={targetNode}
+    node={selectedNodes.length > 0 ? selectedNodes[0] : ''}
     initialPath={jobDir}
     on:select={(e) => {
       jobDir = e.detail.path;

@@ -2,10 +2,7 @@ package cmd
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 
 	"cworker/pkg/client"
 	"cworker/pkg/pathutil"
@@ -40,200 +37,23 @@ var cpCmd = &cobra.Command{
 		}
 
 		cli := client.NewClient()
+		tracker := client.NewProgressTracker(1, 0)
 
-		// 1. 远端到远端拷贝
-		if srcNode != "" && dstNode != "" {
-			// 探测源端是否为目录
-			_, lsErr := cli.ListDirWithContext(ctx, srcNode, srcPath)
-			isSrcDir := lsErr == nil
-
-			if isSrcDir {
-				if !recursive {
-					return fmt.Errorf("omitting directory '%s:%s' (use -r to copy recursively)", srcNode, srcPath)
-				}
-
-				// 若目的端已存在且为目录，自动放入子目录中 (对齐 Unix cp -r 规范)
-				if _, err := cli.ListDirWithContext(ctx, dstNode, dstPath); err == nil {
-					dstPath = pathutil.JoinRemotePath(dstPath, pathutil.SafeBaseName(srcPath))
-				}
-
-				fmt.Printf("[cworker] Relay copying directory '%s:%s' -> '%s:%s' (concurrency: %d)...\n",
-					srcNode, srcPath, dstNode, dstPath, concurrency)
-				if err := cli.RelayCopyDir(ctx, srcNode, srcPath, dstNode, dstPath, concurrency, nil); err != nil {
-					return fmt.Errorf("relay copy directory failed: %w", err)
-				}
-				fmt.Println("[OK] Remote to remote directory copy completed successfully.")
-				return nil
-			}
-
-			// 单文件远端到远端中继拷贝
-			if _, err := cli.ListDirWithContext(ctx, dstNode, dstPath); err == nil {
-				dstPath = pathutil.JoinRemotePath(dstPath, pathutil.SafeBaseName(srcPath))
-			}
-
-			tracker := client.NewProgressTracker(1, 0)
-			fmt.Printf("[cworker] Relay copying '%s:%s' -> '%s:%s' directly via CLI pipe...\n", srcNode, srcPath, dstNode, dstPath)
-			if err := cli.RelayCopyWithContext(ctx, srcNode, srcPath, dstNode, dstPath, tracker); err != nil {
-				return fmt.Errorf("relay copy failed: %w", err)
-			}
-			tracker.AddFile()
-			tracker.Finish()
-			fmt.Println("[OK] Remote to remote copy completed successfully.")
-			return nil
+		opts := client.TransferOptions{
+			SrcNode:     srcNode,
+			SrcPath:     srcPath,
+			DstNode:     dstNode,
+			DstPath:     dstPath,
+			Recursive:   recursive,
+			Concurrency: concurrency,
 		}
 
-		// 2. 本地到远端上传
-		if srcNode == "" && dstNode != "" {
-			cleanLocalSrc, err := pathutil.NormalizeLocalPath(srcPath)
-			if err != nil {
-				return err
-			}
-
-			fi, err := os.Stat(cleanLocalSrc)
-			if err != nil {
-				return fmt.Errorf("open local path failed: %w", err)
-			}
-
-			if fi.IsDir() {
-				if !recursive {
-					return fmt.Errorf("omitting directory '%s' (use -r to copy recursively)", srcPath)
-				}
-
-				// 若目的端已存在且为目录，自动放入子目录中
-				if _, err := cli.ListDirWithContext(ctx, dstNode, dstPath); err == nil {
-					dstPath = pathutil.JoinRemotePath(dstPath, pathutil.SafeBaseName(cleanLocalSrc))
-				}
-
-				fmt.Printf("[cworker] Uploading directory '%s' -> '%s:%s' (concurrency: %d)...\n",
-					cleanLocalSrc, dstNode, dstPath, concurrency)
-				if err := cli.UploadDir(ctx, dstNode, dstPath, cleanLocalSrc, concurrency, nil); err != nil {
-					return fmt.Errorf("upload directory failed: %w", err)
-				}
-				fmt.Println("[OK] Directory upload completed.")
-				return nil
-			}
-
-			// 单文件上传
-			if _, err := cli.ListDirWithContext(ctx, dstNode, dstPath); err == nil {
-				dstPath = pathutil.JoinRemotePath(dstPath, pathutil.SafeBaseName(cleanLocalSrc))
-			}
-
-			f, err := os.Open(cleanLocalSrc)
-			if err != nil {
-				return fmt.Errorf("open local file failed: %w", err)
-			}
-			defer f.Close()
-
-			tracker := client.NewProgressTracker(1, fi.Size())
-			r := client.NewCountingReader(f, tracker)
-
-			fmt.Printf("[cworker] Uploading local '%s' -> '%s:%s'...\n", cleanLocalSrc, dstNode, dstPath)
-			if err := cli.UploadFileWithContext(ctx, dstNode, dstPath, r); err != nil {
-				return fmt.Errorf("upload failed: %w", err)
-			}
-			tracker.AddFile()
-			tracker.Finish()
-			fmt.Println("[OK] Upload completed.")
-			return nil
+		if err := cli.Transfer(ctx, opts, tracker); err != nil {
+			return err
 		}
 
-		// 3. 远端到本地下载
-		if srcNode != "" && dstNode == "" {
-			cleanLocalDst, err := pathutil.NormalizeLocalPath(dstPath)
-			if err != nil {
-				return err
-			}
-
-			// 探测源端是否为目录
-			_, lsErr := cli.ListDirWithContext(ctx, srcNode, srcPath)
-			isSrcDir := lsErr == nil
-
-			if isSrcDir {
-				if !recursive {
-					return fmt.Errorf("omitting directory '%s:%s' (use -r to copy recursively)", srcNode, srcPath)
-				}
-
-				// 若本地目标已存在且为目录，放入子目录中
-				if fi, err := os.Stat(cleanLocalDst); err == nil && fi.IsDir() {
-					cleanLocalDst = filepath.Join(cleanLocalDst, pathutil.SafeBaseName(srcPath))
-				}
-
-				fmt.Printf("[cworker] Downloading directory '%s:%s' -> local '%s' (concurrency: %d)...\n",
-					srcNode, srcPath, cleanLocalDst, concurrency)
-				if err := cli.DownloadDir(ctx, srcNode, srcPath, cleanLocalDst, concurrency, nil); err != nil {
-					return fmt.Errorf("download directory failed: %w", err)
-				}
-				fmt.Println("[OK] Directory download completed.")
-				return nil
-			}
-
-			// 单文件下载
-			if fi, err := os.Stat(cleanLocalDst); err == nil && fi.IsDir() {
-				cleanLocalDst = filepath.Join(cleanLocalDst, pathutil.SafeBaseName(srcPath))
-			}
-
-			tracker := client.NewProgressTracker(1, 0)
-			fmt.Printf("[cworker] Downloading '%s:%s' -> local '%s'...\n", srcNode, srcPath, cleanLocalDst)
-			if err := cli.DownloadToLocalFile(ctx, srcNode, srcPath, cleanLocalDst, tracker); err != nil {
-				return fmt.Errorf("download failed: %w", err)
-			}
-			tracker.AddFile()
-			tracker.Finish()
-			fmt.Println("[OK] Download completed.")
-			return nil
-		}
-
-		// 4. 本地到本地拷贝
-		if srcNode == "" && dstNode == "" {
-			cleanLocalSrc, err := pathutil.NormalizeLocalPath(srcPath)
-			if err != nil {
-				return err
-			}
-			cleanLocalDst, err := pathutil.NormalizeLocalPath(dstPath)
-			if err != nil {
-				return err
-			}
-
-			fi, err := os.Stat(cleanLocalSrc)
-			if err != nil {
-				return fmt.Errorf("open local source path failed: %w", err)
-			}
-
-			if fi.IsDir() {
-				if !recursive {
-					return fmt.Errorf("omitting directory '%s' (use -r to copy recursively)", srcPath)
-				}
-
-				if dstFi, err := os.Stat(cleanLocalDst); err == nil && dstFi.IsDir() {
-					cleanLocalDst = filepath.Join(cleanLocalDst, pathutil.SafeBaseName(cleanLocalSrc))
-				}
-
-				fmt.Printf("[cworker] Copying local directory '%s' -> '%s' (concurrency: %d)...\n",
-					cleanLocalSrc, cleanLocalDst, concurrency)
-				if err := cli.LocalCopyDir(ctx, cleanLocalSrc, cleanLocalDst, concurrency, nil); err != nil {
-					return fmt.Errorf("local copy directory failed: %w", err)
-				}
-				fmt.Println("[OK] Local directory copy completed.")
-				return nil
-			}
-
-			// 单文件本地拷贝
-			if dstFi, err := os.Stat(cleanLocalDst); err == nil && dstFi.IsDir() {
-				cleanLocalDst = filepath.Join(cleanLocalDst, pathutil.SafeBaseName(cleanLocalSrc))
-			}
-
-			tracker := client.NewProgressTracker(1, fi.Size())
-			fmt.Printf("[cworker] Copying local file '%s' -> '%s'...\n", cleanLocalSrc, cleanLocalDst)
-			if err := cli.LocalCopyFile(cleanLocalSrc, cleanLocalDst, tracker); err != nil {
-				return fmt.Errorf("local copy failed: %w", err)
-			}
-			tracker.AddFile()
-			tracker.Finish()
-			fmt.Println("[OK] Local copy completed.")
-			return nil
-		}
-
-		return errors.New("unsupported copy parameters")
+		fmt.Println("[OK] Transfer completed successfully.")
+		return nil
 	},
 }
 

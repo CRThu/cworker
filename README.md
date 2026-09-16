@@ -76,7 +76,7 @@ cw ui
 cw ui --port 19001 --no-open
 ```
 
-* 📊 **集群全景看板**：实时汇总在线节点数、全局可用内存与在线平均 CPU 均值，配有节点级迷你历史折线图；
+* 📊 **集群全景看板**：实时汇总在线节点数、全局可用内存与总算力负荷，配有节点级迷你历史折线图；
 * ⚡ **任务生命周期调度**：直观查看全部活跃与历史任务，一键连根查杀进程树（基于 Win32 Job Object），排查执行状态与耗时；
 * 📜 **流式日志终端**：基于 WebSocket 广播通道，毫秒级实时滚屏跟随日志输出；
 * 📁 **多机文件管理**：支持跨节点与本地文件的拖拽上传、双向互传与目录浏览。
@@ -215,8 +215,8 @@ cw ui
 | `cw run [-n node] [--dir dir] [--name name] [--token xxx] <cmd>` | 异步派发新任务并立即返回 `job-<hex>` 句柄；若携带 `--token` 则在鉴权成功后自动记忆更新至本地账本 |
 | `cw ps [-n node] [--all] [--limit <n>]` | 拉取全网或指定节点的任务运行状态与资源占用；RUNNING 任务优先置顶，默认展示最近 20 条，老任务自动截断省略，`--all` 展开全部 |
 | `cw clean <--days <n> \| --all> [-n node] [-y]` | 显式清理已结束任务记录与磁盘 `output.log`；支持按天数筛选或全量清理已完成任务；严格保护 RUNNING 任务不受影响 |
-| `cw kill <job_id>` | 终止任务并销毁整棵子进程树（基于 Win32 Job Object） |
-| `cw logs <job_id> [-f] [-n lines]` | 查看任务日志；带 `-f` 实时跟随，`-n` 截取末尾行数（默认 100） |
+| `cw kill [<node>:]<job_id> [-n node]` | 终止任务并销毁整棵子进程树（支持 `--node` 或 `node:job_id` 定向秒级查杀，免去全网广播） |
+| `cw logs [<node>:]<job_id> [--node node] [-f] [-n lines]` | 查看任务日志；带 `-f` 实时跟随，`-n` 截取末尾行数（默认 100），支持 `--node` 或 `node:job_id` 定向直连 |
 | `cw ui [--port <port>] [--no-open]` | 启动本地集中式 Web 控制台（严格监听 127.0.0.1，单文件 Go embed 内置前端，提供节点治理、任务生命周期、流式日志终端与文件互传） |
 | `cw update [-y] [--check] [--force] [--proxy <url>] [--mirror <url>]` | 从官方 GitHub Releases (`crthu/cworker`) 手动拉包自升级；自动感知系统代理与环境变量；有 RUNNING 活跃任务时严格报错拦截（除非 `--force`）；原地 Rename-Replace 无锁替换并重启服务 |
 | `cw version` / `cw -v` | 查看当前软件版本号、构建日期与 Go 运行环境 |

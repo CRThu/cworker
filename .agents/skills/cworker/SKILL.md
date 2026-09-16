@@ -38,9 +38,9 @@ description: >-
 | **Dispatch Job** | `cw run -n <node> [--token <t>] [--dir <dir>] [--name <n>] "<cmd>"` | Dispatches async command; returns `job-<hex>` (PID: `12345`). Valid tokens automatically saved to ledger on success |
 | **List Jobs** | `cw ps [-n <node>] [--all] [--limit <n>]` | Lists jobs across cluster or node (`RUNNING` pinned to top, default 20 recent, `--all` shows all) |
 | **Clean Jobs** | `cw clean <--days <n> \| --all> [-n <node>] [-y]` | Cleans completed/failed/stopped jobs and removes disk logs; protects RUNNING tasks |
-| **Read Logs** | `cw logs <job_id> [-n <lines>]` | Reads trailing lines (default 100) |
-| **Stream Logs** | `cw logs <job_id> -f` | Live WebSocket streaming |
-| **Kill Job** | `cw kill <job_id>` | Win32 Job Object tree termination |
+| **Read Logs** | `cw logs [<node>:]<job_id> [--node <node>] [-n <lines>]` | Reads trailing lines (default 100); supports direct node targeting or cluster discovery |
+| **Stream Logs** | `cw logs [<node>:]<job_id> [--node <node>] -f` | Live WebSocket streaming; supports direct node targeting |
+| **Kill Job** | `cw kill [<node>:]<job_id> [-n <node>]` | Win32 Job Object tree termination; supports direct node targeting or cluster broadcast |
 | **Copy File/Dir** | `cw cp [-r] [-j <n>] [<node>:]<src> [<node>:]<dest>` | Supports `local <-> remote`, `remote <-> remote`, `local <-> local` (auto mkdir, `-r` recursive, `-j` concurrency) |
 | **Diff File/Dir** | `cw diff [-r] [--limit <n>] [--all] [<node>:]<src> [<node>:]<dest>` | Cross-node or local SHA-256 diff (omits matched; truncates large diffs >50; exit 0: match, 1: diff, 2: err) |
 | **Read File** | `cw cat [<node>:]<path>` | Prints remote or local text file directly to stdout |
@@ -63,8 +63,10 @@ cw run -n desktop-4090 --dir "D:/workspace" "python train.py"
 # 2. Poll status until COMPLETED or FAILED
 cw ps
 
-# 3. If FAILED, inspect trailing logs for root cause
-cw logs job-1a2b3c4d -n 100
+# 3. If FAILED, inspect trailing logs for root cause (direct node targeting recommended)
+cw logs desktop-4090:job-1a2b3c4d -n 100
+# Or omit node to search across the entire cluster:
+# cw logs job-1a2b3c4d -n 100
 ```
 
 ### Pattern 2: Remote File Staging & Cleanup
@@ -85,9 +87,11 @@ cw rm -r -y desktop-4090:D:/tmp/work
 
 ### Pattern 3: Runaway Process Termination
 ```bash
-# Inspect high CPU tasks and terminate whole process tree
+# Inspect high CPU tasks and terminate whole process tree (direct node targeting recommended)
 cw ps
-cw kill job-1a2b3c4d
+cw kill desktop-4090:job-1a2b3c4d
+# Or omit node to broadcast kill across the entire cluster:
+# cw kill job-1a2b3c4d
 ```
 
 ### Pattern 4: Pre-flight Diff Verification & Selective Sync

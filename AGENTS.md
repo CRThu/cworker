@@ -87,8 +87,15 @@ cw ps -n <node_name>
 ### 4. 日志审计与故障诊断
 若任务出现 `FAILED` 或 Agent 需要提取任务输出：
 ```bash
-# 获取末尾 100 行日志
+# 获取末尾 100 行日志 (全集群自动漫游探测)
 cw logs job-1a2b3c4d -n 100
+
+# 或指定节点定向直连 (推荐：跳过全集群发现，毫秒级直连返回，网络开销最小)
+cw logs DESKTOP-4090:job-1a2b3c4d -n 100
+# 亦可通过标志指定：cw logs --node DESKTOP-4090 job-1a2b3c4d -n 100
+
+# 终止任务同理支持定向节点 (跳过全网广播，精准查杀整棵进程树)
+cw kill DESKTOP-4090:job-1a2b3c4d
 ```
 
 ### 5. 文件传输与远程清理

@@ -1842,6 +1842,166 @@ func TestClient_ListJobs_TargetFilter(t *testing.T) {
 	}
 }
 
+func TestClient_ListJobs_NodeNormalization(t *testing.T) {
+	// 模拟远程 Worker 返回其内部物理主机名
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode([]protocol.JobInfo{
+			{
+				ID:      "job-test-norm",
+				Node:    "RAW-WORKER-HOSTNAME", // Worker 自报主机名
+				Command: "echo test",
+				Status:  protocol.JobStatusCompleted,
+			},
+		})
+	}))
+	defer s.Close()
+
+	tempDir := t.TempDir()
+	cli := NewClient()
+	cli.dataDir = tempDir
+
+	_ = cli.SaveKnownNode(protocol.KnownNode{
+		Name:   "canonical-node",
+		Target: strings.TrimPrefix(s.URL, "http://"),
+		Token:  "valid-token",
+	})
+
+	// 1. 定向查询
+	jobs, err := cli.ListJobs("canonical-node")
+	if err != nil {
+		t.Fatalf("ListJobs failed: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("expected 1 job, got %d", len(jobs))
+	}
+	if jobs[0].Node != "canonical-node" {
+		t.Errorf("expected job.Node to be normalized to 'canonical-node', got '%s'", jobs[0].Node)
+	}
+
+	// 2. 全集群查询
+	clusterJobs, err := cli.ListJobs()
+	if err != nil {
+		t.Fatalf("ListJobs cluster failed: %v", err)
+	}
+	if len(clusterJobs) != 1 {
+		t.Fatalf("expected 1 cluster job, got %d", len(clusterJobs))
+	}
+	if clusterJobs[0].Node != "canonical-node" {
+		t.Errorf("expected cluster job.Node to be normalized to 'canonical-node', got '%s'", clusterJobs[0].Node)
+	}
+}
+
+func TestClient_ResolveTargetForJob_Strict(t *testing.T) {
+	tempDir := t.TempDir()
+	cli := NewClient()
+	cli.dataDir = tempDir
+
+	_ = cli.SaveKnownNode(protocol.KnownNode{
+		Name:   "carrot-work",
+		Target: "100.93.237.16:19000",
+		Token:  "token-secret",
+	})
+
+	// 1. 精确匹配账本节点 (支持大小写忽略)
+	rt, err := cli.resolveTargetForJob("CARROT-WORK", "job-1")
+	if err != nil {
+		t.Fatalf("resolveTargetForJob failed: %v", err)
+	}
+	if rt.Name != "carrot-work" || rt.Token != "token-secret" {
+		t.Errorf("unexpected rt: %+v", rt)
+	}
+
+	// 2. 未在账本中的节点，拒绝静默兜底，必须显式报错
+	_, err = cli.resolveTargetForJob("unknown-node", "job-1")
+	if err == nil {
+		t.Fatal("expected error for unknown node, got nil")
+	}
+	if !strings.Contains(err.Error(), "not found in known nodes ledger") {
+		t.Errorf("expected 'not found in known nodes ledger' error, got: %v", err)
+	}
+}
+
+func TestClient_KillJobNode(t *testing.T) {
+	var killedID string
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/jobs/kill" {
+			var req protocol.KillJobRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			killedID = req.JobID
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(protocol.JobInfo{
+				ID:     req.JobID,
+				Node:   "RAW-HOST",
+				Status: protocol.JobStatusStopped,
+			})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer s.Close()
+
+	tempDir := t.TempDir()
+	cli := NewClient()
+	cli.dataDir = tempDir
+
+	_ = cli.SaveKnownNode(protocol.KnownNode{
+		Name:   "kill-target",
+		Target: strings.TrimPrefix(s.URL, "http://"),
+		Token:  "token-kill",
+	})
+
+	info, err := cli.KillJobNode("kill-target", "job-target-99")
+	if err != nil {
+		t.Fatalf("KillJobNode failed: %v", err)
+	}
+	if killedID != "job-target-99" {
+		t.Errorf("expected killed job ID 'job-target-99', got '%s'", killedID)
+	}
+	if info.Node != "kill-target" {
+		t.Errorf("expected info.Node normalized to 'kill-target', got '%s'", info.Node)
+	}
+}
+
+func TestClient_RunJob_NodeNormalization(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/jobs/run" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(protocol.JobInfo{
+				ID:      "job-run-norm",
+				Node:    "RAW-WORKER-INTERNAL-HOST",
+				Command: "ping 127.0.0.1",
+				Status:  protocol.JobStatusRunning,
+			})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer s.Close()
+
+	tempDir := t.TempDir()
+	cli := NewClient()
+	cli.dataDir = tempDir
+
+	_ = cli.SaveKnownNode(protocol.KnownNode{
+		Name:   "run-target",
+		Target: strings.TrimPrefix(s.URL, "http://"),
+		Token:  "token-run",
+	})
+
+	info, err := cli.RunJob(protocol.RunJobRequest{
+		Node:    "run-target",
+		Command: "ping 127.0.0.1",
+	}, "")
+	if err != nil {
+		t.Fatalf("RunJob failed: %v", err)
+	}
+	if info.Node != "run-target" {
+		t.Errorf("expected info.Node normalized to 'run-target', got '%s'", info.Node)
+	}
+}
+
+
 
 
 

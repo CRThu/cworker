@@ -57,6 +57,8 @@ export interface OverviewData {
   online_count: number;
   active_jobs: number;
   avg_cpu: number;
+  total_cpu_cores?: number;
+  total_used_cpu_percent?: number;
   total_free_mem_mb: number;
   total_mem_mb?: number;
   nodes: NodeInfo[];

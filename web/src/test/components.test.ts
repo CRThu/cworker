@@ -170,7 +170,7 @@ describe('NodesView component layout and interactions', () => {
     expect(secondRowActions?.textContent).toContain('移除');
   });
 
-  it('should format available and total memory in 26.0G / 31.6G format', () => {
+  it('should format used and total memory in usedG / totalG format (e.g. 16.0G / 32.0G)', () => {
     const { container } = render(NodesView, {
       props: {
         nodes: mockNodes,
@@ -179,8 +179,8 @@ describe('NodesView component layout and interactions', () => {
           online_count: 1,
           active_jobs: 2,
           avg_cpu: 15.0,
-          total_free_mem_mb: 26624,
-          total_mem_mb: 32358,
+          total_free_mem_mb: 16384,
+          total_mem_mb: 32768,
           nodes: mockNodes,
           local_card: { name: 'local', ip: '127.0.0.1', port: 19000, token: '' },
         },
@@ -188,10 +188,88 @@ describe('NodesView component layout and interactions', () => {
     });
 
     const statCards = container.querySelectorAll('.stat-card');
-    const memCard = Array.from(statCards).find(c => c.querySelector('.stat-label')?.textContent?.includes('可用内存'));
+    const memCard = Array.from(statCards).find(c => c.querySelector('.stat-label')?.textContent?.trim() === '内存');
     expect(memCard).toBeDefined();
-    expect(memCard?.querySelector('.stat-value')?.textContent?.trim()).toBe('26.0G / 31.6G');
-    expect(memCard?.querySelector('.stat-sub')?.textContent?.trim()).toBe('可分配 / 总量');
+    // mockNodes has 1 ONLINE node with mem_total_mb: 32768, mem_free_mb: 16384 -> used 16384MB = 16.0G / 32.0G
+    expect(memCard?.querySelector('.stat-value')?.textContent?.trim()).toBe('16.0G / 32.0G');
+    expect(memCard?.querySelector('.stat-sub')?.textContent?.trim()).toBe('占用 / 总量');
+  });
+
+  it('should format CPU stat card in used% / total% format (e.g. 400% / 2500%) when cores are available', () => {
+    const multiCoreNodes: any[] = [
+      {
+        name: 'NODE-16C',
+        address: '100.93.237.16:19000',
+        status: 'ONLINE',
+        active_jobs: 1,
+        metrics: { cpu_percent: 15.0, cpu_cores: 16, mem_total_mb: 32768, mem_free_mb: 16384 },
+      },
+      {
+        name: 'NODE-9C',
+        address: '100.93.237.17:19000',
+        status: 'ONLINE',
+        active_jobs: 1,
+        metrics: { cpu_percent: 17.78, cpu_cores: 9, mem_total_mb: 16384, mem_free_mb: 8192 },
+      },
+    ];
+
+    const { container } = render(NodesView, {
+      props: {
+        nodes: multiCoreNodes,
+        overview: {
+          nodes_count: 2,
+          online_count: 2,
+          active_jobs: 2,
+          avg_cpu: 16.0,
+          total_cpu_cores: 25,
+          total_used_cpu_percent: 400.0,
+          total_free_mem_mb: 24576,
+          total_mem_mb: 49152,
+          nodes: multiCoreNodes,
+          local_card: { name: 'local', ip: '127.0.0.1', port: 19000, token: '' },
+        },
+      },
+    });
+
+    const statCards = container.querySelectorAll('.stat-card');
+    const cpuCard = Array.from(statCards).find(c => c.querySelector('.stat-label')?.textContent?.trim() === 'CPU');
+    expect(cpuCard).toBeDefined();
+    expect(cpuCard?.querySelector('.stat-value')?.textContent?.trim()).toBe('400% / 2500%');
+    expect(cpuCard?.querySelector('.stat-sub')?.textContent?.trim()).toBe('负载 / 总量');
+  });
+
+  it('should fall back to single percentage and 在线均值 on CPU card when cores are not provided', () => {
+    const legacyNodes: any[] = [
+      {
+        name: 'NODE-LEGACY',
+        address: '100.93.237.16:19000',
+        status: 'ONLINE',
+        active_jobs: 0,
+        metrics: { cpu_percent: 15.0, mem_total_mb: 8192, mem_free_mb: 4096 },
+      },
+    ];
+
+    const { container } = render(NodesView, {
+      props: {
+        nodes: legacyNodes,
+        overview: {
+          nodes_count: 1,
+          online_count: 1,
+          active_jobs: 0,
+          avg_cpu: 15.0,
+          total_free_mem_mb: 4096,
+          total_mem_mb: 8192,
+          nodes: legacyNodes,
+          local_card: { name: 'local', ip: '127.0.0.1', port: 19000, token: '' },
+        },
+      },
+    });
+
+    const statCards = container.querySelectorAll('.stat-card');
+    const cpuCard = Array.from(statCards).find(c => c.querySelector('.stat-label')?.textContent?.trim() === 'CPU');
+    expect(cpuCard).toBeDefined();
+    expect(cpuCard?.querySelector('.stat-value')?.textContent?.trim()).toBe('15.0%');
+    expect(cpuCard?.querySelector('.stat-sub')?.textContent?.trim()).toBe('在线均值');
   });
 
   it('should render friendly empty state message when nodes list is empty', () => {
@@ -453,6 +531,87 @@ describe('RunJobModal with directory browse', () => {
     // 点击取消
     const cancelBtn = container.querySelector('.modal-footer .btn-secondary') as HTMLButtonElement;
     await fireEvent.click(cancelBtn);
+    expect(closed).toBe(true);
+  });
+
+  it('should support multi-node selection and dispatch multiple nodes in payload', async () => {
+    let submitted: any = null;
+    const { container, getByText } = render(RunJobModal, {
+      props: {
+        open: true,
+        nodes: [
+          { name: 'worker-1', address: '127.0.0.1:19000', status: 'ONLINE', active_jobs: 0 },
+          { name: 'worker-2', address: '127.0.0.1:19001', status: 'ONLINE', active_jobs: 0 },
+        ],
+        onSubmit: (p: any) => { submitted = p; },
+      },
+    });
+
+    // 验证 MultiSelect 组件已挂载
+    const multiSelect = container.querySelector('.multiselect-container');
+    expect(multiSelect).not.toBeNull();
+
+    // 点击下拉展开
+    const trigger = container.querySelector('.multiselect-trigger') as HTMLButtonElement;
+    await fireEvent.click(trigger);
+
+    // 点击 "全选"
+    const selectAllBtn = getByText('全选');
+    await fireEvent.click(selectAllBtn);
+
+    // 输入命令
+    const cmdInput = container.querySelector('#run-job-cmd') as HTMLInputElement;
+    await fireEvent.input(cmdInput, { target: { value: 'pytest test/' } });
+
+    // 提交
+    const form = container.querySelector('form') as HTMLFormElement;
+    await fireEvent.submit(form);
+
+    expect(submitted).not.toBeNull();
+    expect(submitted.nodes).toEqual(['worker-1', 'worker-2']);
+    expect(submitted.command).toBe('pytest test/');
+  });
+
+  it('should disable submit button when no node is selected or command is empty', async () => {
+    const { container, getByText } = render(RunJobModal, {
+      props: {
+        open: true,
+        nodes: [
+          { name: 'worker-1', address: '127.0.0.1:19000', status: 'ONLINE', active_jobs: 0 },
+        ],
+      },
+    });
+
+    const submitBtn = container.querySelector('button[type="submit"]') as HTMLButtonElement;
+    // 命令为空时禁用
+    expect(submitBtn.disabled).toBe(true);
+
+    // 输入命令
+    const cmdInput = container.querySelector('#run-job-cmd') as HTMLInputElement;
+    await fireEvent.input(cmdInput, { target: { value: 'dir' } });
+    expect(submitBtn.disabled).toBe(false);
+
+    // 展开下拉并清空选中节点
+    const trigger = container.querySelector('.multiselect-trigger') as HTMLButtonElement;
+    await fireEvent.click(trigger);
+    const clearBtn = getByText('清空');
+    await fireEvent.click(clearBtn);
+
+    // 节点为空时禁用
+    expect(submitBtn.disabled).toBe(true);
+  });
+
+  it('should close RunJobModal on Escape key press', async () => {
+    let closed = false;
+    render(RunJobModal, {
+      props: {
+        open: true,
+        nodes: [{ name: 'worker-1', address: '127.0.0.1:19000', status: 'ONLINE', active_jobs: 0 }],
+        onClose: () => { closed = true; },
+      },
+    });
+
+    await fireEvent.keyDown(window, { key: 'Escape' });
     expect(closed).toBe(true);
   });
 });

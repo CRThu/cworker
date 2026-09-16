@@ -62,11 +62,59 @@ export async function runJob(data: {
   return handleResponse<JobInfo>(res);
 }
 
-export async function killJob(jobId: string): Promise<JobInfo> {
+export interface DispatchResult {
+  succeeded: JobInfo[];
+  failed: { node: string; error: string }[];
+}
+
+// dispatchJob 支持单节点或多节点并发派发任务，收集成功与失败详情，确保错误隔离
+export async function dispatchJob(data: {
+  nodes?: string[];
+  node?: string;
+  name?: string;
+  dir?: string;
+  command: string;
+  token?: string;
+}): Promise<DispatchResult> {
+  const targetNodes = data.nodes && data.nodes.length > 0
+    ? data.nodes
+    : [data.node || ''];
+
+  const results = await Promise.allSettled(
+    targetNodes.map(node =>
+      runJob({
+        node,
+        name: data.name,
+        dir: data.dir,
+        command: data.command,
+        token: data.token,
+      })
+    )
+  );
+
+  const succeeded: JobInfo[] = [];
+  const failed: { node: string; error: string }[] = [];
+
+  results.forEach((res, idx) => {
+    const nodeName = targetNodes[idx] || 'local';
+    if (res.status === 'fulfilled') {
+      succeeded.push(res.value);
+    } else {
+      failed.push({
+        node: nodeName,
+        error: res.reason?.message || String(res.reason),
+      });
+    }
+  });
+
+  return { succeeded, failed };
+}
+
+export async function killJob(jobId: string, node?: string): Promise<JobInfo> {
   const res = await fetch('/api/ui/jobs/kill', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ job_id: jobId }),
+    body: JSON.stringify({ job_id: jobId, node }),
   });
   return handleResponse<JobInfo>(res);
 }

@@ -92,6 +92,7 @@ type RunJobRequest struct {
 // KillJobRequest 任务终止请求
 type KillJobRequest struct {
 	JobID string `json:"job_id"`
+	Node  string `json:"node,omitempty"`
 }
 
 // CleanJobsRequest 任务与日志清理请求

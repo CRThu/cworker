@@ -23,13 +23,35 @@
     return map;
   })();
 
-  $: totalFreeMemMB = (overview?.total_free_mem_mb && overview.total_free_mem_mb > 0)
-    ? overview.total_free_mem_mb
-    : nodes.filter(n => n.status === 'ONLINE').reduce((sum, n) => sum + (n.metrics?.mem_free_mb || 0), 0);
+  $: onlineNodes = nodes.filter(n => n.status === 'ONLINE');
 
-  $: totalMemMB = (overview?.total_mem_mb && overview.total_mem_mb > 0)
-    ? overview.total_mem_mb
-    : nodes.filter(n => n.status === 'ONLINE').reduce((sum, n) => sum + (n.metrics?.mem_total_mb || 0), 0);
+  // 计算集群聚合内存数据 (占用 / 总量)
+  $: totalMemMB = onlineNodes.length > 0
+    ? onlineNodes.reduce((sum, n) => sum + (n.metrics?.mem_total_mb || 0), 0)
+    : (overview?.total_mem_mb || 0);
+
+  $: totalUsedMemMB = onlineNodes.length > 0
+    ? onlineNodes.reduce((sum, n) => sum + Math.max(0, (n.metrics?.mem_total_mb || 0) - (n.metrics?.mem_free_mb || 0)), 0)
+    : ((overview?.total_mem_mb && overview?.total_free_mem_mb) ? Math.max(0, overview.total_mem_mb - overview.total_free_mem_mb) : 0);
+
+  // 计算集群聚合 CPU 核心与算力负荷 (负载 / 总量，以当前表格各节点整型占用为单一事实来源严格累加)
+  $: totalCores = onlineNodes.length > 0
+    ? onlineNodes.reduce((sum, n) => sum + (n.metrics?.cpu_cores || 0), 0)
+    : (overview?.total_cpu_cores || 0);
+
+  $: totalUsedCpuPercent = onlineNodes.length > 0
+    ? onlineNodes.reduce((sum, n) => {
+        const cores = n.metrics?.cpu_cores || 0;
+        const cpu = n.metrics?.cpu_percent || 0;
+        return sum + (cores > 0 ? Math.round(cpu * cores) : Math.round(cpu));
+      }, 0)
+    : (overview?.total_used_cpu_percent !== undefined ? Math.round(overview.total_used_cpu_percent) : 0);
+
+  $: clusterCpuStr = totalCores > 0
+    ? `${totalUsedCpuPercent}% / ${totalCores * 100}%`
+    : (onlineNodes.length > 0
+        ? `${(onlineNodes.reduce((sum, n) => sum + (n.metrics?.cpu_percent || 0), 0) / onlineNodes.length).toFixed(1)}%`
+        : `${(overview?.avg_cpu || 0).toFixed(1)}%`);
 
   function openAddModal() {
     dispatch('openAddNode');
@@ -55,24 +77,26 @@
     <div class="stat-card">
       <div class="stat-label">总节点</div>
       <div class="stat-value">{overview?.nodes_count || nodes.length}</div>
-      <div class="stat-sub">{overview?.online_count || 0} 在线</div>
+      <div class="stat-sub">{overview?.online_count || onlineNodes.length} 在线</div>
     </div>
     <div class="stat-card">
       <div class="stat-label">活跃任务</div>
-      <div class="stat-value text-primary">{overview?.active_jobs || 0}</div>
+      <div class="stat-value text-primary">{overview?.active_jobs || nodes.reduce((sum, n) => sum + (n.active_jobs || 0), 0)}</div>
       <div class="stat-sub">运行中</div>
     </div>
     <div class="stat-card">
-      <div class="stat-label">平均 CPU</div>
-      <div class="stat-value">{(overview?.avg_cpu || 0).toFixed(1)}%</div>
-      <div class="stat-sub">在线均值</div>
+      <div class="stat-label">CPU</div>
+      <div class="stat-value">
+        {#if totalCores > 0}{totalUsedCpuPercent}%{' '}<span class="stat-secondary">/ {totalCores * 100}%</span>{:else}{clusterCpuStr}{/if}
+      </div>
+      <div class="stat-sub">{totalCores > 0 ? '负载 / 总量' : '在线均值'}</div>
     </div>
     <div class="stat-card">
-      <div class="stat-label">可用内存</div>
+      <div class="stat-label">内存</div>
       <div class="stat-value">
-        {(totalFreeMemMB / 1024).toFixed(1)}G{totalMemMB > 0 ? ` / ${(totalMemMB / 1024).toFixed(1)}G` : ''}
+        {(totalUsedMemMB / 1024).toFixed(1)}G{#if totalMemMB > 0}{' '}<span class="stat-secondary">/ {(totalMemMB / 1024).toFixed(1)}G</span>{/if}
       </div>
-      <div class="stat-sub">可分配 / 总量</div>
+      <div class="stat-sub">占用 / 总量</div>
     </div>
   </div>
 
@@ -209,29 +233,50 @@
     gap: 20px;
     width: 100%;
   }
+  /* 顶层度量卡片矩阵：采用严格 4 列等分并设置响应式断点，彻底杜绝 auto-fit 导致的 3+1 单卡片落单拉伸 */
   .stats-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    grid-template-columns: repeat(4, minmax(0, 1fr));
     gap: 14px;
+  }
+  @media (max-width: 860px) {
+    .stats-grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+  }
+  @media (max-width: 520px) {
+    .stats-grid {
+      grid-template-columns: 1fr;
+    }
   }
   .stat-card {
     background: var(--bg-surface);
     border: 1px solid var(--border);
     border-radius: 8px;
-    padding: 16px 18px;
+    padding: 14px 16px;
     box-shadow: var(--shadow-sm);
+    min-width: 0;
   }
   .stat-label {
     font-size: 12px;
     color: var(--text-dim);
     font-weight: 500;
   }
+  /* 核心指标值：强制单行不换行并设置截断防御，分母提取为次级字阶以大幅缩短渲染宽度 */
   .stat-value {
-    font-size: 26px;
+    font-size: 22px;
     font-weight: 700;
     color: var(--text-main);
     margin: 4px 0 2px;
-    line-height: 1.1;
+    line-height: 1.15;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .stat-secondary {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-muted);
   }
   .text-primary {
     color: var(--primary);

@@ -154,9 +154,22 @@ func (c *Client) ResolveWorker(targetName string, explicitToken string) (*Resolv
 			targetStr = known.Target
 			token = known.Token
 		} else {
-			// 未在账本中的新目标：直接将其作为 targetStr
-			nodeName = targetName
-			targetStr = targetName
+			// 遍历账本按 Name 或 Target 模糊匹配
+			found := false
+			for _, kn := range nodes {
+				if strings.EqualFold(kn.Name, targetName) || strings.EqualFold(kn.Target, targetName) {
+					nodeName = kn.Name
+					targetStr = kn.Target
+					token = kn.Token
+					found = true
+					break
+				}
+			}
+			if !found {
+				// 未在账本中的新目标：直接将其作为 targetStr
+				nodeName = targetName
+				targetStr = targetName
+			}
 		}
 	}
 
@@ -329,6 +342,9 @@ func (c *Client) RunJob(req protocol.RunJobRequest, explicitToken string) (*prot
 	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
 		return nil, err
 	}
+	if rt.Name != "" {
+		info.Node = rt.Name
+	}
 
 	// 契约闭环：若显式指定了 Token 且派发成功，自动记忆入账
 	if explicitToken != "" && rt.Name != "" {
@@ -378,6 +394,11 @@ func (c *Client) ListJobs(targetNode ...string) ([]protocol.JobInfo, error) {
 		if err := json.NewDecoder(resp.Body).Decode(&jobs); err != nil {
 			return nil, err
 		}
+		for i := range jobs {
+			if rt.Name != "" {
+				jobs[i].Node = rt.Name
+			}
+		}
 		sort.Slice(jobs, func(i, j int) bool {
 			return jobs[i].StartTime.After(jobs[j].StartTime)
 		})
@@ -411,6 +432,11 @@ func (c *Client) ListJobs(targetNode ...string) ([]protocol.JobInfo, error) {
 			if resp.StatusCode == http.StatusOK {
 				var jobs []protocol.JobInfo
 				if err := json.NewDecoder(resp.Body).Decode(&jobs); err == nil {
+					for i := range jobs {
+						if kn.Name != "" {
+							jobs[i].Node = kn.Name
+						}
+					}
 					mu.Lock()
 					allJobs = append(allJobs, jobs...)
 					mu.Unlock()
@@ -426,7 +452,36 @@ func (c *Client) ListJobs(targetNode ...string) ([]protocol.JobInfo, error) {
 	return allJobs, nil
 }
 
-// KillJob 终止任务
+// KillJobNode 定向终止指定节点上的任务 (单点直达，避免全集群广播开销)
+func (c *Client) KillJobNode(node string, jobID string) (*protocol.JobInfo, error) {
+	rt, err := c.resolveTargetForJob(node, jobID)
+	if err != nil {
+		return nil, err
+	}
+
+	data, _ := json.Marshal(protocol.KillJobRequest{JobID: jobID})
+	resp, err := c.doRequest(rt, http.MethodPost, "/api/v1/jobs/kill", bytes.NewReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("kill job on node '%s' failed: %w", node, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("kill job on node '%s' failed (%d): %s", node, resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var info protocol.JobInfo
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		return nil, err
+	}
+	if rt.Name != "" {
+		info.Node = rt.Name
+	}
+	return &info, nil
+}
+
+// KillJob 终止任务 (未指定节点时全集群广播探测)
 func (c *Client) KillJob(jobID string) (*protocol.JobInfo, error) {
 	knownNodes, err := c.LoadKnownNodes()
 	if err != nil {
@@ -456,6 +511,9 @@ func (c *Client) KillJob(jobID string) (*protocol.JobInfo, error) {
 			if resp.StatusCode == http.StatusOK {
 				var info protocol.JobInfo
 				if err := json.NewDecoder(resp.Body).Decode(&info); err == nil {
+					if node.Name != "" {
+						info.Node = node.Name
+					}
 					mu.Lock()
 					foundInfo = &info
 					mu.Unlock()
@@ -546,11 +604,22 @@ func (c *Client) CleanJobs(targetNode string, days int, all bool) (map[string]pr
 
 func (c *Client) resolveTargetForJob(node string, jobID string) (*ResolvedTarget, error) {
 	if node != "" {
-		knownNodes, _ := c.LoadKnownNodes()
-		if kn, ok := knownNodes[strings.ToLower(node)]; ok {
-			return c.ResolveWorker(kn.Name, kn.Token)
+		knownNodes, err := c.LoadKnownNodes()
+		if err == nil {
+			if kn, ok := knownNodes[strings.ToLower(node)]; ok {
+				return c.ResolveWorker(kn.Name, kn.Token)
+			}
+			for _, kn := range knownNodes {
+				if strings.EqualFold(kn.Name, node) || strings.EqualFold(kn.Target, node) {
+					return c.ResolveWorker(kn.Name, kn.Token)
+				}
+			}
 		}
-		return c.ResolveWorker(node, "")
+		// 若确实未在账本中，但输入的是显式 IP:端口 或 hostname:端口，允许直连
+		if strings.Contains(node, ":") {
+			return c.ResolveWorker(node, "")
+		}
+		return nil, fmt.Errorf("node '%s' not found in known nodes ledger", node)
 	}
 	return c.findJobWorker(jobID)
 }

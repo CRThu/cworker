@@ -157,6 +157,40 @@ describe('LogTerminal real-time log streaming and retention', () => {
     // 验证发起了新的 WebSocket 连接
     expect(MockWebSocket.instances.length).toBe(2);
   });
+
+  it('should trigger close on Escape key press when open', async () => {
+    let closed = false;
+    render(LogTerminal, {
+      props: {
+        open: true,
+        jobId: 'job-test-esc',
+        status: 'RUNNING',
+        onClose: () => {
+          closed = true;
+        },
+      },
+    });
+
+    await fireEvent.keyDown(window, { key: 'Escape' });
+    expect(closed).toBe(true);
+  });
+
+  it('should not trigger close on Escape key press when closed', async () => {
+    let closed = false;
+    render(LogTerminal, {
+      props: {
+        open: false,
+        jobId: 'job-test-esc-closed',
+        status: 'RUNNING',
+        onClose: () => {
+          closed = true;
+        },
+      },
+    });
+
+    await fireEvent.keyDown(window, { key: 'Escape' });
+    expect(closed).toBe(false);
+  });
 });
 
 describe('JobsView filtering, status pills and action dispatches', () => {

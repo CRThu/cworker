@@ -301,6 +301,58 @@ func TestServer_HandleKillJob_Validation(t *testing.T) {
 	}
 }
 
+func TestServer_HandleKillJob_WithNode(t *testing.T) {
+	srv, _, cleanup := setupTestEnv(t)
+	defer cleanup()
+
+	var killedID string
+	workerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/jobs/kill" {
+			var req protocol.KillJobRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			killedID = req.JobID
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(protocol.JobInfo{
+				ID:     req.JobID,
+				Node:   "RAW-HOST",
+				Status: protocol.JobStatusStopped,
+			})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer workerSrv.Close()
+
+	_ = srv.cli.SaveKnownNode(protocol.KnownNode{
+		Name:   "target-worker",
+		Target: strings.TrimPrefix(workerSrv.URL, "http://"),
+		Token:  "test-token",
+	})
+
+	handler := srv.Handler()
+
+	// 1. 带 node 定向终止
+	reqBody := `{"job_id":"job-kill-123","node":"target-worker"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/ui/jobs/kill", strings.NewReader(reqBody))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d (body: %s)", w.Code, w.Body.String())
+	}
+	if killedID != "job-kill-123" {
+		t.Fatalf("expected killed job ID 'job-kill-123', got %s", killedID)
+	}
+
+	var info protocol.JobInfo
+	if err := json.Unmarshal(w.Body.Bytes(), &info); err != nil {
+		t.Fatalf("decode response failed: %v", err)
+	}
+	if info.Node != "target-worker" {
+		t.Fatalf("expected info.Node 'target-worker', got %s", info.Node)
+	}
+}
+
 func TestServer_HandleCleanJobs_Validation(t *testing.T) {
 	srv, _, cleanup := setupTestEnv(t)
 	defer cleanup()
@@ -1519,6 +1571,12 @@ func TestServer_HandleOverview_WithCPUCores(t *testing.T) {
 	}
 	if overview.Nodes[0].Metrics.CPUPercent != 12.5 {
 		t.Fatalf("expected CPUPercent 12.5, got %f", overview.Nodes[0].Metrics.CPUPercent)
+	}
+	if overview.TotalCPUCores != 16 {
+		t.Fatalf("expected TotalCPUCores 16, got %d", overview.TotalCPUCores)
+	}
+	if overview.TotalUsedCPUPercent != 200.0 {
+		t.Fatalf("expected TotalUsedCPUPercent 200.0, got %f", overview.TotalUsedCPUPercent)
 	}
 
 	// 验证 /api/ui/nodes 接口同样返回 SSOT 对齐的物理通信地址

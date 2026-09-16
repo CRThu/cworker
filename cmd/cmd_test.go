@@ -554,28 +554,52 @@ func TestCmd_Commands_WithMockServer(t *testing.T) {
 		t.Fatalf("unexpected md output: %s", mdOut)
 	}
 
-	// 5. 测试 killCmd.RunE
+	// 5. 测试 killCmd.RunE (定向节点与无节点调用)
 	killOut, err := captureStdout(func() error {
-		return killCmd.RunE(killCmd, []string{"job-mock1"})
+		return killCmd.RunE(killCmd, []string{"mock-node:job-mock1"})
 	})
 	if err != nil {
-		t.Fatalf("killCmd.RunE failed: %v", err)
+		t.Fatalf("killCmd.RunE with node:job_id failed: %v", err)
 	}
 	if !strings.Contains(killOut, "[OK] Job job-mock1 terminated") {
 		t.Fatalf("unexpected kill output: %s", killOut)
 	}
 
-	// 6. 测试 logsCmd.RunE
+	killNode = "mock-node"
+	killOutFlag, err := captureStdout(func() error {
+		return killCmd.RunE(killCmd, []string{"job-mock1"})
+	})
+	killNode = ""
+	if err != nil {
+		t.Fatalf("killCmd.RunE with --node flag failed: %v", err)
+	}
+	if !strings.Contains(killOutFlag, "[OK] Job job-mock1 terminated") {
+		t.Fatalf("unexpected kill output: %s", killOutFlag)
+	}
+
+	// 6. 测试 logsCmd.RunE (定向节点与无节点探测)
 	logsLines = 10
 	logsFollow = false
 	logsOut, err := captureStdout(func() error {
-		return logsCmd.RunE(logsCmd, []string{"job-mock1"})
+		return logsCmd.RunE(logsCmd, []string{"mock-node:job-mock1"})
 	})
 	if err != nil {
-		t.Fatalf("logsCmd.RunE failed: %v", err)
+		t.Fatalf("logsCmd.RunE with node:job_id failed: %v", err)
 	}
 	if !strings.Contains(logsOut, "log line 1") {
 		t.Fatalf("unexpected logs output: %s", logsOut)
+	}
+
+	logsNode = "mock-node"
+	logsOutFlag, err := captureStdout(func() error {
+		return logsCmd.RunE(logsCmd, []string{"job-mock1"})
+	})
+	logsNode = ""
+	if err != nil {
+		t.Fatalf("logsCmd.RunE with --node flag failed: %v", err)
+	}
+	if !strings.Contains(logsOutFlag, "log line 1") {
+		t.Fatalf("unexpected logs output: %s", logsOutFlag)
 	}
 
 	// 7. 测试 nodeCmd.RunE 及 nodeLsCmd.RunE (混合集群排版：同时验证在线与离线节点的 Address SSOT 展示)

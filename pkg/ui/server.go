@@ -5,10 +5,12 @@ import (
 	"crypto/rand"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -178,16 +180,18 @@ func (s *Server) Close() error {
 
 // OverviewData 概览聚合结构
 type OverviewData struct {
-	Version         string               `json:"version"`
-	BuildDate       string               `json:"build_date"`
-	NodesCount      int                  `json:"nodes_count"`
-	OnlineCount     int                  `json:"online_count"`
-	ActiveJobs      int                  `json:"active_jobs"`
-	AvgCPU          float64              `json:"avg_cpu"`
-	TotalFreeMemMB  uint64               `json:"total_free_mem_mb"`
-	TotalMemMB      uint64               `json:"total_mem_mb"`
-	Nodes           []protocol.NodeInfo  `json:"nodes"`
-	LocalCard       LocalCardInfo        `json:"local_card"`
+	Version             string              `json:"version"`
+	BuildDate           string              `json:"build_date"`
+	NodesCount          int                 `json:"nodes_count"`
+	OnlineCount         int                 `json:"online_count"`
+	ActiveJobs          int                 `json:"active_jobs"`
+	AvgCPU              float64             `json:"avg_cpu"`
+	TotalCPUCores       int                 `json:"total_cpu_cores"`
+	TotalUsedCPUPercent float64             `json:"total_used_cpu_percent"`
+	TotalFreeMemMB      uint64              `json:"total_free_mem_mb"`
+	TotalMemMB          uint64              `json:"total_mem_mb"`
+	Nodes               []protocol.NodeInfo `json:"nodes"`
+	LocalCard           LocalCardInfo       `json:"local_card"`
 }
 
 // LocalCardInfo 本机名片结构
@@ -208,6 +212,8 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 	onlineCount := 0
 	activeJobs := 0
 	var sumCPU float64
+	var totalCPUCores int
+	var totalUsedCPU float64
 	var totalFreeMem uint64
 	var totalMem uint64
 
@@ -218,6 +224,10 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 			sumCPU += n.Metrics.CPUPercent
 			totalFreeMem += n.Metrics.MemFreeMB
 			totalMem += n.Metrics.MemTotalMB
+			if n.Metrics.CPUCores > 0 {
+				totalCPUCores += n.Metrics.CPUCores
+				totalUsedCPU += math.Round(n.Metrics.CPUPercent * float64(n.Metrics.CPUCores))
+			}
 		}
 	}
 
@@ -236,15 +246,17 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := OverviewData{
-		Version:        s.cfg.Version,
-		BuildDate:      protocol.BuildDate,
-		NodesCount:     len(nodes),
-		OnlineCount:    onlineCount,
-		ActiveJobs:     activeJobs,
-		AvgCPU:         avgCPU,
-		TotalFreeMemMB: totalFreeMem,
-		TotalMemMB:     totalMem,
-		Nodes:          nodes,
+		Version:             s.cfg.Version,
+		BuildDate:           protocol.BuildDate,
+		NodesCount:          len(nodes),
+		OnlineCount:         onlineCount,
+		ActiveJobs:          activeJobs,
+		AvgCPU:              avgCPU,
+		TotalCPUCores:       totalCPUCores,
+		TotalUsedCPUPercent: totalUsedCPU,
+		TotalFreeMemMB:      totalFreeMem,
+		TotalMemMB:          totalMem,
+		Nodes:               nodes,
 		LocalCard: LocalCardInfo{
 			Name:  hostname,
 			IP:    "127.0.0.1",
@@ -459,7 +471,13 @@ func (s *Server) handleKillJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	info, err := s.cli.KillJob(req.JobID)
+	var info *protocol.JobInfo
+	var err error
+	if req.Node != "" {
+		info, err = s.cli.KillJobNode(req.Node, req.JobID)
+	} else {
+		info, err = s.cli.KillJob(req.JobID)
+	}
 	if err != nil {
 		http.Error(w, "kill job failed: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -771,8 +789,6 @@ func (s *Server) handleFsTransfer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
-	srcNode, srcPath := req.SrcNode, req.SrcPath
-	dstNode, dstPath := req.DstNode, req.DstPath
 
 	tracker := client.NewProgressTracker(0, 0)
 	tracker.SetTTY(false)
@@ -789,149 +805,24 @@ func (s *Server) handleFsTransfer(w http.ResponseWriter, r *http.Request) {
 		})
 	})
 
-	// 1. 远端到远端中继拷贝
-	if srcNode != "" && dstNode != "" {
-		_, lsErr := s.cli.ListDirWithContext(ctx, srcNode, srcPath)
-		if lsErr == nil {
-			if !req.Recursive {
-				handleTransferError(http.StatusBadRequest, "path is a directory, recursive (-r) flag required")
-				return
-			}
-			if _, err := s.cli.ListDirWithContext(ctx, dstNode, dstPath); err == nil {
-				dstPath = pathutil.JoinRemotePath(dstPath, pathutil.SafeBaseName(srcPath))
-			}
-			if err := s.cli.RelayCopyDir(ctx, srcNode, srcPath, dstNode, dstPath, req.Concurrency, tracker); err != nil {
-				handleTransferError(http.StatusInternalServerError, "relay copy dir failed: "+err.Error())
-				return
-			}
-		} else {
-			if _, err := s.cli.ListDirWithContext(ctx, dstNode, dstPath); err == nil {
-				dstPath = pathutil.JoinRemotePath(dstPath, pathutil.SafeBaseName(srcPath))
-			}
-			tracker.SetTotals(1, 0)
-			tracker.StartFile(pathutil.SafeBaseName(srcPath))
-			err := s.cli.RelayCopyWithContext(ctx, srcNode, srcPath, dstNode, dstPath, tracker)
-			tracker.EndFile(pathutil.SafeBaseName(srcPath))
-			if err != nil {
-				handleTransferError(http.StatusInternalServerError, "relay copy file failed: "+err.Error())
-				return
-			}
-			tracker.AddFile()
-		}
-	} else if srcNode == "" && dstNode != "" {
-		// 2. 本地到远端上传
-		cleanSrc, err := pathutil.NormalizeLocalPath(srcPath)
-		if err != nil {
-			handleTransferError(http.StatusBadRequest, err.Error())
-			return
-		}
-		fi, err := os.Stat(cleanSrc)
-		if err != nil {
-			handleTransferError(http.StatusBadRequest, "local source not found: "+err.Error())
-			return
-		}
-		if fi.IsDir() {
-			if !req.Recursive {
-				handleTransferError(http.StatusBadRequest, "local path is directory, recursive (-r) required")
-				return
-			}
-			if _, err := s.cli.ListDirWithContext(ctx, dstNode, dstPath); err == nil {
-				dstPath = pathutil.JoinRemotePath(dstPath, pathutil.SafeBaseName(cleanSrc))
-			}
-			if err := s.cli.UploadDir(ctx, dstNode, dstPath, cleanSrc, req.Concurrency, tracker); err != nil {
-				handleTransferError(http.StatusInternalServerError, "upload dir failed: "+err.Error())
-				return
-			}
-		} else {
-			f, err := os.Open(cleanSrc)
-			if err != nil {
-				handleTransferError(http.StatusInternalServerError, err.Error())
-				return
-			}
-			defer f.Close()
-			if _, err := s.cli.ListDirWithContext(ctx, dstNode, dstPath); err == nil {
-				dstPath = pathutil.JoinRemotePath(dstPath, pathutil.SafeBaseName(cleanSrc))
-			}
-			tracker.SetTotals(1, fi.Size())
-			tracker.StartFile(pathutil.SafeBaseName(cleanSrc))
-			r := client.NewCountingReader(f, tracker)
-			uploadErr := s.cli.UploadFileWithContext(ctx, dstNode, dstPath, r)
-			tracker.EndFile(pathutil.SafeBaseName(cleanSrc))
-			if uploadErr != nil {
-				handleTransferError(http.StatusInternalServerError, "upload file failed: "+uploadErr.Error())
-				return
-			}
-			tracker.AddFile()
-		}
-	} else if srcNode != "" && dstNode == "" {
-		// 3. 远端到本地下载
-		cleanDst, err := pathutil.NormalizeLocalPath(dstPath)
-		if err != nil {
-			handleTransferError(http.StatusBadRequest, err.Error())
-			return
-		}
-		_, lsErr := s.cli.ListDirWithContext(ctx, srcNode, srcPath)
-		if lsErr == nil {
-			if !req.Recursive {
-				handleTransferError(http.StatusBadRequest, "remote path is directory, recursive (-r) required")
-				return
-			}
-			if fi, err := os.Stat(cleanDst); err == nil && fi.IsDir() {
-				cleanDst = filepath.Join(cleanDst, pathutil.SafeBaseName(srcPath))
-			}
-			if err := s.cli.DownloadDir(ctx, srcNode, srcPath, cleanDst, req.Concurrency, tracker); err != nil {
-				handleTransferError(http.StatusInternalServerError, "download dir failed: "+err.Error())
-				return
-			}
-		} else {
-			if fi, err := os.Stat(cleanDst); err == nil && fi.IsDir() {
-				cleanDst = filepath.Join(cleanDst, pathutil.SafeBaseName(srcPath))
-			}
-			tracker.SetTotals(1, 0)
-			tracker.StartFile(pathutil.SafeBaseName(srcPath))
-			err := s.cli.DownloadToLocalFile(ctx, srcNode, srcPath, cleanDst, tracker)
-			tracker.EndFile(pathutil.SafeBaseName(srcPath))
-			if err != nil {
-				handleTransferError(http.StatusInternalServerError, "download file failed: "+err.Error())
-				return
-			}
-			tracker.AddFile()
-		}
-	} else {
-		// 4. 本地到本地拷贝
-		cleanSrc, _ := pathutil.NormalizeLocalPath(srcPath)
-		cleanDst, _ := pathutil.NormalizeLocalPath(dstPath)
-		fi, err := os.Stat(cleanSrc)
-		if err != nil {
-			handleTransferError(http.StatusBadRequest, "local source not found: "+err.Error())
-			return
-		}
-		if fi.IsDir() {
-			if !req.Recursive {
-				handleTransferError(http.StatusBadRequest, "path is directory, recursive (-r) required")
-				return
-			}
-			if err := s.cli.LocalCopyDir(ctx, cleanSrc, cleanDst, req.Concurrency, tracker); err != nil {
-				handleTransferError(http.StatusInternalServerError, "copy dir failed: "+err.Error())
-				return
-			}
-		} else {
-			if dstFi, err := os.Stat(cleanDst); err == nil && dstFi.IsDir() {
-				cleanDst = filepath.Join(cleanDst, pathutil.SafeBaseName(cleanSrc))
-			}
-			tracker.SetTotals(1, fi.Size())
-			tracker.StartFile(pathutil.SafeBaseName(cleanSrc))
-			err := s.cli.LocalCopyFile(cleanSrc, cleanDst, tracker)
-			tracker.EndFile(pathutil.SafeBaseName(cleanSrc))
-			if err != nil {
-				handleTransferError(http.StatusInternalServerError, "copy file failed: "+err.Error())
-				return
-			}
-			tracker.AddFile()
-		}
+	opts := client.TransferOptions{
+		SrcNode:     req.SrcNode,
+		SrcPath:     req.SrcPath,
+		DstNode:     req.DstNode,
+		DstPath:     req.DstPath,
+		Recursive:   req.Recursive,
+		Concurrency: req.Concurrency,
 	}
 
-	tracker.Finish()
+	if err := s.cli.Transfer(ctx, opts, tracker); err != nil {
+		var dirErr *client.ErrDirectoryWithoutRecursive
+		if errors.As(err, &dirErr) || errors.Is(err, os.ErrNotExist) || errors.Is(err, pathutil.ErrEmptyPath) {
+			handleTransferError(http.StatusBadRequest, err.Error())
+			return
+		}
+		handleTransferError(http.StatusInternalServerError, err.Error())
+		return
+	}
 
 	if isStream {
 		sendStreamFrame(map[string]any{

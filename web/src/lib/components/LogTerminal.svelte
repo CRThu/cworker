@@ -8,6 +8,7 @@
   export let node: string = '';
   export let status: string = 'RUNNING';
   export let open: boolean = false;
+  export let onClose: (() => void) | undefined = undefined;
 
   const dispatch = createEventDispatcher();
 
@@ -142,13 +143,23 @@
 
   function handleClose() {
     disconnectWs();
+    if (onClose) onClose();
     dispatch('close');
+  }
+
+  function handleKeydown(e: KeyboardEvent) {
+    if (open && e.key === 'Escape') {
+      e.preventDefault();
+      handleClose();
+    }
   }
 
   onDestroy(() => {
     disconnectWs();
   });
 </script>
+
+<svelte:window on:keydown={handleKeydown} />
 
 {#if open}
   <div class="terminal-modal-overlay" role="presentation" on:click|self={handleClose} on:keydown={(e) => e.key === 'Escape' && handleClose()}>
