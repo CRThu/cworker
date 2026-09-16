@@ -32,10 +32,19 @@
     if (onSubmit) onSubmit(payload);
     dispatch('submit', payload);
   }
+
+  function handleKeydown(e: KeyboardEvent) {
+    if (open && e.key === 'Escape') {
+      e.preventDefault();
+      handleClose();
+    }
+  }
 </script>
 
+<svelte:window on:keydown={handleKeydown} />
+
 {#if open}
-  <div class="modal-overlay" role="presentation" on:click|self={handleClose}>
+  <div class="modal-overlay" role="presentation" on:click|self={handleClose} on:keydown={(e) => e.key === 'Escape' && handleClose()}>
     <div class="modal-box">
       <div class="modal-header">
         <h3 class="modal-title">清理历史任务</h3>

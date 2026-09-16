@@ -51,3 +51,32 @@ describe('theme store', () => {
     expect(isDark).toBe(false);
   });
 });
+
+import { render, fireEvent } from '@testing-library/svelte';
+import ThemeToggle from '../lib/components/ThemeToggle.svelte';
+
+describe('ThemeToggle component rendering and cycle interactions', () => {
+  beforeEach(() => {
+    themeMode.set('system');
+    isDarkEffective.set(true);
+  });
+
+  it('should render system icon by default and cycle through dark and light on click', async () => {
+    const { container } = render(ThemeToggle);
+    const btn = container.querySelector('button') as HTMLButtonElement;
+    expect(btn).not.toBeNull();
+    expect(btn.getAttribute('title')).toContain('跟随系统');
+
+    // 点击切换为 dark
+    await fireEvent.click(btn);
+    expect(btn.getAttribute('title')).toContain('强制暗色');
+
+    // 点击切换为 light
+    await fireEvent.click(btn);
+    expect(btn.getAttribute('title')).toContain('强制亮色');
+
+    // 点击切回 system
+    await fireEvent.click(btn);
+    expect(btn.getAttribute('title')).toContain('跟随系统');
+  });
+});

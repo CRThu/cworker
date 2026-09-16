@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"os/signal"
@@ -36,7 +35,7 @@ var logsCmd = &cobra.Command{
 		cli := client.NewClient()
 
 		if logsFollow {
-			ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+			ctx, cancel := signal.NotifyContext(cmdContext(cmd), os.Interrupt, syscall.SIGTERM)
 			defer cancel()
 
 			if targetNode != "" {
@@ -48,9 +47,9 @@ var logsCmd = &cobra.Command{
 		var output string
 		var err error
 		if targetNode != "" {
-			output, err = cli.GetLogsNode(targetNode, jobID, logsLines)
+			output, err = cli.GetLogsNodeWithContext(cmdContext(cmd), targetNode, jobID, logsLines)
 		} else {
-			output, err = cli.GetLogs(jobID, logsLines)
+			output, err = cli.GetLogsWithContext(cmdContext(cmd), jobID, logsLines)
 		}
 		if err != nil {
 			return err

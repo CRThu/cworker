@@ -67,7 +67,7 @@ export interface DispatchResult {
   failed: { node: string; error: string }[];
 }
 
-// dispatchJob 支持单节点或多节点并发派发任务，收集成功与失败详情，确保错误隔离
+// dispatchJob 支持单节点或多节点并发启动任务，收集成功与失败详情，确保错误隔离
 export async function dispatchJob(data: {
   nodes?: string[];
   node?: string;
@@ -175,7 +175,13 @@ export async function transfer(
     for (const line of lines) {
       const trimmed = line.trim();
       if (!trimmed) continue;
-      const frame: TransferStreamFrame = JSON.parse(trimmed);
+      let frame: TransferStreamFrame;
+      try {
+        frame = JSON.parse(trimmed);
+      } catch (err) {
+        console.warn('Failed to parse transfer stream frame:', trimmed, err);
+        continue;
+      }
       if (frame.type === 'error') {
         throw new Error(frame.error || '传输失败');
       }
@@ -183,8 +189,15 @@ export async function transfer(
     }
   }
 
-  if (buffer.trim()) {
-    const frame: TransferStreamFrame = JSON.parse(buffer.trim());
+  const trailing = buffer.trim();
+  if (trailing) {
+    let frame: TransferStreamFrame;
+    try {
+      frame = JSON.parse(trailing);
+    } catch (err) {
+      console.warn('Failed to parse trailing transfer stream frame:', trailing, err);
+      return;
+    }
     if (frame.type === 'error') {
       throw new Error(frame.error || '传输失败');
     }

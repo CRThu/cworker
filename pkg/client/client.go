@@ -27,8 +27,9 @@ import (
 
 // Client 封装去中心化 CLI 与各 Worker 节点的动态 DNS 解析与直接鉴权交互
 type Client struct {
-	dataDir    string
-	httpClient *http.Client
+	dataDir      string
+	httpClient   *http.Client // RPC client: 30s 默认超时，防控制面请求死锁挂死
+	streamClient *http.Client // Stream client: Timeout 0，无全局硬超时，由 Context 精确控制流式与大文件生命周期
 }
 
 // NewClient 实例化客户端
@@ -57,6 +58,10 @@ func NewClient() *Client {
 		httpClient: &http.Client{
 			Transport: tr,
 			Timeout:   30 * time.Second,
+		},
+		streamClient: &http.Client{
+			Transport: tr,
+			Timeout:   0, // 无全局硬编码超时，生命周期完全受 context.Context 约束
 		},
 	}
 }
@@ -249,8 +254,37 @@ func (c *Client) doRequestWithContext(ctx context.Context, rt *ResolvedTarget, m
 	return c.httpClient.Do(req)
 }
 
+// 统一流式 HTTP 请求封装 (使用 streamClient，无 30s 硬超时截断，生命周期完全由 Context 精准控制)
+func (c *Client) doStreamRequestWithContext(ctx context.Context, rt *ResolvedTarget, method, path string, body io.Reader) (*http.Response, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	u := rt.BaseURL + path
+	req, err := http.NewRequestWithContext(ctx, method, u, body)
+	if err != nil {
+		return nil, err
+	}
+
+	if rt.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+rt.Token)
+	}
+	if method == http.MethodPost || method == http.MethodPut {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	return c.streamClient.Do(req)
+}
+
 // ListNodes 并发对账本中所有已知节点进行动态 DNS 解析与实时测活
 func (c *Client) ListNodes() ([]protocol.NodeInfo, error) {
+	return c.ListNodesWithContext(context.Background())
+}
+
+// ListNodesWithContext 带 Context 控制的并发节点测活
+func (c *Client) ListNodesWithContext(ctx context.Context) ([]protocol.NodeInfo, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	nodes, err := c.LoadKnownNodes()
 	if err != nil {
 		return nil, err
@@ -264,6 +298,12 @@ func (c *Client) ListNodes() ([]protocol.NodeInfo, error) {
 		wg.Add(1)
 		go func(node protocol.KnownNode) {
 			defer wg.Done()
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
 			rt, err := c.ResolveWorker(node.Name, node.Token)
 			if err != nil {
 				mu.Lock()
@@ -276,11 +316,11 @@ func (c *Client) ListNodes() ([]protocol.NodeInfo, error) {
 				return
 			}
 
-			// 统一走 doRequestWithContext：复用 Proxy: nil 隔离系统代理，并设定 1500ms 探活超时
-			ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+			// 统一走 doRequestWithContext：复用 Proxy: nil 隔离系统代理，并设定 1500ms 探活超时 (受父 ctx 约束)
+			probeCtx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
 			defer cancel()
 
-			resp, err := c.doRequestWithContext(ctx, rt, http.MethodGet, "/api/v1/health", nil)
+			resp, err := c.doRequestWithContext(probeCtx, rt, http.MethodGet, "/api/v1/health", nil)
 			if err == nil {
 				defer resp.Body.Close()
 				if resp.StatusCode == http.StatusOK {
@@ -289,7 +329,6 @@ func (c *Client) ListNodes() ([]protocol.NodeInfo, error) {
 						if node.Name != "" {
 							info.Name = node.Name
 						}
-						// 客户端通信透视：以客户端实际动态 DNS 解析并成功打通的物理通信地址为 SSOT 单一事实来源
 						info.Address = strings.TrimPrefix(strings.TrimPrefix(rt.BaseURL, "http://"), "https://")
 						mu.Lock()
 						list = append(list, info)
@@ -311,6 +350,10 @@ func (c *Client) ListNodes() ([]protocol.NodeInfo, error) {
 	}
 	wg.Wait()
 
+	if err := ctx.Err(); err != nil && len(list) == 0 {
+		return nil, err
+	}
+
 	sort.Slice(list, func(i, j int) bool {
 		return list[i].Name < list[j].Name
 	})
@@ -319,6 +362,14 @@ func (c *Client) ListNodes() ([]protocol.NodeInfo, error) {
 
 // RunJob 派发任务到目标 Worker
 func (c *Client) RunJob(req protocol.RunJobRequest, explicitToken string) (*protocol.JobInfo, error) {
+	return c.RunJobWithContext(context.Background(), req, explicitToken)
+}
+
+// RunJobWithContext 带 Context 支持的任务派发
+func (c *Client) RunJobWithContext(ctx context.Context, req protocol.RunJobRequest, explicitToken string) (*protocol.JobInfo, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	rt, err := c.ResolveWorker(req.Node, explicitToken)
 	if err != nil {
 		return nil, err
@@ -327,7 +378,7 @@ func (c *Client) RunJob(req protocol.RunJobRequest, explicitToken string) (*prot
 	req.Node = rt.Name
 	data, _ := json.Marshal(req)
 
-	resp, err := c.doRequest(rt, http.MethodPost, "/api/v1/jobs/run", bytes.NewReader(data))
+	resp, err := c.doRequestWithContext(ctx, rt, http.MethodPost, "/api/v1/jobs/run", bytes.NewReader(data))
 	if err != nil {
 		return nil, fmt.Errorf("connect worker %s failed: %w", rt.BaseURL, err)
 	}
@@ -369,6 +420,14 @@ func (c *Client) RunJob(req protocol.RunJobRequest, explicitToken string) (*prot
 
 // ListJobs 查询指定节点或全集群所有已知在线 Worker 的任务列表 (targetNode 可选)
 func (c *Client) ListJobs(targetNode ...string) ([]protocol.JobInfo, error) {
+	return c.ListJobsWithContext(context.Background(), targetNode...)
+}
+
+// ListJobsWithContext 带 Context 支持的任务列表查询
+func (c *Client) ListJobsWithContext(ctx context.Context, targetNode ...string) ([]protocol.JobInfo, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	node := ""
 	if len(targetNode) > 0 {
 		node = targetNode[0]
@@ -379,7 +438,7 @@ func (c *Client) ListJobs(targetNode ...string) ([]protocol.JobInfo, error) {
 		if err != nil {
 			return nil, err
 		}
-		resp, err := c.doRequest(rt, http.MethodGet, "/api/v1/jobs/ps", nil)
+		resp, err := c.doRequestWithContext(ctx, rt, http.MethodGet, "/api/v1/jobs/ps", nil)
 		if err != nil {
 			return nil, fmt.Errorf("list jobs from node '%s' failed: %w", node, err)
 		}
@@ -418,12 +477,18 @@ func (c *Client) ListJobs(targetNode ...string) ([]protocol.JobInfo, error) {
 		wg.Add(1)
 		go func(kn protocol.KnownNode) {
 			defer wg.Done()
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
 			rt, err := c.ResolveWorker(kn.Name, kn.Token)
 			if err != nil {
 				return
 			}
 
-			resp, err := c.doRequest(rt, http.MethodGet, "/api/v1/jobs/ps", nil)
+			resp, err := c.doRequestWithContext(ctx, rt, http.MethodGet, "/api/v1/jobs/ps", nil)
 			if err != nil {
 				return
 			}
@@ -446,6 +511,10 @@ func (c *Client) ListJobs(targetNode ...string) ([]protocol.JobInfo, error) {
 	}
 	wg.Wait()
 
+	if err := ctx.Err(); err != nil && len(allJobs) == 0 {
+		return nil, err
+	}
+
 	sort.Slice(allJobs, func(i, j int) bool {
 		return allJobs[i].StartTime.After(allJobs[j].StartTime)
 	})
@@ -454,13 +523,21 @@ func (c *Client) ListJobs(targetNode ...string) ([]protocol.JobInfo, error) {
 
 // KillJobNode 定向终止指定节点上的任务 (单点直达，避免全集群广播开销)
 func (c *Client) KillJobNode(node string, jobID string) (*protocol.JobInfo, error) {
-	rt, err := c.resolveTargetForJob(node, jobID)
+	return c.KillJobNodeWithContext(context.Background(), node, jobID)
+}
+
+// KillJobNodeWithContext 带 Context 支持的定向任务终止
+func (c *Client) KillJobNodeWithContext(ctx context.Context, node string, jobID string) (*protocol.JobInfo, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	rt, err := c.resolveTargetForJobWithContext(ctx, node, jobID)
 	if err != nil {
 		return nil, err
 	}
 
 	data, _ := json.Marshal(protocol.KillJobRequest{JobID: jobID})
-	resp, err := c.doRequest(rt, http.MethodPost, "/api/v1/jobs/kill", bytes.NewReader(data))
+	resp, err := c.doRequestWithContext(ctx, rt, http.MethodPost, "/api/v1/jobs/kill", bytes.NewReader(data))
 	if err != nil {
 		return nil, fmt.Errorf("kill job on node '%s' failed: %w", node, err)
 	}
@@ -483,6 +560,14 @@ func (c *Client) KillJobNode(node string, jobID string) (*protocol.JobInfo, erro
 
 // KillJob 终止任务 (未指定节点时全集群广播探测)
 func (c *Client) KillJob(jobID string) (*protocol.JobInfo, error) {
+	return c.KillJobWithContext(context.Background(), jobID)
+}
+
+// KillJobWithContext 带 Context 支持的全集群广播任务终止
+func (c *Client) KillJobWithContext(ctx context.Context, jobID string) (*protocol.JobInfo, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	knownNodes, err := c.LoadKnownNodes()
 	if err != nil {
 		return nil, err
@@ -496,13 +581,19 @@ func (c *Client) KillJob(jobID string) (*protocol.JobInfo, error) {
 		wg.Add(1)
 		go func(node protocol.KnownNode) {
 			defer wg.Done()
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
 			rt, err := c.ResolveWorker(node.Name, node.Token)
 			if err != nil {
 				return
 			}
 
 			data, _ := json.Marshal(protocol.KillJobRequest{JobID: jobID})
-			resp, err := c.doRequest(rt, http.MethodPost, "/api/v1/jobs/kill", bytes.NewReader(data))
+			resp, err := c.doRequestWithContext(ctx, rt, http.MethodPost, "/api/v1/jobs/kill", bytes.NewReader(data))
 			if err != nil {
 				return
 			}
@@ -526,11 +617,22 @@ func (c *Client) KillJob(jobID string) (*protocol.JobInfo, error) {
 	if foundInfo != nil {
 		return foundInfo, nil
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return nil, fmt.Errorf("job '%s' not found across known workers", jobID)
 }
 
 // CleanJobs 向指定节点或全集群在线节点下发任务与日志清理指令
 func (c *Client) CleanJobs(targetNode string, days int, all bool) (map[string]protocol.CleanJobsResponse, error) {
+	return c.CleanJobsWithContext(context.Background(), targetNode, days, all)
+}
+
+// CleanJobsWithContext 带 Context 支持的任务清理
+func (c *Client) CleanJobsWithContext(ctx context.Context, targetNode string, days int, all bool) (map[string]protocol.CleanJobsResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	reqData, err := json.Marshal(protocol.CleanJobsRequest{
 		Days: days,
 		All:  all,
@@ -547,7 +649,7 @@ func (c *Client) CleanJobs(targetNode string, days int, all bool) (map[string]pr
 		if err != nil {
 			return nil, err
 		}
-		resp, err := c.doRequest(rt, http.MethodPost, "/api/v1/jobs/clean", bytes.NewReader(reqData))
+		resp, err := c.doRequestWithContext(ctx, rt, http.MethodPost, "/api/v1/jobs/clean", bytes.NewReader(reqData))
 		if err != nil {
 			return nil, fmt.Errorf("clean jobs on node %s failed: %w", targetNode, err)
 		}
@@ -577,11 +679,17 @@ func (c *Client) CleanJobs(targetNode string, days int, all bool) (map[string]pr
 		wg.Add(1)
 		go func(node protocol.KnownNode) {
 			defer wg.Done()
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
 			rt, err := c.ResolveWorker(node.Name, node.Token)
 			if err != nil {
 				return
 			}
-			resp, err := c.doRequest(rt, http.MethodPost, "/api/v1/jobs/clean", bytes.NewReader(reqData))
+			resp, err := c.doRequestWithContext(ctx, rt, http.MethodPost, "/api/v1/jobs/clean", bytes.NewReader(reqData))
 			if err != nil {
 				return
 			}
@@ -599,10 +707,18 @@ func (c *Client) CleanJobs(targetNode string, days int, all bool) (map[string]pr
 	}
 	wg.Wait()
 
+	if err := ctx.Err(); err != nil && len(results) == 0 {
+		return nil, err
+	}
+
 	return results, nil
 }
 
 func (c *Client) resolveTargetForJob(node string, jobID string) (*ResolvedTarget, error) {
+	return c.resolveTargetForJobWithContext(context.Background(), node, jobID)
+}
+
+func (c *Client) resolveTargetForJobWithContext(ctx context.Context, node string, jobID string) (*ResolvedTarget, error) {
 	if node != "" {
 		knownNodes, err := c.LoadKnownNodes()
 		if err == nil {
@@ -621,23 +737,36 @@ func (c *Client) resolveTargetForJob(node string, jobID string) (*ResolvedTarget
 		}
 		return nil, fmt.Errorf("node '%s' not found in known nodes ledger", node)
 	}
-	return c.findJobWorker(jobID)
+	return c.findJobWorkerWithContext(ctx, jobID)
 }
 
 // GetLogs 获取日志 (自动探测节点)
 func (c *Client) GetLogs(jobID string, lines int) (string, error) {
-	return c.GetLogsNode("", jobID, lines)
+	return c.GetLogsWithContext(context.Background(), jobID, lines)
+}
+
+// GetLogsWithContext 带 Context 支持的自动探测日志查询
+func (c *Client) GetLogsWithContext(ctx context.Context, jobID string, lines int) (string, error) {
+	return c.GetLogsNodeWithContext(ctx, "", jobID, lines)
 }
 
 // GetLogsNode 获取指定节点上的日志
 func (c *Client) GetLogsNode(node string, jobID string, lines int) (string, error) {
-	rt, err := c.resolveTargetForJob(node, jobID)
+	return c.GetLogsNodeWithContext(context.Background(), node, jobID, lines)
+}
+
+// GetLogsNodeWithContext 带 Context 支持的指定节点日志查询
+func (c *Client) GetLogsNodeWithContext(ctx context.Context, node string, jobID string, lines int) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	rt, err := c.resolveTargetForJobWithContext(ctx, node, jobID)
 	if err != nil {
 		return "", err
 	}
 
 	path := fmt.Sprintf("/api/v1/jobs/logs?job_id=%s&lines=%d", url.QueryEscape(jobID), lines)
-	resp, err := c.doRequest(rt, http.MethodGet, path, nil)
+	resp, err := c.doRequestWithContext(ctx, rt, http.MethodGet, path, nil)
 	if err != nil {
 		return "", err
 	}
@@ -659,7 +788,7 @@ func (c *Client) StreamLogs(ctx context.Context, jobID string, out io.Writer) er
 
 // StreamLogsNode 实时流式日志 (指定或探测节点)
 func (c *Client) StreamLogsNode(ctx context.Context, node string, jobID string, out io.Writer) error {
-	rt, err := c.resolveTargetForJob(node, jobID)
+	rt, err := c.resolveTargetForJobWithContext(ctx, node, jobID)
 	if err != nil {
 		return err
 	}
@@ -690,52 +819,118 @@ func (c *Client) StreamLogsNode(ctx context.Context, node string, jobID string, 
 }
 
 func (c *Client) findJobWorker(jobID string) (*ResolvedTarget, error) {
+	return c.findJobWorkerWithContext(context.Background(), jobID)
+}
+
+// findJobWorkerWithContext 并发探测账本节点，带 Fast-path 极速熔断与 Context 生命周期保护
+func (c *Client) findJobWorkerWithContext(ctx context.Context, jobID string) (*ResolvedTarget, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	knownNodes, err := c.LoadKnownNodes()
 	if err != nil {
 		return nil, err
 	}
+	if len(knownNodes) == 0 {
+		return nil, fmt.Errorf("no known nodes configured in ledger")
+	}
 
-	// 1. 先通过 /api/v1/jobs/ps 检索活跃/内存中的任务
+	probeCtx, cancelProbe := context.WithCancel(ctx)
+	defer cancelProbe()
+
+	var result *ResolvedTarget
+	var once sync.Once
+
+	// 阶段一：并发探测内存中活跃或保留的任务 (/api/v1/jobs/ps)
+	var wg sync.WaitGroup
 	for _, kn := range knownNodes {
-		rt, err := c.ResolveWorker(kn.Name, kn.Token)
-		if err != nil {
-			continue
-		}
-		resp, err := c.doRequest(rt, http.MethodGet, "/api/v1/jobs/ps", nil)
-		if err != nil {
-			continue
-		}
-		if resp.StatusCode == http.StatusOK {
-			var jobs []protocol.JobInfo
-			err := json.NewDecoder(resp.Body).Decode(&jobs)
-			resp.Body.Close()
-			if err == nil {
-				for _, j := range jobs {
-					if j.ID == jobID {
-						return rt, nil
+		wg.Add(1)
+		go func(node protocol.KnownNode) {
+			defer wg.Done()
+			select {
+			case <-probeCtx.Done():
+				return
+			default:
+			}
+
+			rt, err := c.ResolveWorker(node.Name, node.Token)
+			if err != nil {
+				return
+			}
+			resp, err := c.doRequestWithContext(probeCtx, rt, http.MethodGet, "/api/v1/jobs/ps", nil)
+			if err != nil {
+				return
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode == http.StatusOK {
+				var jobs []protocol.JobInfo
+				if err := json.NewDecoder(resp.Body).Decode(&jobs); err == nil {
+					for _, j := range jobs {
+						if j.ID == jobID {
+							once.Do(func() {
+								result = rt
+								cancelProbe() // Fast-path: 立即熔断其余正在进行的探测！
+							})
+							return
+						}
 					}
 				}
 			}
-		} else {
-			resp.Body.Close()
-		}
+		}(kn)
+	}
+	wg.Wait()
+
+	if result != nil {
+		return result, nil
 	}
 
-	// 2. 若内存中未匹配 (如任务已完成且 Worker 曾重启)，向节点检索磁盘历史日志
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	// 阶段二：若内存中未找到，并发探测磁盘历史日志 (/api/v1/jobs/logs?job_id=...&lines=1)
+	probeCtx2, cancelProbe2 := context.WithCancel(ctx)
+	defer cancelProbe2()
+
+	var once2 sync.Once
 	for _, kn := range knownNodes {
-		rt, err := c.ResolveWorker(kn.Name, kn.Token)
-		if err != nil {
-			continue
-		}
-		path := fmt.Sprintf("/api/v1/jobs/logs?job_id=%s&lines=1", url.QueryEscape(jobID))
-		resp, err := c.doRequest(rt, http.MethodGet, path, nil)
-		if err != nil {
-			continue
-		}
-		resp.Body.Close()
-		if resp.StatusCode == http.StatusOK {
-			return rt, nil
-		}
+		wg.Add(1)
+		go func(node protocol.KnownNode) {
+			defer wg.Done()
+			select {
+			case <-probeCtx2.Done():
+				return
+			default:
+			}
+
+			rt, err := c.ResolveWorker(node.Name, node.Token)
+			if err != nil {
+				return
+			}
+			path := fmt.Sprintf("/api/v1/jobs/logs?job_id=%s&lines=1", url.QueryEscape(jobID))
+			resp, err := c.doRequestWithContext(probeCtx2, rt, http.MethodGet, path, nil)
+			if err != nil {
+				return
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode == http.StatusOK {
+				once2.Do(func() {
+					result = rt
+					cancelProbe2() // Fast-path 熔断！
+				})
+			}
+		}(kn)
+	}
+	wg.Wait()
+
+	if result != nil {
+		return result, nil
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	return nil, fmt.Errorf("job '%s' not found across known workers", jobID)
@@ -796,7 +991,7 @@ func (c *Client) UploadFileWithContext(ctx context.Context, node, remotePath str
 		req.Header.Set("Authorization", "Bearer "+rt.Token)
 	}
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.streamClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -838,7 +1033,7 @@ func (c *Client) DownloadFileWithContext(ctx context.Context, node, remotePath s
 	}
 
 	path := fmt.Sprintf("/api/v1/fs/download?path=%s", url.QueryEscape(remotePath))
-	resp, err := c.doRequestWithContext(ctx, rt, http.MethodGet, path, nil)
+	resp, err := c.doStreamRequestWithContext(ctx, rt, http.MethodGet, path, nil)
 	if err != nil {
 		return err
 	}
@@ -903,7 +1098,7 @@ func (c *Client) DownloadToLocalFile(ctx context.Context, node, remotePath, loca
 	}
 
 	path := fmt.Sprintf("/api/v1/fs/download?path=%s", url.QueryEscape(remotePath))
-	resp, err := c.doRequestWithContext(ctx, rt, http.MethodGet, path, nil)
+	resp, err := c.doStreamRequestWithContext(ctx, rt, http.MethodGet, path, nil)
 	if err != nil {
 		return err
 	}
@@ -991,12 +1186,20 @@ func (c *Client) ListDirWithContext(ctx context.Context, node, remotePath string
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	isRec := len(recursive) > 0 && recursive[0]
+	if node == "" {
+		cleanLocal, err := pathutil.NormalizeLocalPath(remotePath)
+		if err != nil {
+			return nil, err
+		}
+		return fsengine.ListDir(cleanLocal, isRec)
+	}
+
 	rt, err := c.ResolveWorker(node, "")
 	if err != nil {
 		return nil, err
 	}
 
-	isRec := len(recursive) > 0 && recursive[0]
 	path := fmt.Sprintf("/api/v1/fs/ls?path=%s&recursive=%t", url.QueryEscape(remotePath), isRec)
 	resp, err := c.doRequestWithContext(ctx, rt, http.MethodGet, path, nil)
 	if err != nil {
@@ -1024,6 +1227,14 @@ func (c *Client) MakeDirWithContext(ctx context.Context, node, remotePath string
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if node == "" {
+		cleanLocal, err := pathutil.NormalizeLocalPath(remotePath)
+		if err != nil {
+			return err
+		}
+		return fsengine.MakeDir(cleanLocal)
+	}
+
 	rt, err := c.ResolveWorker(node, "")
 	if err != nil {
 		return err
@@ -1044,13 +1255,28 @@ func (c *Client) MakeDirWithContext(ctx context.Context, node, remotePath string
 }
 
 func (c *Client) Delete(node, remotePath string, recursive bool) error {
+	return c.DeleteWithContext(context.Background(), node, remotePath, recursive)
+}
+
+func (c *Client) DeleteWithContext(ctx context.Context, node, remotePath string, recursive bool) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if node == "" {
+		cleanLocal, err := pathutil.NormalizeLocalPath(remotePath)
+		if err != nil {
+			return err
+		}
+		return fsengine.Remove(cleanLocal, recursive)
+	}
+
 	rt, err := c.ResolveWorker(node, "")
 	if err != nil {
 		return err
 	}
 
 	path := fmt.Sprintf("/api/v1/fs/rm?path=%s&recursive=%t", url.QueryEscape(remotePath), recursive)
-	resp, err := c.doRequest(rt, http.MethodPost, path, nil)
+	resp, err := c.doRequestWithContext(ctx, rt, http.MethodPost, path, nil)
 	if err != nil {
 		return err
 	}
@@ -1085,9 +1311,9 @@ func (c *Client) RelayCopyWithContext(ctx context.Context, srcNode, srcPath, dst
 		tracker = trackers[0]
 	}
 
-	// 1. 发起源端读取流
+	// 1. 发起源端读取流 (使用 streamClient，无 30s 截断)
 	srcPathURL := fmt.Sprintf("/api/v1/fs/download?path=%s", url.QueryEscape(srcPath))
-	srcResp, err := c.doRequestWithContext(ctx, srcTarget, http.MethodGet, srcPathURL, nil)
+	srcResp, err := c.doStreamRequestWithContext(ctx, srcTarget, http.MethodGet, srcPathURL, nil)
 	if err != nil {
 		return fmt.Errorf("connect src worker %s failed: %w", srcTarget.BaseURL, err)
 	}
@@ -1106,7 +1332,7 @@ func (c *Client) RelayCopyWithContext(ctx context.Context, srcNode, srcPath, dst
 		}
 	}
 
-	// 2. 边从源端拉流，边在 CLI 内存计算中继 Hash，边向目的端直灌 (单遍流式，零磁盘中转)
+	// 2. 边从源端拉流，边在 CLI 内存计算中继 Hash，边向目的端直灌 (单遍流式，零磁盘中转，使用 streamClient)
 	cliHasher := sha256.New()
 	var bodyReader io.Reader = srcResp.Body
 	if tracker != nil {
@@ -1123,7 +1349,7 @@ func (c *Client) RelayCopyWithContext(ctx context.Context, srcNode, srcPath, dst
 		dstReq.Header.Set("Authorization", "Bearer "+dstTarget.Token)
 	}
 
-	dstResp, err := c.httpClient.Do(dstReq)
+	dstResp, err := c.streamClient.Do(dstReq)
 	if err != nil {
 		return fmt.Errorf("connect dst worker %s failed: %w", dstTarget.BaseURL, err)
 	}
@@ -1161,6 +1387,42 @@ func (c *Client) RelayCopyWithContext(ctx context.Context, srcNode, srcPath, dst
 	}
 
 	return nil
+}
+
+// Cat 打印或输出远端节点或本地文件的内容 (统一本地与远端)
+func (c *Client) Cat(ctx context.Context, node, path string, w io.Writer) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if node == "" {
+		cleanLocal, err := pathutil.NormalizeLocalPath(path)
+		if err != nil {
+			return err
+		}
+		f, err := os.Open(cleanLocal)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		_, err = io.Copy(w, f)
+		return err
+	}
+	return c.DownloadFileWithContext(ctx, node, path, w)
+}
+
+// Hash 获取远端节点或本地路径的文件/目录 SHA-256 清单 (统一本地与远端)
+func (c *Client) Hash(ctx context.Context, node, path string, recursive bool) ([]protocol.FileInfo, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if node == "" {
+		cleanLocal, err := pathutil.NormalizeLocalPath(path)
+		if err != nil {
+			return nil, err
+		}
+		return HashLocalPath(cleanLocal, recursive)
+	}
+	return c.HashRemotePath(ctx, node, path, recursive)
 }
 
 // UploadDir 递归并发上传本地文件夹到远端节点 (两阶段目录治理 + 单遍流式 Hash + 自洽进度条)

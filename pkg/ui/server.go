@@ -208,7 +208,7 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	nodes, _ := s.cli.ListNodes()
+	nodes, _ := s.cli.ListNodesWithContext(r.Context())
 	onlineCount := 0
 	activeJobs := 0
 	var sumCPU float64
@@ -273,7 +273,7 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		nodes, err := s.cli.ListNodes()
+		nodes, err := s.cli.ListNodesWithContext(r.Context())
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -352,7 +352,7 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request) {
 	statusFilter := protocol.JobStatus(r.URL.Query().Get("status"))
 	search := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("search")))
 
-	jobs, err := s.cli.ListJobs(node)
+	jobs, err := s.cli.ListJobsWithContext(r.Context(), node)
 	if err != nil {
 		http.Error(w, "list jobs failed: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -431,7 +431,7 @@ func (s *Server) handleRunJob(w http.ResponseWriter, r *http.Request) {
 		req.Name = generateRandomJobName()
 	}
 
-	info, err := s.cli.RunJob(req.RunJobRequest, req.Token)
+	info, err := s.cli.RunJobWithContext(r.Context(), req.RunJobRequest, req.Token)
 	if err != nil {
 		http.Error(w, "dispatch job failed: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -474,9 +474,9 @@ func (s *Server) handleKillJob(w http.ResponseWriter, r *http.Request) {
 	var info *protocol.JobInfo
 	var err error
 	if req.Node != "" {
-		info, err = s.cli.KillJobNode(req.Node, req.JobID)
+		info, err = s.cli.KillJobNodeWithContext(r.Context(), req.Node, req.JobID)
 	} else {
-		info, err = s.cli.KillJob(req.JobID)
+		info, err = s.cli.KillJobWithContext(r.Context(), req.JobID)
 	}
 	if err != nil {
 		http.Error(w, "kill job failed: "+err.Error(), http.StatusInternalServerError)
@@ -508,7 +508,7 @@ func (s *Server) handleCleanJobs(w http.ResponseWriter, r *http.Request) {
 	allResults := make(map[string]protocol.CleanJobsResponse)
 	if len(req.Nodes) > 0 {
 		for _, n := range req.Nodes {
-			res, err := s.cli.CleanJobs(n, req.Days, req.All)
+			res, err := s.cli.CleanJobsWithContext(r.Context(), n, req.Days, req.All)
 			if err == nil {
 				for k, v := range res {
 					allResults[k] = v
@@ -516,7 +516,7 @@ func (s *Server) handleCleanJobs(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	} else {
-		res, err := s.cli.CleanJobs(req.Node, req.Days, req.All)
+		res, err := s.cli.CleanJobsWithContext(r.Context(), req.Node, req.Days, req.All)
 		if err != nil {
 			http.Error(w, "clean jobs failed: "+err.Error(), http.StatusInternalServerError)
 			return
@@ -577,7 +577,7 @@ func (s *Server) handleStreamLogs(w http.ResponseWriter, r *http.Request) {
 
 	// 若流式广播未发送任何字节 (例如已完成任务或 Worker 刚重启)，自动回退直接读取已落盘历史输出
 	if written == 0 {
-		if logs, err := s.cli.GetLogsNode(node, jobID, 500); err == nil && len(logs) > 0 {
+		if logs, err := s.cli.GetLogsNodeWithContext(r.Context(), node, jobID, 500); err == nil && len(logs) > 0 {
 			_ = conn.Write(r.Context(), websocket.MessageText, logstream.EnsureUTF8([]byte(logs)))
 		}
 	}
@@ -604,7 +604,7 @@ func (s *Server) handleGetJobLogs(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	output, err := s.cli.GetLogsNode(node, jobID, lines)
+	output, err := s.cli.GetLogsNodeWithContext(r.Context(), node, jobID, lines)
 	if err != nil {
 		http.Error(w, "get logs failed: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -614,7 +614,7 @@ func (s *Server) handleGetJobLogs(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(logstream.EnsureUTF8([]byte(output)))
 }
 
-// handleFsList 目录列表
+// handleFsList 目录列表 (通过 Client.ListDirWithContext 统一本地与远端)
 func (s *Server) handleFsList(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -627,15 +627,7 @@ func (s *Server) handleFsList(w http.ResponseWriter, r *http.Request) {
 		targetPath = "."
 	}
 
-	var files []protocol.FileInfo
-	var err error
-
-	if node == "" {
-		files, err = client.ListLocalDir(targetPath)
-	} else {
-		files, err = s.cli.ListDir(node, targetPath)
-	}
-
+	files, err := s.cli.ListDirWithContext(r.Context(), node, targetPath)
 	if err != nil {
 		http.Error(w, "list directory failed: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -874,19 +866,7 @@ func (s *Server) handleFsMkdir(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var err error
-	if req.Node == "" {
-		cleanPath, nErr := pathutil.NormalizeLocalPath(req.Path)
-		if nErr != nil {
-			http.Error(w, nErr.Error(), http.StatusBadRequest)
-			return
-		}
-		err = client.MakeLocalDir(cleanPath)
-	} else {
-		err = s.cli.MakeDirWithContext(r.Context(), req.Node, req.Path)
-	}
-
-	if err != nil {
+	if err := s.cli.MakeDirWithContext(r.Context(), req.Node, req.Path); err != nil {
 		http.Error(w, "create directory failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -895,7 +875,7 @@ func (s *Server) handleFsMkdir(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
 }
 
-// handleFsRemove 删除文件或目录
+// handleFsRemove 删除文件或目录 (通过 Client.DeleteWithContext 统一本地与远端)
 func (s *Server) handleFsRemove(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost && r.Method != http.MethodDelete {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -916,19 +896,7 @@ func (s *Server) handleFsRemove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var err error
-	if req.Node == "" {
-		cleanPath, nErr := pathutil.NormalizeLocalPath(req.Path)
-		if nErr != nil {
-			http.Error(w, nErr.Error(), http.StatusBadRequest)
-			return
-		}
-		err = client.DeleteLocal(cleanPath, req.Recursive)
-	} else {
-		err = s.cli.Delete(req.Node, req.Path, req.Recursive)
-	}
-
-	if err != nil {
+	if err := s.cli.DeleteWithContext(r.Context(), req.Node, req.Path, req.Recursive); err != nil {
 		http.Error(w, "delete failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}

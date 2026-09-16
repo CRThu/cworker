@@ -1,4 +1,4 @@
-<!-- web/src/lib/components/RunJobModal.svelte - 派发新任务模态框 (支持多节点并发派发、智能随机命名) -->
+<!-- web/src/lib/components/RunJobModal.svelte - 新建任务模态框 (支持多节点并发启动、智能随机命名) -->
 <script lang="ts">
   import { createEventDispatcher } from 'svelte';
   import { Folder } from 'lucide-svelte';
@@ -76,18 +76,19 @@
   <div class="modal-overlay" role="presentation" on:click|self={handleClose}>
     <div class="modal-box">
       <div class="modal-header">
-        <h3 class="modal-title">派发新任务</h3>
+        <h3 class="modal-title">新建任务</h3>
         <button class="btn-icon close-btn" on:click={handleClose}>&times;</button>
       </div>
 
       <form on:submit|preventDefault={handleSubmit}>
         <div class="modal-body">
           <div class="form-group">
-            <span class="form-label">目标 Worker 节点 (支持多选) *</span>
+            <span class="form-label">目标节点 *</span>
             <MultiSelect
               options={nodeNames}
               bind:selected={selectedNodes}
-              placeholder="请选择目标节点"
+              placeholder="选择节点"
+              allSelectedText="全部节点"
             />
           </div>
 
@@ -142,7 +143,7 @@
 
         <div class="modal-footer">
           <button type="button" class="btn btn-secondary" on:click={handleClose}>取消</button>
-          <button type="submit" class="btn btn-primary" disabled={!jobCmd.trim() || selectedNodes.length === 0}>派发任务</button>
+          <button type="submit" class="btn btn-primary" disabled={!jobCmd.trim() || selectedNodes.length === 0}>立即运行</button>
         </div>
       </form>
     </div>

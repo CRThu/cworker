@@ -36,7 +36,7 @@ WebSocket 实时终端流式推流与全双工跨机文件高速互传等全套�
 			Client:   cli,
 		})
 
-		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		ctx, cancel := signal.NotifyContext(cmdContext(cmd), os.Interrupt, syscall.SIGTERM)
 		defer cancel()
 
 		url := fmt.Sprintf("http://127.0.0.1:%d", uiPort)

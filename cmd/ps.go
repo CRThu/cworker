@@ -23,7 +23,7 @@ var psCmd = &cobra.Command{
 	Short: "查看全集群或指定节点的任务运行状态、硬件开销与进程 ID",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cli := client.NewClient()
-		jobs, err := cli.ListJobs(psNode)
+		jobs, err := cli.ListJobsWithContext(cmdContext(cmd), psNode)
 		if err != nil {
 			return err
 		}

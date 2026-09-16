@@ -7,7 +7,6 @@ import (
 
 	"cworker/pkg/client"
 	"cworker/pkg/pathutil"
-	"cworker/pkg/protocol"
 	"github.com/spf13/cobra"
 )
 
@@ -17,15 +16,8 @@ var lsCmd = &cobra.Command{
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		node, path := pathutil.ParseNodePath(args[0])
-		var files []protocol.FileInfo
-		var err error
-
-		if node == "" {
-			files, err = client.ListLocalDir(path)
-		} else {
-			cli := client.NewClient()
-			files, err = cli.ListDir(node, path)
-		}
+		cli := client.NewClient()
+		files, err := cli.ListDirWithContext(cmdContext(cmd), node, path)
 		if err != nil {
 			return err
 		}

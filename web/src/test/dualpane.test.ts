@@ -481,6 +481,26 @@ describe('DualPaneFiles in-situ operations and keyboard shortcuts', () => {
     const fill = container.querySelector('.progress-fill') as HTMLElement;
     expect(fill?.style.width).toBe('50%');
   });
+
+  it('should pass target directory directly as dst_path to transfer (preventing backend double nesting)', async () => {
+    const { container } = render(DualPaneFiles, {
+      props: { nodes: mockNodes },
+    });
+    await new Promise(r => setTimeout(r, 20));
+
+    // 点击左栏首行 docs (目录) 的 "传到右侧" 按钮
+    const leftPane = container.querySelectorAll('.file-pane')[0];
+    const transferBtn = leftPane.querySelector('.btn-action-icon[title="传到右侧"]') as HTMLButtonElement;
+    expect(transferBtn).not.toBeNull();
+    await fireEvent.click(transferBtn);
+
+    expect(api.transfer).toHaveBeenCalled();
+    const lastCall = vi.mocked(api.transfer).mock.calls[0][0];
+    // 源路径为 C:/docs, 目的路径应为对侧当前路径 C:/ (由后端单一内核自动决断嵌套，严禁前端拼接为 C:/docs 导致双重 docs/docs 嵌套)
+    expect(lastCall.src_path).toBe('C:/docs');
+    expect(lastCall.dst_path).toBe('C:/');
+    expect(lastCall.recursive).toBe(true);
+  });
 });
 
 

@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"math"
 	"net"
@@ -19,10 +20,11 @@ var (
 )
 
 var nodeCmd = &cobra.Command{
-	Use:   "node",
-	Short: "查看集群节点状态或管理本地已知节点记忆账本",
+	Use:     "node",
+	Aliases: []string{"nodes"},
+	Short:   "查看集群节点状态或管理本地已知节点",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return runNodeList()
+		return runNodeList(cmdContext(cmd))
 	},
 }
 
@@ -31,13 +33,17 @@ var nodeLsCmd = &cobra.Command{
 	Aliases: []string{"list"},
 	Short:   "查看集群中所有 Worker 节点的在线状态与实时硬件负载",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return runNodeList()
+		return runNodeList(cmdContext(cmd))
 	},
 }
 
-func runNodeList() error {
+func runNodeList(ctx ...context.Context) error {
+	var c context.Context = context.Background()
+	if len(ctx) > 0 && ctx[0] != nil {
+		c = ctx[0]
+	}
 	cli := client.NewClient()
-	nodes, err := cli.ListNodes()
+	nodes, err := cli.ListNodesWithContext(c)
 	if err != nil {
 		return err
 	}
@@ -78,7 +84,7 @@ func runNodeList() error {
 
 var nodeAddCmd = &cobra.Command{
 	Use:   "add <target> [address]",
-	Short: "向本地已知账本添加新节点 (支持单参数同名添加：cw node add desktop-4090 --token xxx)",
+	Short: "添加已知节点 (支持单参数同名添加：cw node add desktop-4090 --token xxx)",
 	Args:  cobra.RangeArgs(1, 2),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		var name string
@@ -129,14 +135,14 @@ var nodeAddCmd = &cobra.Command{
 			return fmt.Errorf("add node failed: %w", err)
 		}
 
-		fmt.Printf("[OK] Added node '%s' (%s) to known nodes ledger.\n", name, target)
+		fmt.Printf("[OK] Added node '%s' (%s) to known nodes.\n", name, target)
 		return nil
 	},
 }
 
 var nodeRmCmd = &cobra.Command{
 	Use:   "rm <name>",
-	Short: "从本地已知账本移除节点",
+	Short: "移除已知节点",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		name := args[0]

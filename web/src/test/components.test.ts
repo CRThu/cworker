@@ -282,7 +282,7 @@ describe('NodesView component layout and interactions', () => {
 
     const emptyCell = container.querySelector('.empty-cell');
     expect(emptyCell).not.toBeNull();
-    expect(emptyCell?.textContent).toContain('当前账本中暂无 Worker 节点。点击右上角 "+ 添加节点" 进行添加。');
+    expect(emptyCell?.textContent).toContain('暂无节点。点击右上角 "+ 添加节点" 添加。');
   });
 
   it('should render CPU as used% / total% when cpu_cores is available', () => {

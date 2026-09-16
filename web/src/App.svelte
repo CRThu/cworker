@@ -153,7 +153,7 @@
 
   async function handleRemoveNode(event: CustomEvent<string>) {
     const name = event.detail;
-    if (!confirm(`确定要从已知节点账本中移除 '${name}' 吗？`)) return;
+    if (!confirm(`确定要移除节点 '${name}' 吗？`)) return;
     try {
       await removeNode(name);
       showToast(`已移除节点 '${name}'`);
@@ -163,16 +163,16 @@
     }
   }
 
-  // 任务派发与终止 (支持单节点或多节点并发派发与容错隔离)
+  // 任务启动与终止 (支持单节点或多节点并发启动与容错隔离)
   async function handleRunJob(event: CustomEvent<any>) {
     try {
       const { succeeded, failed } = await dispatchJob(event.detail);
 
       if (succeeded.length > 0) {
         if (succeeded.length === 1) {
-          showToast(`任务已派发: ${succeeded[0].id} (节点: ${succeeded[0].node || 'local'}, PID: ${succeeded[0].pid})`);
+          showToast(`任务已启动: ${succeeded[0].id} (节点: ${succeeded[0].node || 'local'}, PID: ${succeeded[0].pid})`);
         } else {
-          showToast(`已成功向 ${succeeded.length} 个节点并发派发任务: ${succeeded.map(s => `${s.node}(${s.id})`).join(', ')}`);
+          showToast(`已成功在 ${succeeded.length} 个节点启动任务: ${succeeded.map(s => `${s.node}(${s.id})`).join(', ')}`);
         }
         isRunJobOpen = false;
         currentTab = 'jobs';
@@ -180,10 +180,10 @@
       }
 
       if (failed.length > 0) {
-        showToast(`部分节点派发失败 (${failed.length}): ${failed.map(f => `${f.node}: ${f.error}`).join('; ')}`, 'error');
+        showToast(`部分节点启动失败 (${failed.length}): ${failed.map(f => `${f.node}: ${f.error}`).join('; ')}`, 'error');
       }
     } catch (e: any) {
-      showToast(`派发失败: ${e.message}`, 'error');
+      showToast(`启动失败: ${e.message}`, 'error');
     }
   }
 

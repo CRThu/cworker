@@ -230,9 +230,10 @@
     const item = file || leftFiles.find(f => f.name === leftSelected);
     if (!item) return;
     const cleanSrc = leftPath.replace(/[\\/]+$/, '');
-    const cleanDst = rightPath.replace(/[\\/]+$/, '');
+    let cleanDst = rightPath.replace(/[\\/]+$/, '') || '.';
+    if (/^[A-Za-z]:$/.test(cleanDst)) cleanDst += '/';
     const srcPath = cleanSrc ? `${cleanSrc}/${item.name}` : item.name;
-    const dstPath = cleanDst ? `${cleanDst}/${item.name}` : item.name;
+    const dstPath = cleanDst;
 
     await executeTransfer(leftNode, srcPath, rightNode, dstPath, item.is_dir, 'left-to-right');
   }
@@ -242,9 +243,10 @@
     const item = file || rightFiles.find(f => f.name === rightSelected);
     if (!item) return;
     const cleanSrc = rightPath.replace(/[\\/]+$/, '');
-    const cleanDst = leftPath.replace(/[\\/]+$/, '');
+    let cleanDst = leftPath.replace(/[\\/]+$/, '') || '.';
+    if (/^[A-Za-z]:$/.test(cleanDst)) cleanDst += '/';
     const srcPath = cleanSrc ? `${cleanSrc}/${item.name}` : item.name;
-    const dstPath = cleanDst ? `${cleanDst}/${item.name}` : item.name;
+    const dstPath = cleanDst;
 
     await executeTransfer(rightNode, srcPath, leftNode, dstPath, item.is_dir, 'right-to-left');
   }

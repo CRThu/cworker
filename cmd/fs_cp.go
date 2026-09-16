@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"context"
 	"fmt"
 
 	"cworker/pkg/client"
@@ -31,10 +30,7 @@ var cpCmd = &cobra.Command{
 			concurrency = 8
 		}
 
-		ctx := cmd.Context()
-		if ctx == nil {
-			ctx = context.Background()
-		}
+		ctx := cmdContext(cmd)
 
 		cli := client.NewClient()
 		tracker := client.NewProgressTracker(1, 0)

@@ -31,9 +31,9 @@ var killCmd = &cobra.Command{
 		var err error
 
 		if targetNode != "" {
-			info, err = cli.KillJobNode(targetNode, jobID)
+			info, err = cli.KillJobNodeWithContext(cmdContext(cmd), targetNode, jobID)
 		} else {
-			info, err = cli.KillJob(jobID)
+			info, err = cli.KillJobWithContext(cmdContext(cmd), jobID)
 		}
 		if err != nil {
 			return fmt.Errorf("kill failed: %w", err)

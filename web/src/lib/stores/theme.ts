@@ -1,5 +1,5 @@
 // web/src/lib/stores/theme.ts - 黑白主题切换与系统自动自适应状态机
-import { writable, derived } from 'svelte/store';
+import { writable, get } from 'svelte/store';
 import type { ThemeMode } from '../types';
 
 const STORAGE_KEY = 'cworker-theme';
@@ -19,7 +19,7 @@ export const themeMode = writable<ThemeMode>(getInitialTheme());
 export const isDarkEffective = writable<boolean>(true);
 
 export function initTheme() {
-  if (typeof window === 'undefined') return;
+  if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
 
   const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
 
@@ -39,11 +39,9 @@ export function initTheme() {
   });
 
   mediaQuery.addEventListener('change', () => {
-    themeMode.subscribe((mode) => {
-      if (mode === 'system') {
-        updateDom('system');
-      }
-    })();
+    if (get(themeMode) === 'system') {
+      updateDom('system');
+    }
   });
 }
 

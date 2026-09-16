@@ -53,7 +53,7 @@ var cleanCmd = &cobra.Command{
 		}
 
 		cli := client.NewClient()
-		results, err := cli.CleanJobs(cleanNode, cleanDays, cleanAll)
+		results, err := cli.CleanJobsWithContext(cmdContext(cmd), cleanNode, cleanDays, cleanAll)
 		if err != nil {
 			return fmt.Errorf("clean jobs failed: %w", err)
 		}

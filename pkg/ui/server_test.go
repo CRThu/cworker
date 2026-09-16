@@ -1753,4 +1753,62 @@ func TestServer_HandleStreamLogs_FallbackToDisk(t *testing.T) {
 	}
 }
 
+func TestServer_UnifiedFS_LocalEndpoints(t *testing.T) {
+	srv, tempDir, cleanup := setupTestEnv(t)
+	defer cleanup()
+
+	handler := srv.Handler()
+
+	// 1. mkdir: POST /api/ui/fs/mkdir
+	subDir := filepath.Join(tempDir, "test_ui_mkdir")
+	mkdirBody, _ := json.Marshal(map[string]string{
+		"node": "",
+		"path": subDir,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/ui/fs/mkdir", bytes.NewReader(mkdirBody))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("mkdir failed, code %d: %s", w.Code, w.Body.String())
+	}
+	if info, err := os.Stat(subDir); err != nil || !info.IsDir() {
+		t.Fatalf("subDir not created on disk: %v", err)
+	}
+
+	// 写入一个测试文件
+	fPath := filepath.Join(subDir, "demo.txt")
+	_ = os.WriteFile(fPath, []byte("ui fs test"), 0644)
+
+	// 2. ls: GET /api/ui/fs/ls?node=&path=...
+	req = httptest.NewRequest(http.MethodGet, "/api/ui/fs/ls?path="+subDir, nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("ls failed, code %d: %s", w.Code, w.Body.String())
+	}
+	var entries []protocol.FileInfo
+	if err := json.NewDecoder(w.Body).Decode(&entries); err != nil {
+		t.Fatalf("decode entries failed: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name != "demo.txt" {
+		t.Fatalf("expected 1 entry 'demo.txt', got %+v", entries)
+	}
+
+	// 3. rm: POST /api/ui/fs/rm
+	rmBody, _ := json.Marshal(map[string]any{
+		"node":      "",
+		"path":      subDir,
+		"recursive": true,
+	})
+	req = httptest.NewRequest(http.MethodPost, "/api/ui/fs/rm", bytes.NewReader(rmBody))
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("rm failed, code %d: %s", w.Code, w.Body.String())
+	}
+	if _, err := os.Stat(subDir); !os.IsNotExist(err) {
+		t.Fatalf("expected subDir to be deleted")
+	}
+}
+
 

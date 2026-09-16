@@ -1,10 +1,21 @@
 package cmd
 
 import (
+	"context"
 	"os"
 
 	"github.com/spf13/cobra"
 )
+
+// cmdContext 安全提取 Cobra 命令的 Context，并在为 nil 时安全回退至 context.Background()
+func cmdContext(cmd *cobra.Command) context.Context {
+	if cmd != nil {
+		if ctx := cmd.Context(); ctx != nil {
+			return ctx
+		}
+	}
+	return context.Background()
+}
 
 // RootCmd cworker 顶层主命令 cw
 var RootCmd = &cobra.Command{

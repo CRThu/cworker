@@ -2001,6 +2001,161 @@ func TestClient_RunJob_NodeNormalization(t *testing.T) {
 	}
 }
 
+// 验证 HTTP 客户端双轨设计：RPC 超时 30s 防死锁，流式客户端超时 0 由 Context 约束
+func TestClient_HTTPClients_TimeoutConfiguration(t *testing.T) {
+	cli := NewClient()
+	if cli.httpClient == nil {
+		t.Fatal("httpClient is nil")
+	}
+	if cli.httpClient.Timeout != 30*time.Second {
+		t.Errorf("expected httpClient.Timeout to be 30s, got %v", cli.httpClient.Timeout)
+	}
+	if cli.streamClient == nil {
+		t.Fatal("streamClient is nil")
+	}
+	if cli.streamClient.Timeout != 0 {
+		t.Errorf("expected streamClient.Timeout to be 0 (unbounded), got %v", cli.streamClient.Timeout)
+	}
+}
+
+// 验证单一内核下 Client 的统一文件系统接口 (node == "")
+func TestClient_UnifiedLocalFS(t *testing.T) {
+	cli := NewClient()
+	tempDir := t.TempDir()
+
+	testFolder := filepath.Join(tempDir, "nested", "folder")
+	// 1. MakeDirWithContext
+	if err := cli.MakeDirWithContext(context.Background(), "", testFolder); err != nil {
+		t.Fatalf("MakeDirWithContext failed: %v", err)
+	}
+	if info, err := os.Stat(testFolder); err != nil || !info.IsDir() {
+		t.Fatalf("expected folder to exist, err: %v", err)
+	}
+
+	// 2. 写入文件并用 Cat 输出
+	filePath := filepath.Join(testFolder, "test.txt")
+	expectedContent := "hello single kernel filesystem"
+	if err := os.WriteFile(filePath, []byte(expectedContent), 0644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	var buf bytes.Buffer
+	if err := cli.Cat(context.Background(), "", filePath, &buf); err != nil {
+		t.Fatalf("Cat failed: %v", err)
+	}
+	if buf.String() != expectedContent {
+		t.Errorf("expected Cat content '%s', got '%s'", expectedContent, buf.String())
+	}
+
+	// 3. ListDirWithContext
+	entries, err := cli.ListDirWithContext(context.Background(), "", testFolder)
+	if err != nil {
+		t.Fatalf("ListDirWithContext failed: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name != "test.txt" {
+		t.Fatalf("expected 1 entry 'test.txt', got %v", entries)
+	}
+
+	// 4. Hash
+	hashEntries, err := cli.Hash(context.Background(), "", testFolder, true)
+	if err != nil {
+		t.Fatalf("Hash failed: %v", err)
+	}
+	if len(hashEntries) != 1 || hashEntries[0].SHA256 == "" {
+		t.Fatalf("expected 1 hashed file, got %v", hashEntries)
+	}
+
+	// 5. DeleteWithContext
+	if err := cli.DeleteWithContext(context.Background(), "", filePath, false); err != nil {
+		t.Fatalf("DeleteWithContext file failed: %v", err)
+	}
+	if err := cli.DeleteWithContext(context.Background(), "", testFolder, true); err != nil {
+		t.Fatalf("DeleteWithContext dir failed: %v", err)
+	}
+}
+
+// 验证任务全网并发发现与 Fast-path 熔断短路逻辑
+func TestClient_FindJobWorkerWithContext_FastPathConcurrent(t *testing.T) {
+	// Worker 1: 含有目标任务，立即返回
+	s1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/jobs/ps" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]protocol.JobInfo{
+				{ID: "target-job-fastpath", Status: protocol.JobStatusRunning},
+			})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer s1.Close()
+
+	// Worker 2 & 3: 响应极其缓慢 (1 秒延迟)，验证 Fast-path 熔断不会等待它们
+	slowHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(1 * time.Second):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]protocol.JobInfo{})
+		case <-r.Context().Done():
+			// 受到 probeCancel() 立即熔断
+			return
+		}
+	})
+	s2 := httptest.NewServer(slowHandler)
+	defer s2.Close()
+	s3 := httptest.NewServer(slowHandler)
+	defer s3.Close()
+
+	tempDir := t.TempDir()
+	cli := NewClient()
+	cli.dataDir = tempDir
+
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "worker-fast", Target: strings.TrimPrefix(s1.URL, "http://")})
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "worker-slow1", Target: strings.TrimPrefix(s2.URL, "http://")})
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "worker-slow2", Target: strings.TrimPrefix(s3.URL, "http://")})
+
+	start := time.Now()
+	target, err := cli.resolveTargetForJobWithContext(context.Background(), "", "target-job-fastpath")
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("resolveTargetForJobWithContext failed: %v", err)
+	}
+	if target.Name != "worker-fast" {
+		t.Errorf("expected target 'worker-fast', got '%s'", target.Name)
+	}
+	// 关键断言：Fast-path 并发短路耗时远小于 1s
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("expected fast-path short circuit < 500ms, took %v", elapsed)
+	}
+}
+
+// 验证 Context 取消可迅速终止各客户端操作
+func TestClient_ContextCancellation(t *testing.T) {
+	hangServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer hangServer.Close()
+
+	tempDir := t.TempDir()
+	cli := NewClient()
+	cli.dataDir = tempDir
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "hang-worker", Target: strings.TrimPrefix(hangServer.URL, "http://")})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err := cli.ListJobsWithContext(ctx, "hang-worker")
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected error on cancelled context, got nil")
+	}
+	if elapsed > 300*time.Millisecond {
+		t.Errorf("expected context cancellation within 300ms, took %v", elapsed)
+	}
+}
+
 
 
 

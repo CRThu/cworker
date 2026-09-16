@@ -127,6 +127,57 @@ func TestCmd_Ps(t *testing.T) {
 	if err := psCmd.RunE(psCmd, []string{}); err != nil {
 		t.Fatalf("psCmd failed: %v", err)
 	}
+
+	// 模拟返回任务列表
+	now := time.Now()
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/jobs/ps" {
+			rw.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(rw).Encode([]protocol.JobInfo{
+				{
+					ID:        "job-ps-1",
+					Name:      "test-job-active",
+					Node:      "worker-ps",
+					Status:    protocol.JobStatusRunning,
+					PID:       1234,
+					Command:   "ping 127.0.0.1",
+					StartTime: now,
+					Metrics: protocol.JobMetrics{
+						CPUPercent: 12.5,
+						MemoryMB:   256,
+					},
+				},
+				{
+					ID:        "job-ps-2",
+					Name:      "test-job-done",
+					Node:      "worker-ps",
+					Status:    protocol.JobStatusCompleted,
+					PID:       1235,
+					Command:   "echo done",
+					StartTime: now.Add(-time.Minute),
+				},
+			})
+			return
+		}
+		http.NotFound(rw, r)
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	cli := client.NewClient()
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "worker-ps", Target: u.Host, Token: "tok-ps"})
+
+	// 全集群 ps
+	if err := psCmd.RunE(psCmd, []string{}); err != nil {
+		t.Fatalf("psCmd failed: %v", err)
+	}
+
+	// 指定节点 ps -n worker-ps
+	psNode = "worker-ps"
+	defer func() { psNode = "" }()
+	if err := psCmd.RunE(psCmd, []string{}); err != nil {
+		t.Fatalf("psCmd with psNode failed: %v", err)
+	}
 }
 
 func TestCmd_ServiceHelpers(t *testing.T) {
@@ -1263,6 +1314,18 @@ func TestCmd_Logs(t *testing.T) {
 	if err := logsCmd.RunE(logsCmd, []string{"job-logs-123"}); err != nil {
 		t.Fatalf("logsCmd failed: %v", err)
 	}
+
+	// 2. 定向语法糖 worker-logs:job-logs-123
+	if err := logsCmd.RunE(logsCmd, []string{"worker-logs:job-logs-123"}); err != nil {
+		t.Fatalf("logsCmd syntax sugar failed: %v", err)
+	}
+
+	// 3. 定向 flag --node
+	logsNode = "worker-logs"
+	defer func() { logsNode = "" }()
+	if err := logsCmd.RunE(logsCmd, []string{"job-logs-123"}); err != nil {
+		t.Fatalf("logsCmd with logsNode failed: %v", err)
+	}
 }
 
 func TestCmd_Kill(t *testing.T) {
@@ -1293,6 +1356,18 @@ func TestCmd_Kill(t *testing.T) {
 
 	if err := killCmd.RunE(killCmd, []string{"job-kill-123"}); err != nil {
 		t.Fatalf("killCmd failed: %v", err)
+	}
+
+	// 2. 定向语法糖 worker-kill:job-kill-123
+	if err := killCmd.RunE(killCmd, []string{"worker-kill:job-kill-123"}); err != nil {
+		t.Fatalf("killCmd syntax sugar failed: %v", err)
+	}
+
+	// 3. 定向 flag --node
+	killNode = "worker-kill"
+	defer func() { killNode = "" }()
+	if err := killCmd.RunE(killCmd, []string{"job-kill-123"}); err != nil {
+		t.Fatalf("killCmd with killNode failed: %v", err)
 	}
 }
 
@@ -1380,6 +1455,7 @@ func TestCmd_Run(t *testing.T) {
 		t.Fatalf("runCmd failed: %v", err)
 	}
 }
+
 
 
 

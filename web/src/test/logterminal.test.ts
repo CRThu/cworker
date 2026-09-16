@@ -325,8 +325,8 @@ describe('JobsView filtering, status pills and action dispatches', () => {
       },
     });
 
-    // 1. 点击操作栏 "派发任务" 按钮
-    const runBtn = Array.from(container.querySelectorAll('.action-group button')).find(b => b.textContent?.includes('派发任务')) as HTMLElement;
+    // 1. 点击操作栏 "新建任务" 按钮
+    const runBtn = Array.from(container.querySelectorAll('.action-group button')).find(b => b.textContent?.includes('新建任务')) as HTMLElement;
     expect(runBtn).toBeDefined();
     await fireEvent.click(runBtn);
     expect(runOpened).toBe(true);

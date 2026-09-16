@@ -5,6 +5,7 @@
   export let options: string[] = [];
   export let selected: string[] = [];
   export let placeholder: string = '全部节点 (全集群)';
+  export let allSelectedText: string = '';
 
   let open = false;
   let container: HTMLDivElement;
@@ -49,8 +50,10 @@
 <div class="multiselect-container" bind:this={container}>
   <button class="multiselect-trigger select" type="button" on:click={toggleOpen}>
     <span class="trigger-label">
-      {#if isNoneSelected || isAllSelected}
+      {#if isNoneSelected}
         {placeholder}
+      {:else if isAllSelected}
+        {allSelectedText || (placeholder.includes('全部节点') ? placeholder : `全部节点 (${selected.length} 台)`)}
       {:else}
         已选 {selected.length} 个节点: {selected.join(', ')}
       {/if}

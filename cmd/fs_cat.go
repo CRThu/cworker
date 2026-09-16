@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"io"
 	"os"
 
 	"cworker/pkg/client"
@@ -15,23 +14,8 @@ var catCmd = &cobra.Command{
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		node, path := pathutil.ParseNodePath(args[0])
-		if node == "" {
-			cleanLocal, err := pathutil.NormalizeLocalPath(path)
-			if err != nil {
-				return err
-			}
-			f, err := os.Open(cleanLocal)
-			if err != nil {
-				return err
-			}
-			defer f.Close()
-			_, err = io.Copy(os.Stdout, f)
-			return err
-		}
-
 		cli := client.NewClient()
-
-		return cli.DownloadFile(node, path, os.Stdout)
+		return cli.Cat(cmdContext(cmd), node, path, os.Stdout)
 	},
 }
 

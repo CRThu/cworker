@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -35,23 +34,12 @@ var diffCmd = &cobra.Command{
 		all, _ := cmd.Flags().GetBool("all")
 		limit, _ := cmd.Flags().GetInt("limit")
 
-		ctx := cmd.Context()
-		if ctx == nil {
-			ctx = context.Background()
-		}
+		ctx := cmdContext(cmd)
 
 		cli := client.NewClient()
 
-		// 1. 获取源端与目标端的文件清单与哈希
-		var srcFiles []protocol.FileInfo
-		var dstFiles []protocol.FileInfo
-		var err error
-
-		if srcNode == "" {
-			srcFiles, err = client.HashLocalPath(srcPath, recursive)
-		} else {
-			srcFiles, err = cli.HashRemotePath(ctx, srcNode, srcPath, recursive)
-		}
+		// 1. 获取源端与目标端的文件清单与哈希 (通过 Client.Hash 统一本地与远端)
+		srcFiles, err := cli.Hash(ctx, srcNode, srcPath, recursive)
 		if err != nil {
 			if strings.Contains(err.Error(), "requires recursive flag (-r)") {
 				return &ExitError{Code: 2, Msg: fmt.Sprintf("omitting directory '%s' (use -r to diff recursively)", srcRaw)}
@@ -59,11 +47,7 @@ var diffCmd = &cobra.Command{
 			return &ExitError{Code: 2, Msg: fmt.Sprintf("failed to inspect source '%s': %v", srcRaw, err)}
 		}
 
-		if dstNode == "" {
-			dstFiles, err = client.HashLocalPath(dstPath, recursive)
-		} else {
-			dstFiles, err = cli.HashRemotePath(ctx, dstNode, dstPath, recursive)
-		}
+		dstFiles, err := cli.Hash(ctx, dstNode, dstPath, recursive)
 		if err != nil {
 			if strings.Contains(err.Error(), "requires recursive flag (-r)") {
 				return &ExitError{Code: 2, Msg: fmt.Sprintf("omitting directory '%s' (use -r to diff recursively)", dstRaw)}

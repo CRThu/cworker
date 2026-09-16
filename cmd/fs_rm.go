@@ -43,21 +43,16 @@ var rmCmd = &cobra.Command{
 			}
 		}
 
-		if node == "" {
-			if err := client.DeleteLocal(path, rmRecursive); err != nil {
-				return fmt.Errorf("delete failed: %w", err)
-			}
-			fmt.Printf("[OK] Deleted '%s'\n", path)
-			return nil
-		}
-
 		cli := client.NewClient()
-
-		if err := cli.Delete(node, path, rmRecursive); err != nil {
+		if err := cli.DeleteWithContext(cmdContext(cmd), node, path, rmRecursive); err != nil {
 			return fmt.Errorf("delete failed: %w", err)
 		}
 
-		fmt.Printf("[OK] Deleted '%s'\n", targetName)
+		if node == "" {
+			fmt.Printf("[OK] Deleted '%s'\n", path)
+		} else {
+			fmt.Printf("[OK] Deleted '%s'\n", targetName)
+		}
 		return nil
 	},
 }

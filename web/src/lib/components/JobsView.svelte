@@ -153,7 +153,7 @@
       </button>
       <button class="btn btn-primary btn-sm" type="button" on:click={openRunModal}>
         <Plus size={14} />
-        <span>派发任务</span>
+        <span>新建任务</span>
       </button>
     </div>
   </div>

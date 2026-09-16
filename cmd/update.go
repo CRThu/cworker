@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"bufio"
-	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -34,7 +33,7 @@ var updateCmd = &cobra.Command{
 			return fmt.Errorf("init updater failed: %w", err)
 		}
 
-		ctx := context.Background()
+		ctx := cmdContext(cmd)
 		rel, err := up.FetchLatestRelease(ctx)
 		if err != nil {
 			return fmt.Errorf("check latest release failed: %w", err)

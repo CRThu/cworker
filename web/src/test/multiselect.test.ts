@@ -48,4 +48,29 @@ describe('MultiSelect component', () => {
     expect(getByText('全选')).toBeTruthy();
     expect(getByText('清空')).toBeTruthy();
   });
+
+  it('should render allSelectedText when all options are selected', () => {
+    const { getByText } = render(MultiSelect, {
+      props: {
+        options,
+        selected: ['node-alpha', 'node-beta', 'node-gamma'],
+        placeholder: '请选择目标节点',
+        allSelectedText: '全部节点 (全选)',
+      },
+    });
+
+    expect(getByText('全部节点 (全选)')).toBeTruthy();
+  });
+
+  it('should render count fallback when all options selected and custom placeholder without allSelectedText', () => {
+    const { getByText } = render(MultiSelect, {
+      props: {
+        options,
+        selected: ['node-alpha', 'node-beta', 'node-gamma'],
+        placeholder: '请选择目标节点',
+      },
+    });
+
+    expect(getByText('全部节点 (3 台)')).toBeTruthy();
+  });
 });

@@ -435,12 +435,16 @@ func extractExeFromZip(zipData []byte) ([]byte, error) {
 	}
 	for _, f := range r.File {
 		if strings.EqualFold(filepath.Base(f.Name), "cw.exe") || strings.HasSuffix(strings.ToLower(f.Name), ".exe") {
+			// 限制单个可执行文件解压上限为 100MB，物理防范恶意 Zip Bomb
+			if f.UncompressedSize64 > 100*1024*1024 {
+				return nil, fmt.Errorf("executable inside zip exceeds maximum allowed size (100MB)")
+			}
 			rc, err := f.Open()
 			if err != nil {
 				return nil, err
 			}
 			defer rc.Close()
-			return io.ReadAll(rc)
+			return io.ReadAll(io.LimitReader(rc, 100*1024*1024))
 		}
 	}
 	return nil, fmt.Errorf("no executable found inside zip archive")

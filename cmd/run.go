@@ -24,7 +24,7 @@ var runCmd = &cobra.Command{
 		rawCommand := strings.Join(args, " ")
 		cli := client.NewClient()
 
-		info, err := cli.RunJob(protocol.RunJobRequest{
+		info, err := cli.RunJobWithContext(cmdContext(cmd), protocol.RunJobRequest{
 			Name:    runJobName,
 			Node:    runNodeName,
 			Command: rawCommand,

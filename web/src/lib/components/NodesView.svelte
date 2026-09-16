@@ -203,7 +203,7 @@
                     class="btn btn-danger btn-sm"
                     type="button"
                     on:click={() => handleRemove(n.name)}
-                    title="从账本移除节点"
+                    title="移除节点"
                   >
                     <Trash2 size={12} />
                     <span>移除</span>
@@ -216,7 +216,7 @@
           {#if nodes.length === 0}
             <tr>
               <td colspan="7" class="empty-cell">
-                当前账本中暂无 Worker 节点。点击右上角 "+ 添加节点" 进行添加。
+                暂无节点。点击右上角 "+ 添加节点" 添加。
               </td>
             </tr>
           {/if}

@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"os/signal"
@@ -42,7 +41,7 @@ var workerCmd = &cobra.Command{
 		}
 
 		// 2. 交互式控制台前台启动
-		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		ctx, cancel := signal.NotifyContext(cmdContext(cmd), os.Interrupt, syscall.SIGTERM)
 		defer cancel()
 
 		w, err := worker.NewWorker(worker.Config{
