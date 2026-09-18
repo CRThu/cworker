@@ -118,6 +118,8 @@ describe('DualPaneFiles in-situ operations and keyboard shortcuts', () => {
 
   it('should display progress banner with close button and close on click', async () => {
     // 模拟 transfer 会调用 onProgress
+    let finishTransfer: () => void = () => {};
+    const transferPromise = new Promise<void>(r => { finishTransfer = r; });
     vi.mocked(api.transfer).mockImplementation(async (_req, onProgress) => {
       if (onProgress) {
         onProgress({
@@ -128,7 +130,7 @@ describe('DualPaneFiles in-situ operations and keyboard shortcuts', () => {
           active_files: ['fileA.txt'],
         });
       }
-      await new Promise(r => setTimeout(r, 50));
+      await transferPromise;
     });
 
     const { container } = render(DualPaneFiles, {
@@ -155,6 +157,7 @@ describe('DualPaneFiles in-situ operations and keyboard shortcuts', () => {
 
     // 验证横幅已消失
     expect(container.querySelector('.progress-banner')).toBeNull();
+    finishTransfer();
   });
 
   it('should allow manual dismissal of error banner on transfer failure', async () => {
@@ -186,6 +189,8 @@ describe('DualPaneFiles in-situ operations and keyboard shortcuts', () => {
   });
 
   it('should correctly format bulk files progress and present clean single-bar layout without clutter', async () => {
+    let finishTransfer: () => void = () => {};
+    const transferPromise = new Promise<void>(r => { finishTransfer = r; });
     vi.mocked(api.transfer).mockImplementation(async (_req, onProgress) => {
       if (onProgress) {
         onProgress({
@@ -198,7 +203,7 @@ describe('DualPaneFiles in-situ operations and keyboard shortcuts', () => {
           speed_bps: 10485760,
         });
       }
-      await new Promise(r => setTimeout(r, 50));
+      await transferPromise;
     });
 
     const { container } = render(DualPaneFiles, {
@@ -223,6 +228,7 @@ describe('DualPaneFiles in-situ operations and keyboard shortcuts', () => {
     expect(container.querySelector('.btn-banner-toggle')).toBeNull();
     expect(container.querySelector('.progress-files-detail')).toBeNull();
     expect(container.querySelector('.progress-file-chips')).toBeNull();
+    finishTransfer();
   });
 
   it('should call getRoots with selected node when switching node in left pane', async () => {
@@ -413,6 +419,8 @@ describe('DualPaneFiles in-situ operations and keyboard shortcuts', () => {
   });
 
   it('should format progress banner properly for single large file transfer (no redundant file count, valid progress width)', async () => {
+    let finishTransfer: () => void = () => {};
+    const transferPromise = new Promise<void>(r => { finishTransfer = r; });
     vi.mocked(api.transfer).mockImplementation(async (req, onProgress) => {
       if (onProgress) {
         onProgress({
@@ -425,7 +433,7 @@ describe('DualPaneFiles in-situ operations and keyboard shortcuts', () => {
           percent: 25,
         });
       }
-      await new Promise(r => setTimeout(r, 50));
+      await transferPromise;
     });
 
     const { container } = render(DualPaneFiles, {
@@ -445,9 +453,12 @@ describe('DualPaneFiles in-situ operations and keyboard shortcuts', () => {
     expect(banner?.textContent).toContain('25%');
     const fill = container.querySelector('.progress-fill') as HTMLElement;
     expect(fill?.style.width).toBe('25%');
+    finishTransfer();
   });
 
   it('should format progress banner properly for multi-file transfer (shows completed/total items)', async () => {
+    let finishTransfer: () => void = () => {};
+    const transferPromise = new Promise<void>(r => { finishTransfer = r; });
     vi.mocked(api.transfer).mockImplementation(async (req, onProgress) => {
       if (onProgress) {
         onProgress({
@@ -460,7 +471,7 @@ describe('DualPaneFiles in-situ operations and keyboard shortcuts', () => {
           percent: 50,
         });
       }
-      await new Promise(r => setTimeout(r, 50));
+      await transferPromise;
     });
 
     const { container } = render(DualPaneFiles, {
@@ -480,6 +491,7 @@ describe('DualPaneFiles in-situ operations and keyboard shortcuts', () => {
     expect(banner?.textContent).toContain('50%');
     const fill = container.querySelector('.progress-fill') as HTMLElement;
     expect(fill?.style.width).toBe('50%');
+    finishTransfer();
   });
 
   it('should pass target directory directly as dst_path to transfer (preventing backend double nesting)', async () => {
