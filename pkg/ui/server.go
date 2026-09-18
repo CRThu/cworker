@@ -573,13 +573,19 @@ func (s *Server) handleStreamLogs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 桥接 Client.StreamLogsNode 推流
-	_ = s.cli.StreamLogsNode(r.Context(), node, jobID, writer)
+	streamErr := s.cli.StreamLogsNode(r.Context(), node, jobID, writer)
 
 	// 若流式广播未发送任何字节 (例如已完成任务或 Worker 刚重启)，自动回退直接读取已落盘历史输出
 	if written == 0 {
 		if logs, err := s.cli.GetLogsNodeWithContext(r.Context(), node, jobID, 500); err == nil && len(logs) > 0 {
 			_ = conn.Write(r.Context(), websocket.MessageText, logstream.EnsureUTF8([]byte(logs)))
+		} else if streamErr != nil && r.Context().Err() == nil {
+			slog.Warn("stream logs failed", "job_id", jobID, "err", streamErr)
+			_ = conn.Write(r.Context(), websocket.MessageText, []byte(fmt.Sprintf("\n[cworker] 获取任务日志失败: %v\n", streamErr)))
 		}
+	} else if streamErr != nil && r.Context().Err() == nil && websocket.CloseStatus(streamErr) != websocket.StatusNormalClosure {
+		slog.Warn("stream logs interrupted", "job_id", jobID, "err", streamErr)
+		_ = conn.Write(r.Context(), websocket.MessageText, []byte(fmt.Sprintf("\n[cworker] 实时日志流异常中断: %v\n", streamErr)))
 	}
 }
 

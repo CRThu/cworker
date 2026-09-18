@@ -1,0 +1,16 @@
+[tool.bumpversion]
+current_version = "1.6.0"
+parse = "(?P<major>\\d+)\\.(?P<minor>\\d+)\\.(?P<patch>\\d+)"
+serialize = ["{major}.{minor}.{patch}"]
+search = "{current_version}"
+replace = "{new_version}"
+commit = true
+tag = true
+allow_dirty = true
+tag_name = "v{new_version}"
+commit_message = "chore(release): 发布 v{new_version} 版本"
+
+[[tool.bumpversion.files]]
+filename = "pkg/protocol/types.go"
+search = 'Version = "{current_version}"'
+replace = 'Version = "{new_version}"'

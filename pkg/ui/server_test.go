@@ -1753,6 +1753,59 @@ func TestServer_HandleStreamLogs_FallbackToDisk(t *testing.T) {
 	}
 }
 
+func TestServer_HandleStreamLogs_StreamErrorPropagated(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv("USERPROFILE", tempDir)
+
+	// 启动一个 Mock Worker，全部请求返回 500
+	mockWorker := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		http.Error(rw, "worker failure error", http.StatusInternalServerError)
+	}))
+	defer mockWorker.Close()
+
+	cli := client.NewClient()
+	_ = cli.SaveKnownNode(protocol.KnownNode{
+		Name:   "node-err",
+		Target: strings.TrimPrefix(mockWorker.URL, "http://"),
+	})
+
+	srv := NewServer(Config{
+		BindAddr: "127.0.0.1",
+		Port:     -1,
+		Client:   cli,
+	})
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = srv.Start(ctx) }()
+
+	for i := 0; i < 50; i++ {
+		time.Sleep(50 * time.Millisecond)
+		if srv.Addr() != "" {
+			break
+		}
+	}
+
+	wsURL := strings.Replace(srv.URL(), "http://", "ws://", 1) + "/api/ui/jobs/stream?node=node-err&job_id=job-err-1"
+	wsCtx, wsCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer wsCancel()
+
+	conn, _, err := websocket.Dial(wsCtx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("websocket dial failed: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+
+	_, msg, err := conn.Read(wsCtx)
+	if err != nil {
+		t.Fatalf("expected error frame from server, got error: %v", err)
+	}
+	if !strings.Contains(string(msg), "获取任务日志失败") {
+		t.Fatalf("expected error frame to contain '获取任务日志失败', got: %s", string(msg))
+	}
+}
+
 func TestServer_UnifiedFS_LocalEndpoints(t *testing.T) {
 	srv, tempDir, cleanup := setupTestEnv(t)
 	defer cleanup()

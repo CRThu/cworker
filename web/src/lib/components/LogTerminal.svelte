@@ -62,7 +62,7 @@
         if (!rawBuffer.trim()) {
           await fetchFallbackLogs();
         } else {
-          wsStatus = '传输完毕';
+          wsStatus = status === 'RUNNING' ? '连接已断开' : '传输完毕';
         }
       };
 
@@ -72,7 +72,7 @@
         if (!rawBuffer.trim()) {
           await fetchFallbackLogs();
         } else {
-          wsStatus = '连接断开';
+          wsStatus = status === 'RUNNING' ? '连接异常中断' : '连接断开';
         }
       };
     } catch (e: any) {
@@ -89,7 +89,8 @@
       query.set('lines', '500');
       const res = await fetch(`/api/ui/jobs/logs?${query.toString()}`);
       if (!res.ok) {
-        wsStatus = '暂无日志输出';
+        const errText = await res.text().catch(() => '');
+        wsStatus = `加载失败: ${errText || res.statusText || '服务异常'}`;
         return;
       }
       const text = await res.text();
@@ -105,8 +106,8 @@
       } else {
         wsStatus = '暂无日志输出';
       }
-    } catch {
-      wsStatus = '暂无日志输出';
+    } catch (e: any) {
+      wsStatus = `加载失败: ${e?.message || '网络连接异常'}`;
     }
   }
 
@@ -208,8 +209,10 @@
         {#if renderedHtml}
           <!-- eslint-disable-next-line svelte/no-at-html-tags -->
           {@html renderedHtml}
+        {:else if wsStatus.startsWith('加载失败')}
+          <div class="empty-hint text-danger">{wsStatus}</div>
         {:else}
-          <div class="empty-hint">暂无日志输出</div>
+          <div class="empty-hint">{wsStatus === '正在加载日志...' ? '正在加载日志...' : '暂无日志输出'}</div>
         {/if}
       </div>
 
@@ -303,6 +306,9 @@
     color: #64748b;
     text-align: center;
     padding: 32px 0;
+  }
+  .empty-hint.text-danger {
+    color: var(--danger);
   }
   .terminal-footer {
     display: flex;

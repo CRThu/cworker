@@ -806,6 +806,9 @@ func (c *Client) StreamLogsNode(ctx context.Context, node string, jobID string, 
 	}
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
+	// 解除 nhooyr.io/websocket 默认 32KB (32768 字节) 单帧读取保护限制，防止大历史积压或长终端输出熔断
+	conn.SetReadLimit(-1)
+
 	for {
 		_, data, err := conn.Read(ctx)
 		if err != nil {

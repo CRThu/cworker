@@ -125,6 +125,62 @@ describe('LogTerminal real-time log streaming and retention', () => {
     expect(container.querySelector('.footer-hint')?.textContent).toContain('传输完毕');
   });
 
+  it('should display "连接已断开" when websocket closes while job is still RUNNING', async () => {
+    const { container } = render(LogTerminal, {
+      props: {
+        open: true,
+        jobId: 'job-running-disc',
+        status: 'RUNNING',
+      },
+    });
+
+    await new Promise(r => setTimeout(r, 10));
+    const ws = MockWebSocket.instances[0];
+    expect(ws).toBeDefined();
+
+    ws.onmessage?.({ data: 'Some running log output\n' });
+    await new Promise(r => setTimeout(r, 10));
+
+    ws.close();
+    await new Promise(r => setTimeout(r, 10));
+
+    expect(container.querySelector('.footer-hint')?.textContent).toContain('连接已断开');
+    expect(container.querySelector('.terminal-body')?.textContent).toContain('Some running log output');
+  });
+
+  it('should display error message when fallback REST /api/ui/jobs/logs fails with 500', async () => {
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 500,
+      statusText: 'Internal Server Error',
+      text: () => Promise.resolve('node DESKTOP-4090 not found in known nodes ledger'),
+    });
+    (globalThis as any).fetch = mockFetch;
+
+    const { container } = render(LogTerminal, {
+      props: {
+        open: true,
+        jobId: 'job-fallback-err',
+        node: 'DESKTOP-4090',
+        status: 'RUNNING',
+      },
+    });
+
+    await new Promise(r => setTimeout(r, 10));
+    const ws = MockWebSocket.instances[0];
+    expect(ws).toBeDefined();
+
+    // WebSocket 立即关闭且无内容，触发 fallback
+    ws.close();
+    await new Promise(r => setTimeout(r, 20));
+
+    expect(mockFetch).toHaveBeenCalled();
+    const terminalBody = container.querySelector('.terminal-body');
+    expect(terminalBody?.textContent).toContain('加载失败: node DESKTOP-4090 not found in known nodes ledger');
+    expect(terminalBody?.querySelector('.text-danger')).toBeTruthy();
+    expect(container.querySelector('.footer-hint')?.textContent).toContain('加载失败');
+  });
+
   it('should support manual clear and reload', async () => {
     const { container } = render(LogTerminal, {
       props: {

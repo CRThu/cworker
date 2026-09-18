@@ -354,6 +354,58 @@ func TestClient_StreamLogs(t *testing.T) {
 	}
 }
 
+func TestClient_StreamLogs_Over32KB(t *testing.T) {
+	// 生成 64KB 大小的数据帧，验证解除 32KB 限制后读取正常
+	largePayload := strings.Repeat("A", 64*1024) + "\n"
+
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/jobs/ps" {
+			_ = json.NewEncoder(rw).Encode([]protocol.JobInfo{
+				{ID: "stream-large-job", Command: "test", Status: protocol.JobStatusRunning},
+			})
+			return
+		}
+		if r.URL.Path == "/api/v1/jobs/stream" {
+			conn, err := websocket.Accept(rw, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+			if err != nil {
+				return
+			}
+			defer conn.Close(websocket.StatusNormalClosure, "")
+			_ = conn.Write(r.Context(), websocket.MessageText, []byte(largePayload))
+			return
+		}
+		http.NotFound(rw, r)
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	tempDir, err := os.MkdirTemp("", "cw_client_stream_large_*")
+	if err != nil {
+		t.Fatalf("create temp dir failed: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	cli := NewClient()
+	cli.dataDir = tempDir
+	_ = cli.SaveKnownNode(protocol.KnownNode{
+		Name:   "stream-large-node",
+		Target: u.Host,
+		Token:  "test-token",
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	var buf bytes.Buffer
+	err = cli.StreamLogs(ctx, "stream-large-job", &buf)
+	if err != nil && err != context.DeadlineExceeded && err != context.Canceled {
+		t.Fatalf("StreamLogs over 32KB returned unexpected error: %v", err)
+	}
+	if len(buf.String()) != len(largePayload) {
+		t.Fatalf("expected %d bytes, got: %d", len(largePayload), len(buf.String()))
+	}
+}
+
 func TestClient_ResolveWorker_IPv6(t *testing.T) {
 	tempDir, err := os.MkdirTemp("", "cw_client_ipv6_*")
 	if err != nil {
