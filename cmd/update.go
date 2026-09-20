@@ -3,6 +3,7 @@ package cmd
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -72,7 +73,11 @@ var updateCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		fmt.Printf("\nMatched asset: %s (%.1f MB)\n", asset.Name, float64(asset.Size)/(1024*1024))
+		if asset.Size > 0 {
+			fmt.Printf("\nMatched asset: %s (%.1f MB)\n", asset.Name, float64(asset.Size)/(1024*1024))
+		} else {
+			fmt.Printf("\nMatched asset: %s\n", asset.Name)
+		}
 
 		// 检查运行中活跃任务冲突
 		if err := up.CheckRunningJobs(ctx); err != nil {
@@ -85,7 +90,14 @@ var updateCmd = &cobra.Command{
 			reader := bufio.NewReader(os.Stdin)
 			input, err := reader.ReadString('\n')
 			if err != nil {
-				return err
+				trimmed := strings.TrimSpace(input)
+				if err == io.EOF && trimmed == "" {
+					fmt.Println("\nUpdate canceled (EOF detected. In non-interactive or script environments, use 'cw update -y').")
+					return nil
+				}
+				if err != io.EOF {
+					return err
+				}
 			}
 			input = strings.TrimSpace(strings.ToLower(input))
 			if input != "y" && input != "yes" {

@@ -1111,6 +1111,67 @@ func TestCmd_Update_ExecutionFlow(t *testing.T) {
 	}
 }
 
+func TestCmd_Update_ProbeRedirectAndEOF(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv("USERPROFILE", tempDir)
+
+	// 模拟镜像站 302 重定向
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "releases/latest/download/cw.exe") {
+			rw.Header().Set("Location", "/https://github.com/crthu/cworker/releases/download/v8.8.8/cw.exe")
+			rw.WriteHeader(http.StatusFound)
+			return
+		}
+		rw.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	origVer := Version
+	defer func() { Version = origVer }()
+	Version = "1.0.0"
+
+	// 1. 测试通过 302 探针顺利检测到版本
+	updateCheck = true
+	updateYes = false
+	updateForce = false
+	updateMirror = server.URL
+	updateProxy = ""
+
+	out, err := captureStdout(func() error {
+		return updateCmd.RunE(updateCmd, []string{})
+	})
+	if err != nil {
+		t.Fatalf("update --check with 302 redirect failed: %v", err)
+	}
+	if !strings.Contains(out, "New release v8.8.8 is available") {
+		t.Fatalf("expected new release v8.8.8 notice, got: %s", out)
+	}
+
+	// 2. 测试交互确认时的 EOF 优雅退出（无需管道挂起）
+	updateCheck = false
+	// 重定向 os.Stdin 为空的 Reader（模拟 EOF 场景）
+	rPipe, wPipe, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create pipe failed: %v", err)
+	}
+	_ = wPipe.Close() // 立即关闭写入端，使读取端直接产生 EOF
+	origStdin := os.Stdin
+	defer func() { os.Stdin = origStdin }()
+	os.Stdin = rPipe
+
+	outEOF, errEOF := captureStdout(func() error {
+		return updateCmd.RunE(updateCmd, []string{})
+	})
+	_ = rPipe.Close()
+
+	if errEOF != nil {
+		t.Fatalf("expected graceful nil on EOF, got error: %v", errEOF)
+	}
+	if !strings.Contains(outEOF, "EOF detected") {
+		t.Fatalf("expected 'EOF detected' friendly guidance in output, got: %s", outEOF)
+	}
+}
+
 func TestCmd_ExitErrorAndFormatBytes(t *testing.T) {
 	// 1. ExitError
 	err := &ExitError{Code: 42, Msg: "custom fatal error"}

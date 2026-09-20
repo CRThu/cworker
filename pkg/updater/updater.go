@@ -153,10 +153,174 @@ func detectWindowsRegistryProxy() *url.URL {
 	return u
 }
 
-// FetchLatestRelease 查询 GitHub 最新 Release 元数据
+// ExtractTagFromLocation 从 HTTP 重定向 Location 头中精准提取版本 Tag
+// 支持各类形如 /releases/download/<tag>/cw.exe 或 /releases/tag/<tag> 的绝对/相对路径及镜像反代 URL
+func ExtractTagFromLocation(loc string) (string, error) {
+	loc = strings.TrimSpace(loc)
+	if loc == "" {
+		return "", fmt.Errorf("empty redirect location header")
+	}
+
+	// 模式 1: .../releases/download/<tag>/...
+	const dlPattern = "/releases/download/"
+	if idx := strings.Index(loc, dlPattern); idx != -1 {
+		remainder := loc[idx+len(dlPattern):]
+		parts := strings.Split(remainder, "/")
+		if len(parts) > 0 {
+			tag := strings.TrimSpace(parts[0])
+			tag = strings.Split(tag, "?")[0]
+			tag = strings.Split(tag, "#")[0]
+			if tag != "" {
+				return tag, nil
+			}
+		}
+	}
+
+	// 模式 2: .../releases/tag/<tag>
+	const tagPattern = "/releases/tag/"
+	if idx := strings.Index(loc, tagPattern); idx != -1 {
+		remainder := loc[idx+len(tagPattern):]
+		parts := strings.Split(remainder, "/")
+		if len(parts) > 0 {
+			tag := strings.TrimSpace(parts[0])
+			tag = strings.Split(tag, "?")[0]
+			tag = strings.Split(tag, "#")[0]
+			if tag != "" {
+				return tag, nil
+			}
+		}
+	}
+
+	return "", fmt.Errorf("could not extract version tag from location: %s", loc)
+}
+
+// FetchLatestRelease 统一通过 releases/latest 探针获取最新版本与资产（免 API 限制、镜像原生兼容）
 func (u *Updater) FetchLatestRelease(ctx context.Context) (*ReleaseInfo, error) {
-	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", u.Repo)
+	// 构造 latest 目标探针 URL (以 cw.exe 为锚点)
+	probeURL := fmt.Sprintf("https://github.com/%s/releases/latest/download/cw.exe", u.Repo)
 	if u.Mirror != "" {
+		mirror := strings.TrimRight(u.Mirror, "/") + "/"
+		probeURL = mirror + probeURL
+	}
+
+	// 创建不跟随重定向的探针专用 HTTP Client
+	probeTransport := u.httpClient.Transport
+	probeClient := &http.Client{
+		Transport: probeTransport,
+		Timeout:   15 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	// 优先以 HEAD 请求探测（开销极低），若服务器不支持则平滑降级为 GET
+	rel, err := u.probeReleaseInfo(ctx, probeClient, http.MethodHead, probeURL)
+	if err != nil {
+		rel, err = u.probeReleaseInfo(ctx, probeClient, http.MethodGet, probeURL)
+	}
+
+	// 若 302 探针成功提取到版本与资产
+	if err == nil && rel != nil {
+		// 若为直连且无 mirror 且无 Release Notes，尝试轻量获取 Release Notes（失败则静默忽略，绝不阻塞升级主链路）
+		if u.Mirror == "" && rel.Body == "" {
+			u.tryEnrichReleaseNotes(ctx, rel)
+		}
+		return rel, nil
+	}
+
+	// 若探针失败，尝试直接从 API 获取作为兜底（支持针对本地纯 Mock Server 测试）
+	apiRel, apiErr := u.fetchFromAPI(ctx)
+	if apiErr == nil && apiRel != nil {
+		return apiRel, nil
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("probe latest release failed: %w", err)
+	}
+	return nil, fmt.Errorf("failed to determine latest release")
+}
+
+func (u *Updater) probeReleaseInfo(ctx context.Context, client *http.Client, method, probeURL string) (*ReleaseInfo, error) {
+	req, err := http.NewRequestWithContext(ctx, method, probeURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "cworker-updater/"+u.CurrentVer)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	// 截获重定向响应并提取 Tag
+	if resp.StatusCode == http.StatusFound ||
+		resp.StatusCode == http.StatusMovedPermanently ||
+		resp.StatusCode == http.StatusSeeOther ||
+		resp.StatusCode == http.StatusTemporaryRedirect ||
+		resp.StatusCode == http.StatusPermanentRedirect {
+		loc := resp.Header.Get("Location")
+		tag, err := ExtractTagFromLocation(loc)
+		if err != nil {
+			return nil, err
+		}
+		return u.buildReleaseInfoFromTag(tag), nil
+	}
+
+	// 若直接返回 200 OK 且包含完整 JSON，兼容直接返回 ReleaseInfo 的测试服务
+	if resp.StatusCode == http.StatusOK {
+		var rel ReleaseInfo
+		if err := json.NewDecoder(resp.Body).Decode(&rel); err == nil && rel.TagName != "" {
+			if len(rel.Assets) == 0 {
+				rel.Assets = u.buildReleaseInfoFromTag(rel.TagName).Assets
+			}
+			return &rel, nil
+		}
+	}
+
+	return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+}
+
+func (u *Updater) buildReleaseInfoFromTag(tag string) *ReleaseInfo {
+	downloadBase := fmt.Sprintf("https://github.com/%s/releases/download/%s", u.Repo, tag)
+	return &ReleaseInfo{
+		TagName: tag,
+		Name:    tag,
+		Assets: []ReleaseAsset{
+			{
+				Name:               "cw.exe",
+				BrowserDownloadURL: fmt.Sprintf("%s/cw.exe", downloadBase),
+			},
+			{
+				Name:               "cw.exe.sha256",
+				BrowserDownloadURL: fmt.Sprintf("%s/cw.exe.sha256", downloadBase),
+			},
+		},
+	}
+}
+
+func (u *Updater) tryEnrichReleaseNotes(ctx context.Context, rel *ReleaseInfo) {
+	enrichCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	apiRel, err := u.fetchFromAPI(enrichCtx)
+	if err == nil && apiRel != nil {
+		if apiRel.Body != "" {
+			rel.Body = apiRel.Body
+		}
+		for _, a := range apiRel.Assets {
+			for i := range rel.Assets {
+				if strings.EqualFold(rel.Assets[i].Name, a.Name) && a.Size > 0 {
+					rel.Assets[i].Size = a.Size
+				}
+			}
+		}
+	}
+}
+
+func (u *Updater) fetchFromAPI(ctx context.Context) (*ReleaseInfo, error) {
+	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", u.Repo)
+	if u.Mirror != "" && !strings.HasPrefix(apiURL, strings.TrimRight(u.Mirror, "/")) {
 		mirror := strings.TrimRight(u.Mirror, "/") + "/"
 		apiURL = mirror + apiURL
 	}
@@ -288,7 +452,7 @@ func (u *Updater) CheckRunningJobs(ctx context.Context) error {
 // DownloadAsset 下载目标资产并计算单遍 SHA-256，返回下载文件的实际数据
 func (u *Updater) DownloadAsset(ctx context.Context, asset *ReleaseAsset, onProgress func(downloaded, total int64)) ([]byte, string, error) {
 	downloadURL := asset.BrowserDownloadURL
-	if u.Mirror != "" {
+	if u.Mirror != "" && !strings.HasPrefix(downloadURL, strings.TrimRight(u.Mirror, "/")) {
 		mirror := strings.TrimRight(u.Mirror, "/") + "/"
 		downloadURL = mirror + downloadURL
 	}

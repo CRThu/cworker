@@ -157,6 +157,91 @@ func TestVerifyChecksum(t *testing.T) {
 	}
 }
 
+func TestExtractTagFromLocation(t *testing.T) {
+	cases := []struct {
+		input    string
+		expected string
+		wantErr  bool
+	}{
+		{
+			input:    "https://github.com/crthu/cworker/releases/download/v1.7.1/cw.exe",
+			expected: "v1.7.1",
+		},
+		{
+			input:    "https://ghfast.top/https://github.com/crthu/cworker/releases/download/v1.7.1/cw.exe",
+			expected: "v1.7.1",
+		},
+		{
+			input:    "/https://github.com/crthu/cworker/releases/download/v2.0.0-rc1/cw.exe",
+			expected: "v2.0.0-rc1",
+		},
+		{
+			input:    "https://github.com/crthu/cworker/releases/tag/v1.7.1",
+			expected: "v1.7.1",
+		},
+		{
+			input:    "/releases/tag/v1.7.1?ref=latest#anchor",
+			expected: "v1.7.1",
+		},
+		{
+			input:   "",
+			wantErr: true,
+		},
+		{
+			input:   "https://example.com/invalid/path/file.exe",
+			wantErr: true,
+		},
+	}
+
+	for _, c := range cases {
+		got, err := ExtractTagFromLocation(c.input)
+		if c.wantErr {
+			if err == nil {
+				t.Errorf("ExtractTagFromLocation(%q) expected error, got nil", c.input)
+			}
+		} else {
+			if err != nil {
+				t.Errorf("ExtractTagFromLocation(%q) unexpected error: %v", c.input, err)
+			}
+			if got != c.expected {
+				t.Errorf("ExtractTagFromLocation(%q) = %q, expected %q", c.input, got, c.expected)
+			}
+		}
+	}
+}
+
+func TestUpdater_ProbeLatestRelease_Redirect(t *testing.T) {
+	// 模拟 GitHub 302 重定向响应
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		rw.Header().Set("Location", "/https://github.com/crthu/cworker/releases/download/v1.7.1/cw.exe")
+		rw.WriteHeader(http.StatusFound)
+	}))
+	defer server.Close()
+
+	up, err := NewUpdater("1.0.0", "", "", false)
+	if err != nil {
+		t.Fatalf("NewUpdater failed: %v", err)
+	}
+	up.Mirror = server.URL + "/"
+
+	rel, err := up.FetchLatestRelease(context.Background())
+	if err != nil {
+		t.Fatalf("FetchLatestRelease with 302 probe failed: %v", err)
+	}
+	if rel.TagName != "v1.7.1" {
+		t.Fatalf("expected tag v1.7.1, got: %s", rel.TagName)
+	}
+	if len(rel.Assets) < 2 {
+		t.Fatalf("expected at least 2 synthesized assets, got: %d", len(rel.Assets))
+	}
+	if rel.Assets[0].Name != "cw.exe" {
+		t.Errorf("expected first asset cw.exe, got: %s", rel.Assets[0].Name)
+	}
+	if rel.Assets[1].Name != "cw.exe.sha256" {
+		t.Errorf("expected second asset cw.exe.sha256, got: %s", rel.Assets[1].Name)
+	}
+}
+
 func TestUpdater_FetchLatestRelease(t *testing.T) {
 	mockRel := ReleaseInfo{
 		TagName:     "v1.2.0",
