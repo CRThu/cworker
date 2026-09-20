@@ -6,12 +6,15 @@
 
 ## 一、给 Agent 的核心特性与边界认知
 
-1. **非阻塞与长程常驻性**：
-   * `cw run` 派发任务为**毫秒级异步动作**，命令下发成功后立即返回唯一的 `job-<hex>` ID 并退出；
-   * Agent 无需在单个终端命令中挂起长程任务，派发后应通过 `cw ps` 轮询状态，或通过 `cw logs <job_id>` 查阅阶段输出。
+1. **非阻塞长程常驻 与 同步即时执行（-w / -wc）**：
+   * **长程异步任务（默认）**：`cw run` 默认为**毫秒级异步动作**，命令下发成功后立即返回唯一的 `job-<hex>` ID 并退出；Agent 无需在单个终端命令中挂起长程任务，派发后通过 `cw ps` 轮询，通过 `cw logs <job_id>` 查阅阶段输出；
+   * **即时探测与短命令执行（推荐 `-wc`）**：针对环境探测、`git status`、短脚本等即时调用，**必须优先使用 `cw run -wc "<command>"`**（即 `--wait --clean`）：
+     * `-w, --wait`：前台同步阻塞执行，实时流式直出 stdout/stderr，进程退出码严格对齐远端 ExitCode；
+     * `-c, --clean`：任务执行完毕后自动物理销毁远端日志目录与内存记录（合写即 `-wc`），零垃圾残留，不污染 `cw ps`；
+     * **门禁规则**：`-c` 严格依赖 `-w`，严禁在纯异步模式下使用。
 2. **确定性的进程树清理保证（无孤儿进程风险）**：
    * 在 Windows 环境下，`cw kill <job_id>` 由操作系统内核级 **Win32 Job Object** 驱动；
-   * Agent 无需担心子脚本再开的后台子进程泄漏，调用 `cw kill` 能够 100% 连根拔起整棵进程树。
+   * Agent 无需担心子脚本再开的后台子进程泄漏，调用 `cw kill` 能够 100% 连根拔起整棵进程树；在 `-w` 同步模式下若捕获中断信号同样联动强杀并清场。
 3. **原生物理宿主环境（零沙盒）与高危破坏性操作二次确认**：
    * 目标 Worker 拥有宿主原生物理用户权限，**非 Docker/VM 容器，无沙盒虚拟隔离层**；
    * 任何在远端或本地节点执行的 `cw rm`、`cw cp`、`cw run` 均**直接作用于真实物理操作系统与磁盘文件系统**，破坏性不可逆；
@@ -41,12 +44,20 @@
      * `1`：存在变动（有修改/新增/删除）；
      * `2`：异常错误（文件不存在、遗漏 `-r`、网络异常等）。
      Agent 可直接在自动化脚本中以单行退出码判定是否触发全量同步。
-9. **任务历史与日志清理规范（`cw clean` 必须附加 `-y`）**：
-   * Agent 调用 `cw clean` 清理已完成任务时，**必须显式指定 `--days <n>` 或 `--all` 之一，且必须附加 `-y`（自动确认）**；若缺少 `-y`，CLI 会在终端阻塞等待输入 `[y/N]` 导致超时死锁；
+9. **任务历史与单任务/批量清理规范（`cw clean` 必须附加 `-y`）**：
+   * **单任务定向清理**：`cw clean [<node>:]<job_id> -y`，精准清除指定的已终态任务及其磁盘日志目录（释放磁盘且移出账本）；
+   * **批量清理**：未指定 job_id 时，**必须显式指定 `--days <n>` 或 `--all` 之一，且必须附加 `-y`（自动确认）**；若缺少 `-y`，CLI 会在终端阻塞等待输入 `[y/N]` 导致超时死锁；
    * 底层保证：正在处于 `RUNNING` 状态的任务绝对受保护，严禁被清理。
 10. **本地 Web 控制台启动认知（`cw ui` 前台常驻阻塞警示）**：
-   * `cw ui [--port <port>] [--no-open]` 为本地前台常驻 HTTP 服务（严格绑定 127.0.0.1，Go embed 内嵌 Svelte 5 SPA 前端产物）；
-   * **Agent 严禁在非守护同步会话中直接阻塞执行 `cw ui`**，否则会导致终端挂起超时；当用户需要可视化界面时，Agent 应建议用户在独立终端直接运行 `cw ui`，或以 Daemon 后台模式启动。
+    * `cw ui [--port <port>] [--no-open]` 为本地前台常驻 HTTP 服务（严格绑定 127.0.0.1，Go embed 内嵌 Svelte 5 SPA 前端产物）；
+    * **Agent 严禁在非守护同步会话中直接阻塞执行 `cw ui`**，否则会导致终端挂起超时；当用户需要可视化界面时，Agent 应建议用户在独立终端直接运行 `cw ui`，或以 Daemon 后台模式启动。
+11. **文本切片与 1MB 自动截断规则（`cw cat` 与 `cw logs`）**：
+    * **默认截断**：未指定切片参数时，文件/日志 $\le$ 1MB 默认全量输出；> 1MB 自动截取末尾 100 行并提示 `--all`；
+    * **切片参数**：
+      * `-n, --tail <N>`：读取末尾 N 行（无文件大小限制）；
+      * `--head <N>`：读取开头 N 行（早停断流）；
+      * `-L, --lines <start:end>`：读取区间切片（如 `-L 100:200`）；
+      * `--all`：输出完整内容。
 
 ---
 
@@ -58,7 +69,19 @@
 cw node
 ```
 
-### 2. 任务派发与凭证提取
+### 2. 即时探测与短命令快速执行 (推荐 -wc)
+针对环境检查、查看版本、`git status`、小脚本等短生命周期命令，**直接使用 `-wc` 同步前台直出并自毁清理**（退出码严格对齐，零垃圾残留）：
+```bash
+# 在远端节点执行快速探测 (屏幕实时输出，退出码对齐，执行完自毁清理)
+cw run -n DESKTOP-4090 -wc "nvidia-smi"
+cw run -n DESKTOP-4090 -wc "git status"
+
+# 亦可指定工作目录
+cw run -n DESKTOP-4090 -wc --dir "D:/workspace" "python -V"
+```
+
+### 3. 长程作业派发与凭证提取 (默认异步)
+针对模型训练、全量编译、长跑服务等长时间任务，使用默认异步派发：
 ```bash
 cw run -n <node_name> [--token <token>] --name <readable_name> --dir "<working_dir>" "<command>"
 ```
@@ -69,7 +92,7 @@ Use 'cw logs job-1a2b3c4d -f' to stream live logs.
 ```
 Agent 应通过正则提取出 `job-[a-f0-9]+` 作为后续任务生命周期的句柄（Handle）。
 
-### 3. 任务状态轮询与监控
+### 4. 任务状态轮询与监控
 Agent 应周期性调用 `cw ps` 跟踪任务执行（支持 `-n <node>` 定向节点加速查询）：
 ```bash
 # 全集群轮询
@@ -84,21 +107,28 @@ cw ps -n <node_name>
 * `FAILED`：执行失败，退出码非 0；
 * `STOPPED`：被主动通过 `cw kill` 终止。
 
-### 4. 日志审计与故障诊断
-若任务出现 `FAILED` 或 Agent 需要提取任务输出：
+### 5. 日志审计与精准切片排查
 ```bash
-# 获取末尾 100 行日志 (全集群自动漫游探测)
-cw logs job-1a2b3c4d -n 100
+# 查看启动初期前 50 行日志 (抓启动初期 ImportError / CUDA 初始化崩溃根因)
+cw logs DESKTOP-4090:job-1a2b3c4d --head 50
 
-# 或指定节点定向直连 (推荐：跳过全集群发现，毫秒级直连返回，网络开销最小)
+# 查看末尾 100 行最新进展 (1MB 内短任务日志自动全量直出，超限保底末尾 100 行)
 cw logs DESKTOP-4090:job-1a2b3c4d -n 100
-# 亦可通过标志指定：cw logs --node DESKTOP-4090 job-1a2b3c4d -n 100
 
-# 终止任务同理支持定向节点 (跳过全网广播，精准查杀整棵进程树)
+# 查看指定行号区间
+cw logs DESKTOP-4090:job-1a2b3c4d -L 120:160
+
+# 强制查看全量完整日志 (流式直出)
+cw logs DESKTOP-4090:job-1a2b3c4d --all
+
+# 终止任务 (Win32 Job Object 连根查杀进程树)
 cw kill DESKTOP-4090:job-1a2b3c4d
+
+# 精准清理单个已终态任务 (释放磁盘 output.log 并移出账本)
+cw clean DESKTOP-4090:job-1a2b3c4d -y
 ```
 
-### 5. 文件传输与远程清理
+### 6. 文件传输与远程清理
 ```bash
 # 传单文件到远端指定绝对路径 (目标路径父目录不存在时会自动递归创建)
 cw cp ./input_data.csv DESKTOP-4090:D:/workspace/data.csv
@@ -109,8 +139,13 @@ cw cp -r ./workspace DESKTOP-4090:D:/workspace
 # 跨机器直接中继拷贝目录 (零中转磁盘开销，内存管道直灌)
 cw cp -r DESKTOP-4090:D:/workspace/output TEST-BOX:D:/workspace/output
 
-# 读取远端或本地配置文件 (文本直接打印，免去临时下载)
+# 读取配置文件 (1MB 内全量秒开；超 1MB 自动安全保底末尾 100 行防爆屏)
 cw cat DESKTOP-4090:D:/workspace/metrics.json
+
+# 文本精准切片 (看表头/看尾部/看区间)
+cw cat --head 20 DESKTOP-4090:D:/workspace/data.csv
+cw cat -n 50 DESKTOP-4090:D:/workspace/training.log
+cw cat -L 100:150 DESKTOP-4090:D:/workspace/main.py
 
 # 跨机或本地差异核验 (单文件对比，返回 Size 与完整 SHA-256)
 cw diff ./train.py DESKTOP-4090:D:/workspace/train.py
@@ -122,7 +157,7 @@ cw diff -r ./workspace DESKTOP-4090:D:/workspace
 cw rm -r -y DESKTOP-4090:D:/workspace/temp/
 ```
 
-### 6. 本地 Web 控制台启动
+### 7. 本地 Web 控制台启动
 ```bash
 # 启动嵌入式 Web 控制台 (推荐用户在独立终端运行，默认自动打开 http://127.0.0.1:19001)
 cw ui

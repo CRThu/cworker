@@ -714,6 +714,79 @@ func (c *Client) CleanJobsWithContext(ctx context.Context, targetNode string, da
 	return results, nil
 }
 
+// CleanJobWithContext 精准清理单个已终态任务及其磁盘日志目录
+func (c *Client) CleanJobWithContext(ctx context.Context, targetNode string, jobID string) (*protocol.CleanJobsResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	rt, err := c.resolveTargetForJobWithContext(ctx, targetNode, jobID)
+	if err != nil {
+		return nil, err
+	}
+
+	reqData, err := json.Marshal(protocol.CleanJobsRequest{
+		JobID: jobID,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.doRequestWithContext(ctx, rt, http.MethodPost, "/api/v1/jobs/clean", bytes.NewReader(reqData))
+	if err != nil {
+		return nil, fmt.Errorf("clean job '%s' on node '%s' failed: %w", jobID, rt.Name, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("clean job '%s' on node '%s' failed (%d): %s", jobID, rt.Name, resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var cleanResp protocol.CleanJobsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&cleanResp); err != nil {
+		return nil, err
+	}
+	return &cleanResp, nil
+}
+
+// GetJobInfoWithContext 定向获取指定任务的最新实时状态与退出码
+func (c *Client) GetJobInfoWithContext(ctx context.Context, targetNode string, jobID string) (*protocol.JobInfo, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	rt, err := c.resolveTargetForJobWithContext(ctx, targetNode, jobID)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.doRequestWithContext(ctx, rt, http.MethodGet, "/api/v1/jobs/ps", nil)
+	if err != nil {
+		return nil, fmt.Errorf("query jobs on node '%s' failed: %w", rt.Name, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("query jobs on node '%s' failed (%d): %s", rt.Name, resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var jobs []protocol.JobInfo
+	if err := json.NewDecoder(resp.Body).Decode(&jobs); err != nil {
+		return nil, err
+	}
+
+	for _, j := range jobs {
+		if j.ID == jobID {
+			if j.Node == "" {
+				j.Node = rt.Name
+			}
+			return &j, nil
+		}
+	}
+
+	return nil, fmt.Errorf("job '%s' not found on node '%s'", jobID, rt.Name)
+}
+
 func (c *Client) resolveTargetForJob(node string, jobID string) (*ResolvedTarget, error) {
 	return c.resolveTargetForJobWithContext(context.Background(), node, jobID)
 }
@@ -755,8 +828,8 @@ func (c *Client) GetLogsNode(node string, jobID string, lines int) (string, erro
 	return c.GetLogsNodeWithContext(context.Background(), node, jobID, lines)
 }
 
-// GetLogsNodeWithContext 带 Context 支持的指定节点日志查询
-func (c *Client) GetLogsNodeWithContext(ctx context.Context, node string, jobID string, lines int) (string, error) {
+// GetLogsWithOptionsWithContext 带切片选项与 Context 支持的日志查询 (支持 head/tail/range/all)
+func (c *Client) GetLogsWithOptionsWithContext(ctx context.Context, node string, jobID string, opts protocol.TextSliceOptions) (string, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -765,7 +838,22 @@ func (c *Client) GetLogsNodeWithContext(ctx context.Context, node string, jobID 
 		return "", err
 	}
 
-	path := fmt.Sprintf("/api/v1/jobs/logs?job_id=%s&lines=%d", url.QueryEscape(jobID), lines)
+	queryParams := url.Values{}
+	queryParams.Set("job_id", jobID)
+	if opts.All {
+		queryParams.Set("all", "true")
+	}
+	if opts.Tail > 0 {
+		queryParams.Set("tail", strconv.Itoa(opts.Tail))
+	}
+	if opts.Head > 0 {
+		queryParams.Set("head", strconv.Itoa(opts.Head))
+	}
+	if opts.LineRange != "" {
+		queryParams.Set("range", opts.LineRange)
+	}
+
+	path := fmt.Sprintf("/api/v1/jobs/logs?%s", queryParams.Encode())
 	resp, err := c.doRequestWithContext(ctx, rt, http.MethodGet, path, nil)
 	if err != nil {
 		return "", err
@@ -779,6 +867,15 @@ func (c *Client) GetLogsNodeWithContext(ctx context.Context, node string, jobID 
 
 	data, err := io.ReadAll(resp.Body)
 	return string(data), err
+}
+
+// GetLogsNodeWithContext 带 Context 支持的指定节点日志查询
+func (c *Client) GetLogsNodeWithContext(ctx context.Context, node string, jobID string, lines int) (string, error) {
+	opts := protocol.TextSliceOptions{}
+	if lines > 0 {
+		opts.Tail = lines
+	}
+	return c.GetLogsWithOptionsWithContext(ctx, node, jobID, opts)
 }
 
 // StreamLogs 实时流式日志 (自动探测节点)
@@ -1392,8 +1489,13 @@ func (c *Client) RelayCopyWithContext(ctx context.Context, srcNode, srcPath, dst
 	return nil
 }
 
-// Cat 打印或输出远端节点或本地文件的内容 (统一本地与远端)
+// Cat 打印或输出远端节点或本地文件的内容 (统一本地与远端，默认对超 1MB 内容截取末尾 100 行)
 func (c *Client) Cat(ctx context.Context, node, path string, w io.Writer) error {
+	return c.CatWithSlice(ctx, node, path, protocol.TextSliceOptions{}, w)
+}
+
+// CatWithSlice 带切片选项与 1MB 智能防线的文本输出 (统一本地与远端)
+func (c *Client) CatWithSlice(ctx context.Context, node, path string, opts protocol.TextSliceOptions, w io.Writer) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1407,10 +1509,73 @@ func (c *Client) Cat(ctx context.Context, node, path string, w io.Writer) error 
 			return err
 		}
 		defer f.Close()
-		_, err = io.Copy(w, f)
+
+		truncated, err := fsengine.SliceFile(f, opts, w)
+		if err != nil {
+			return err
+		}
+		if truncated {
+			fi, _ := f.Stat()
+			sizeMB := float64(fi.Size()) / (1024 * 1024)
+			_, _ = fmt.Fprintf(w, "\n[NOTICE] File size (%.2f MB) exceeds 1 MB limit. Truncated to last 100 lines. Use -n, --head, -L, or --all to override.\n", sizeMB)
+		}
+		return nil
+	}
+
+	// 远端节点：向 Worker 请求 /api/v1/fs/cat
+	rt, err := c.ResolveWorker(node, "")
+	if err != nil {
 		return err
 	}
-	return c.DownloadFileWithContext(ctx, node, path, w)
+
+	queryParams := url.Values{}
+	queryParams.Set("path", path)
+	if opts.All {
+		queryParams.Set("all", "true")
+	}
+	if opts.Tail > 0 {
+		queryParams.Set("tail", strconv.Itoa(opts.Tail))
+	}
+	if opts.Head > 0 {
+		queryParams.Set("head", strconv.Itoa(opts.Head))
+	}
+	if opts.LineRange != "" {
+		queryParams.Set("range", opts.LineRange)
+	}
+
+	catURL := fmt.Sprintf("/api/v1/fs/cat?%s", queryParams.Encode())
+	resp, err := c.doRequestWithContext(ctx, rt, http.MethodGet, catURL, nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		_, err := io.Copy(w, resp.Body)
+		return err
+	}
+
+	// 防御性优雅降级：若远端 Worker 是未升级老版本 (返回 404 Not Found)，回退到全量下载并在客户端安全切片
+	if resp.StatusCode == http.StatusNotFound {
+		var tmpBuf bytes.Buffer
+		if dErr := c.DownloadFileWithContext(ctx, node, path, &tmpBuf); dErr == nil {
+			tmpFile, tErr := os.CreateTemp("", "cworker-cat-fallback-*.tmp")
+			if tErr == nil {
+				defer os.Remove(tmpFile.Name())
+				defer tmpFile.Close()
+				_, _ = tmpFile.Write(tmpBuf.Bytes())
+				truncated, sErr := fsengine.SliceFile(tmpFile, opts, w)
+				if sErr == nil && truncated {
+					sizeMB := float64(tmpBuf.Len()) / (1024 * 1024)
+					_, _ = fmt.Fprintf(w, "\n[NOTICE] File size (%.2f MB) exceeds 1 MB limit. Truncated to last 100 lines. Use -n, --head, -L, or --all to override.\n", sizeMB)
+				}
+				return sErr
+			}
+		}
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	return fmt.Errorf("cat remote file failed (%d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
 }
 
 // Hash 获取远端节点或本地路径的文件/目录 SHA-256 清单 (统一本地与远端)

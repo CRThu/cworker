@@ -221,6 +221,7 @@ func (w *Worker) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/v1/fs/roots", w.authMiddleware(w.handleFsRoots))
 	mux.HandleFunc("/api/v1/fs/upload", w.authMiddleware(w.handleFsUpload))
 	mux.HandleFunc("/api/v1/fs/download", w.authMiddleware(w.handleFsDownload))
+	mux.HandleFunc("/api/v1/fs/cat", w.authMiddleware(w.handleFsCat))
 	mux.HandleFunc("/api/v1/fs/ls", w.authMiddleware(w.handleFsList))
 	mux.HandleFunc("/api/v1/fs/md", w.authMiddleware(w.handleFsMakeDir))
 	mux.HandleFunc("/api/v1/fs/rm", w.authMiddleware(w.handleFsRemove))
@@ -439,13 +440,49 @@ func (w *Worker) handleCleanJobs(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !req.All && req.Days <= 0 {
-		http.Error(rw, "bad request: either all must be true or days must be greater than 0", http.StatusBadRequest)
+	if req.JobID == "" && !req.All && req.Days <= 0 {
+		http.Error(rw, "bad request: must specify job_id, all, or days > 0", http.StatusBadRequest)
 		return
 	}
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
+	// 1. 若指定了 JobID，精准定向单任务清理 (RUNNING 状态严格受保护)
+	if req.JobID != "" {
+		if !isValidJobID(req.JobID) {
+			http.Error(rw, "invalid job_id", http.StatusBadRequest)
+			return
+		}
+
+		job, exists := w.jobs[req.JobID]
+		if exists && job.GetInfo().Status == protocol.JobStatusRunning {
+			http.Error(rw, fmt.Sprintf("cannot clean running job '%s'", req.JobID), http.StatusConflict)
+			return
+		}
+
+		jobDir := filepath.Join(w.cfg.DataDir, "jobs", req.JobID)
+		dirExists := false
+		if fi, err := os.Stat(jobDir); err == nil && fi.IsDir() {
+			dirExists = true
+		}
+
+		if !exists && !dirExists {
+			http.Error(rw, fmt.Sprintf("job '%s' not found", req.JobID), http.StatusNotFound)
+			return
+		}
+
+		freedBytes := getDirSize(jobDir)
+		_ = os.RemoveAll(jobDir)
+		delete(w.jobs, req.JobID)
+
+		rw.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(rw).Encode(protocol.CleanJobsResponse{
+			CleanedCount: 1,
+			FreedBytes:   freedBytes,
+		})
+		return
+	}
 
 	cleanedCount := 0
 	var freedBytes int64
@@ -619,6 +656,43 @@ func extractLastNLines(content []byte, n int) []byte {
 	return []byte(result)
 }
 
+type utf8Writer struct {
+	w io.Writer
+}
+
+func (u *utf8Writer) Write(p []byte) (int, error) {
+	clean := logstream.EnsureUTF8(p)
+	_, err := u.w.Write(clean)
+	if err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+func parseTextSliceOptions(r *http.Request) protocol.TextSliceOptions {
+	q := r.URL.Query()
+	opts := protocol.TextSliceOptions{
+		LineRange: q.Get("range"),
+		All:       q.Get("all") == "true",
+	}
+	if linesStr := q.Get("lines"); linesStr != "" {
+		if n, err := strconv.Atoi(linesStr); err == nil && n > 0 {
+			opts.Tail = n
+		}
+	}
+	if tailStr := q.Get("tail"); tailStr != "" {
+		if n, err := strconv.Atoi(tailStr); err == nil && n > 0 {
+			opts.Tail = n
+		}
+	}
+	if headStr := q.Get("head"); headStr != "" {
+		if n, err := strconv.Atoi(headStr); err == nil && n > 0 {
+			opts.Head = n
+		}
+	}
+	return opts
+}
+
 func (w *Worker) handleGetLogs(rw http.ResponseWriter, r *http.Request) {
 	jobID := r.URL.Query().Get("job_id")
 	if !isValidJobID(jobID) {
@@ -638,23 +712,71 @@ func (w *Worker) handleGetLogs(rw http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	linesStr := r.URL.Query().Get("lines")
-	var content []byte
-	if linesStr != "" {
-		if n, err := strconv.Atoi(linesStr); err == nil && n > 0 {
-			content, err = tailFile(file, n)
-			if err != nil {
-				http.Error(rw, "tail log failed: "+err.Error(), http.StatusInternalServerError)
-				return
-			}
-		}
-	}
-	if content == nil {
-		content, _ = io.ReadAll(file)
-	}
+	opts := parseTextSliceOptions(r)
 
 	rw.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	_, _ = rw.Write(logstream.EnsureUTF8(content))
+	writer := &utf8Writer{w: rw}
+	truncated, err := fsengine.SliceFile(file, opts, writer)
+	if err != nil {
+		http.Error(rw, "slice log failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if truncated {
+		rw.Header().Set("X-Content-Truncated", "true")
+		fi, _ := file.Stat()
+		sizeMB := float64(fi.Size()) / (1024 * 1024)
+		_, _ = fmt.Fprintf(rw, "\n[NOTICE] Log size (%.2f MB) exceeds 1 MB limit. Truncated to last 100 lines. Use -n, --head, -L, or --all to override.\n", sizeMB)
+	}
+}
+
+func (w *Worker) handleFsCat(rw http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(rw, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	rawPath := r.URL.Query().Get("path")
+	cleanPath, err := pathutil.NormalizeLocalPath(rawPath)
+	if err != nil {
+		http.Error(rw, "invalid path: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	file, err := os.Open(cleanPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			http.Error(rw, "file not found", http.StatusNotFound)
+			return
+		}
+		http.Error(rw, "open file failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer file.Close()
+
+	fi, err := file.Stat()
+	if err != nil {
+		http.Error(rw, "stat file failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if fi.IsDir() {
+		http.Error(rw, "path is a directory, not a file", http.StatusBadRequest)
+		return
+	}
+
+	opts := parseTextSliceOptions(r)
+
+	rw.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	writer := &utf8Writer{w: rw}
+	truncated, err := fsengine.SliceFile(file, opts, writer)
+	if err != nil {
+		http.Error(rw, "slice file failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if truncated {
+		rw.Header().Set("X-Content-Truncated", "true")
+		sizeMB := float64(fi.Size()) / (1024 * 1024)
+		_, _ = fmt.Fprintf(rw, "\n[NOTICE] File size (%.2f MB) exceeds 1 MB limit. Truncated to last 100 lines. Use -n, --head, -L, or --all to override.\n", sizeMB)
+	}
 }
 
 func (w *Worker) handleStreamLogs(rw http.ResponseWriter, r *http.Request) {

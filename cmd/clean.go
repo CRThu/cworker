@@ -18,13 +18,54 @@ var (
 )
 
 var cleanCmd = &cobra.Command{
-	Use:   "clean",
-	Short: "显式清理已结束的历史任务及其磁盘日志目录",
+	Use:   "clean [[<node>:]<job_id>] [flags]",
+	Short: "显式清理已结束的历史任务及其磁盘日志目录 (支持单任务精准清理与批量清空)",
 	Long: `显式清理 Worker 内存中已终态的任务记录，并同步物理删除对应的磁盘 jobs/<id> 日志目录。
-必须显式指定 --days <N> 或 --all 之一，严禁未指定参数的静默全量清理。正在运行（RUNNING）的任务受严格保护，绝不被清理。`,
+支持定向清理单个任务 (如 cw clean job-xxxx -y 或 cw clean node:job-xxxx -y)；
+亦可批量清理已完成任务 (必须显式指定 --days <N> 或 --all)。正在运行（RUNNING）的任务受严格保护，绝不被清理。`,
+	Args: cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
+		cli := client.NewClient()
+
+		// 模式 A：单任务精准清理 (cw clean [<node>:]<job_id>)
+		if len(args) == 1 {
+			targetNode := cleanNode
+			jobID := args[0]
+			if idx := strings.Index(args[0], ":"); idx != -1 {
+				targetNode = args[0][:idx]
+				jobID = args[0][idx+1:]
+			}
+
+			targetDesc := ""
+			if targetNode != "" {
+				targetDesc = fmt.Sprintf(" on node '%s'", targetNode)
+			}
+
+			if !cleanYes {
+				fmt.Printf("Are you sure you want to clean job '%s'%s? [y/N]: ", jobID, targetDesc)
+				reader := bufio.NewReader(os.Stdin)
+				input, err := reader.ReadString('\n')
+				if err != nil {
+					return err
+				}
+				input = strings.TrimSpace(strings.ToLower(input))
+				if input != "y" && input != "yes" {
+					fmt.Println("Operation canceled.")
+					return nil
+				}
+			}
+
+			res, err := cli.CleanJobWithContext(cmdContext(cmd), targetNode, jobID)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("[OK] Cleaned job %s (freed %s)\n", jobID, formatBytes(res.FreedBytes))
+			return nil
+		}
+
+		// 模式 B：批量清理 (维持原有契约)
 		if !cleanAll && cleanDays <= 0 {
-			return fmt.Errorf("must specify either --days <N> (e.g. --days 7) or --all to clean finished jobs")
+			return fmt.Errorf("must specify either --days <N> (e.g. --days 7), --all, or provide a job ID to clean finished jobs")
 		}
 
 		targetDesc := "all known nodes"
@@ -52,7 +93,6 @@ var cleanCmd = &cobra.Command{
 			}
 		}
 
-		cli := client.NewClient()
 		results, err := cli.CleanJobsWithContext(cmdContext(cmd), cleanNode, cleanDays, cleanAll)
 		if err != nil {
 			return fmt.Errorf("clean jobs failed: %w", err)

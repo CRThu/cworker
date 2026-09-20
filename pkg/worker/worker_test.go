@@ -1707,6 +1707,275 @@ func TestWorker_HydrateJobs_CorruptedMetaFallback(t *testing.T) {
 	}
 }
 
+func TestHandleCleanJobs_SingleJob(t *testing.T) {
+	tempDir := t.TempDir()
+	w := &Worker{
+		cfg: Config{
+			Name:    "clean-test-node",
+			DataDir: tempDir,
+		},
+		jobs: make(map[string]*process.ManagedJob),
+	}
+
+	// 1. 已完成任务
+	jobDir1 := filepath.Join(tempDir, "jobs", "job-comp-1")
+	_ = os.MkdirAll(jobDir1, 0755)
+	_ = os.WriteFile(filepath.Join(jobDir1, "output.log"), []byte("output-1"), 0644)
+	w.jobs["job-comp-1"] = process.NewHistoricJob(protocol.JobInfo{
+		ID:     "job-comp-1",
+		Status: protocol.JobStatusCompleted,
+	}, jobDir1)
+
+	// 2. 正在运行任务
+	w.jobs["job-run-1"] = process.NewHistoricJob(protocol.JobInfo{
+		ID:     "job-run-1",
+		Status: protocol.JobStatusRunning,
+	}, "")
+
+	// 3. 测试正在运行的任务清理被拒绝 (409 Conflict)
+	runReqBody, _ := json.Marshal(protocol.CleanJobsRequest{JobID: "job-run-1"})
+	runRec := httptest.NewRecorder()
+	runReq := httptest.NewRequest(http.MethodPost, "/api/v1/jobs/clean", bytes.NewReader(runReqBody))
+	w.handleCleanJobs(runRec, runReq)
+	if runRec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 for running job, got %d", runRec.Code)
+	}
+
+	// 4. 测试已完成任务正常清理 (200 OK)
+	compReqBody, _ := json.Marshal(protocol.CleanJobsRequest{JobID: "job-comp-1"})
+	compRec := httptest.NewRecorder()
+	compReq := httptest.NewRequest(http.MethodPost, "/api/v1/jobs/clean", bytes.NewReader(compReqBody))
+	w.handleCleanJobs(compRec, compReq)
+	if compRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for completed job, got %d: %s", compRec.Code, compRec.Body.String())
+	}
+	var resp protocol.CleanJobsResponse
+	_ = json.Unmarshal(compRec.Body.Bytes(), &resp)
+	if resp.CleanedCount != 1 || resp.FreedBytes <= 0 {
+		t.Fatalf("unexpected clean response: %+v", resp)
+	}
+	if _, err := os.Stat(jobDir1); !os.IsNotExist(err) {
+		t.Fatalf("expected job directory to be deleted")
+	}
+
+	// 5. 测试不存在任务 (404 Not Found)
+	missReqBody, _ := json.Marshal(protocol.CleanJobsRequest{JobID: "job-missing-404"})
+	missRec := httptest.NewRecorder()
+	missReq := httptest.NewRequest(http.MethodPost, "/api/v1/jobs/clean", bytes.NewReader(missReqBody))
+	w.handleCleanJobs(missRec, missReq)
+	if missRec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for missing job, got %d", missRec.Code)
+	}
+}
+
+func TestHandleFsCat_And_GetLogs_Slice(t *testing.T) {
+	tempDir := t.TempDir()
+	w := &Worker{
+		cfg: Config{
+			Name:    "cat-slice-node",
+			DataDir: tempDir,
+		},
+		jobs: make(map[string]*process.ManagedJob),
+	}
+
+	// 创建测试文件
+	filePath := filepath.Join(tempDir, "sample.txt")
+	var sb strings.Builder
+	for i := 1; i <= 20; i++ {
+		fmt.Fprintf(&sb, "line %02d\n", i)
+	}
+	_ = os.WriteFile(filePath, []byte(sb.String()), 0644)
+
+	// 1. handleFsCat: head 3
+	reqHead := httptest.NewRequest(http.MethodGet, "/api/v1/fs/cat?path="+filePath+"&head=3", nil)
+	recHead := httptest.NewRecorder()
+	w.handleFsCat(recHead, reqHead)
+	if recHead.Code != http.StatusOK {
+		t.Fatalf("handleFsCat head failed: %d", recHead.Code)
+	}
+	headLines := strings.Split(strings.TrimSpace(recHead.Body.String()), "\n")
+	if len(headLines) != 3 || headLines[0] != "line 01" || headLines[2] != "line 03" {
+		t.Fatalf("unexpected head lines: %v", headLines)
+	}
+
+	// 2. handleFsCat: tail 3
+	reqTail := httptest.NewRequest(http.MethodGet, "/api/v1/fs/cat?path="+filePath+"&tail=3", nil)
+	recTail := httptest.NewRecorder()
+	w.handleFsCat(recTail, reqTail)
+	if recTail.Code != http.StatusOK {
+		t.Fatalf("handleFsCat tail failed: %d", recTail.Code)
+	}
+	tailLines := strings.Split(strings.TrimSpace(recTail.Body.String()), "\n")
+	if len(tailLines) != 3 || tailLines[2] != "line 20" {
+		t.Fatalf("unexpected tail lines: %v", tailLines)
+	}
+
+	// 3. handleGetLogs: range 5:8
+	jobDir := filepath.Join(tempDir, "jobs", "job-log-1")
+	_ = os.MkdirAll(jobDir, 0755)
+	_ = os.WriteFile(filepath.Join(jobDir, "output.log"), []byte(sb.String()), 0644)
+
+	reqLogRange := httptest.NewRequest(http.MethodGet, "/api/v1/jobs/logs?job_id=job-log-1&range=5:8", nil)
+	recLogRange := httptest.NewRecorder()
+	w.handleGetLogs(recLogRange, reqLogRange)
+	if recLogRange.Code != http.StatusOK {
+		t.Fatalf("handleGetLogs range failed: %d", recLogRange.Code)
+	}
+	logLines := strings.Split(strings.TrimSpace(recLogRange.Body.String()), "\n")
+	if len(logLines) != 4 || logLines[0] != "line 05" || logLines[3] != "line 08" {
+		t.Fatalf("unexpected log range lines: %v", logLines)
+	}
+}
+
+func TestWorker_HandleFsCat_And_HandleCleanJobs_EdgeCases(t *testing.T) {
+	tempDir := t.TempDir()
+	w := &Worker{
+		cfg: Config{
+			Name:    "edge-worker",
+			DataDir: tempDir,
+		},
+		jobs: make(map[string]*process.ManagedJob),
+	}
+
+	// 1. handleFsCat: 非 GET 请求 -> 405
+	rec405 := httptest.NewRecorder()
+	req405 := httptest.NewRequest(http.MethodPost, "/api/v1/fs/cat?path=sample.txt", nil)
+	w.handleFsCat(rec405, req405)
+	if rec405.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 for POST cat, got %d", rec405.Code)
+	}
+
+	// 2. handleFsCat: 不存在文件 -> 404
+	rec404 := httptest.NewRecorder()
+	req404 := httptest.NewRequest(http.MethodGet, "/api/v1/fs/cat?path="+filepath.Join(tempDir, "notfound.txt"), nil)
+	w.handleFsCat(rec404, req404)
+	if rec404.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for missing file, got %d", rec404.Code)
+	}
+
+	// 3. handleFsCat: 路径为目录 -> 400
+	subDir := filepath.Join(tempDir, "subdir")
+	_ = os.MkdirAll(subDir, 0755)
+	recDir := httptest.NewRecorder()
+	reqDir := httptest.NewRequest(http.MethodGet, "/api/v1/fs/cat?path="+subDir, nil)
+	w.handleFsCat(recDir, reqDir)
+	if recDir.Code != http.StatusBadRequest || !strings.Contains(recDir.Body.String(), "directory") {
+		t.Fatalf("expected 400 for directory cat, got %d: %s", recDir.Code, recDir.Body.String())
+	}
+
+	// 4. handleFsCat: 大文件 (>1MB) 截断并包含 X-Content-Truncated 响应头
+	largeFilePath := filepath.Join(tempDir, "large_cat.txt")
+	lf, err := os.Create(largeFilePath)
+	if err != nil {
+		t.Fatalf("create large file failed: %v", err)
+	}
+	lineChunk := strings.Repeat("L", 95) + "\n"
+	for i := 0; i < 12000; i++ {
+		_, _ = lf.WriteString(lineChunk)
+	}
+	lf.Close()
+
+	recLarge := httptest.NewRecorder()
+	reqLarge := httptest.NewRequest(http.MethodGet, "/api/v1/fs/cat?path="+largeFilePath, nil)
+	w.handleFsCat(recLarge, reqLarge)
+	if recLarge.Code != http.StatusOK {
+		t.Fatalf("expected 200 for large cat, got %d", recLarge.Code)
+	}
+	if recLarge.Header().Get("X-Content-Truncated") != "true" {
+		t.Fatalf("expected X-Content-Truncated header to be true")
+	}
+	if !strings.Contains(recLarge.Body.String(), "[NOTICE] File size") {
+		t.Fatalf("expected notice message in truncated output, got %s", recLarge.Body.String())
+	}
+
+	// 4.1 handleFsCat: 大文件附加 all=true 不截断
+	recLargeAll := httptest.NewRecorder()
+	reqLargeAll := httptest.NewRequest(http.MethodGet, "/api/v1/fs/cat?path="+largeFilePath+"&all=true", nil)
+	w.handleFsCat(recLargeAll, reqLargeAll)
+	if recLargeAll.Code != http.StatusOK {
+		t.Fatalf("expected 200 for large cat with all, got %d", recLargeAll.Code)
+	}
+	if recLargeAll.Header().Get("X-Content-Truncated") == "true" {
+		t.Fatalf("expected X-Content-Truncated to be absent when all=true")
+	}
+
+	// 5. handleCleanJobs: 非 POST 请求 -> 405
+	recClean405 := httptest.NewRecorder()
+	reqClean405 := httptest.NewRequest(http.MethodGet, "/api/v1/jobs/clean", nil)
+	w.handleCleanJobs(recClean405, reqClean405)
+	if recClean405.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 for GET clean, got %d", recClean405.Code)
+	}
+
+	// 6. handleCleanJobs: 非法参数 -> 400
+	recClean400 := httptest.NewRecorder()
+	reqClean400 := httptest.NewRequest(http.MethodPost, "/api/v1/jobs/clean", strings.NewReader(`{}`))
+	w.handleCleanJobs(recClean400, reqClean400)
+	if recClean400.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for empty clean request, got %d", recClean400.Code)
+	}
+
+	// 7. handleCleanJobs: 非法 JobID 格式 -> 400
+	recCleanBadID := httptest.NewRecorder()
+	reqCleanBadID := httptest.NewRequest(http.MethodPost, "/api/v1/jobs/clean", strings.NewReader(`{"job_id": "../invalid-id"}`))
+	w.handleCleanJobs(recCleanBadID, reqCleanBadID)
+	if recCleanBadID.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for bad job_id, got %d", recCleanBadID.Code)
+	}
+
+	// 8. handleCleanJobs: 孤儿磁盘目录清理 (内存中无 job，但磁盘 jobs/<id> 存在)
+	orphanDir := filepath.Join(tempDir, "jobs", "job-orphan-999")
+	_ = os.MkdirAll(orphanDir, 0755)
+	_ = os.WriteFile(filepath.Join(orphanDir, "output.log"), []byte("orphan logs data"), 0644)
+
+	recOrphan := httptest.NewRecorder()
+	reqOrphan := httptest.NewRequest(http.MethodPost, "/api/v1/jobs/clean", strings.NewReader(`{"job_id": "job-orphan-999"}`))
+	w.handleCleanJobs(recOrphan, reqOrphan)
+	if recOrphan.Code != http.StatusOK {
+		t.Fatalf("expected 200 for orphan clean, got %d: %s", recOrphan.Code, recOrphan.Body.String())
+	}
+	var orphanResp protocol.CleanJobsResponse
+	_ = json.Unmarshal(recOrphan.Body.Bytes(), &orphanResp)
+	if orphanResp.CleanedCount != 1 || orphanResp.FreedBytes <= 0 {
+		t.Fatalf("unexpected orphan clean response: %+v", orphanResp)
+	}
+	if _, err := os.Stat(orphanDir); !os.IsNotExist(err) {
+		t.Fatalf("expected orphan dir to be deleted")
+	}
+
+	// 9. handleGetLogs: 非法 / 缺失 job_id -> 400
+	recLogBad := httptest.NewRecorder()
+	reqLogBad := httptest.NewRequest(http.MethodGet, "/api/v1/jobs/logs?job_id=bad/path", nil)
+	w.handleGetLogs(recLogBad, reqLogBad)
+	if recLogBad.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for bad job_id, got %d", recLogBad.Code)
+	}
+
+	// 10. handleGetLogs: 大日志文件截断 (>1MB)
+	largeJobDir := filepath.Join(tempDir, "jobs", "job-large-log")
+	_ = os.MkdirAll(largeJobDir, 0755)
+	logFile, _ := os.Create(filepath.Join(largeJobDir, "output.log"))
+	for i := 0; i < 12000; i++ {
+		_, _ = logFile.WriteString(lineChunk)
+	}
+	logFile.Close()
+
+	recLargeLog := httptest.NewRecorder()
+	reqLargeLog := httptest.NewRequest(http.MethodGet, "/api/v1/jobs/logs?job_id=job-large-log", nil)
+	w.handleGetLogs(recLargeLog, reqLargeLog)
+	if recLargeLog.Code != http.StatusOK {
+		t.Fatalf("expected 200 for large log, got %d", recLargeLog.Code)
+	}
+	if recLargeLog.Header().Get("X-Content-Truncated") != "true" {
+		t.Fatalf("expected X-Content-Truncated for large log")
+	}
+	if !strings.Contains(recLargeLog.Body.String(), "[NOTICE] Log size") {
+		t.Fatalf("expected notice message in log output")
+	}
+}
+
+
+
 
 
 

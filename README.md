@@ -52,7 +52,7 @@
 - 🚀 **文件六件套治理（跨机与本地全打通）**：
   - `cp`：支持文件与目录的 本地 $\leftrightarrow$ 远端、远端 $\leftrightarrow$ 远端、本地 $\leftrightarrow$ 本地直传（`-r` 递归、`-j` 并发传输、空目录守恒、自动递归创建父级目录）；全链路单遍流式 SHA-256 强一致性核验与脏数据自动回滚；自适应平滑进度条（TTY 环境实时刷新，Non-TTY/Agent 环境单行摘要纯净输出）。
   - `diff`：跨机或本地文件与目录 SHA-256 强校验比对；单文件输出 Size 与 SHA-256 对比；`-r` 递归比对目录树，**默认排除全部相同文件**，仅打印变动条目并给出匹配汇总行；确定性退出码（`0` 一致，`1` 差异，`2` 异常）。
-  - `cat`：直接在终端打印远端或本地文件文本内容，免去临时下载与清理。
+  - `cat`：直接在终端打印远端或本地文件文本内容，默认 $\le$ 1MB 全量输出，超限自动截取末尾 100 行；支持 `--head`、`-n`、`-L` 行切片与 `--all` 全量直出，常数内存 $O(1)$ 流式传输。
   - `ls` / `md` / `rm`：目录清单、远端/本地递归创建目录以及非空删除安全拦截（脚本传 `-y` 可跳过确认）。
 - 🩺 **实时资源采集**：整机 CPU、可用物理内存及单任务进程树开销实时采集。
 - 🖥️ **嵌入式 Web 控制台（开箱即用）**：单二进制内嵌轻量级 Svelte 5 SPA 前端，执行 `cw ui` 即可秒级启动本地可视化面板（严格绑定 127.0.0.1）。提供集群健康监控、实时 CPU/内存曲线、任务生命周期治理、流式日志终端与文件拖拽互传。
@@ -212,24 +212,24 @@ cw ui
 ### 2. 任务调度与进程控制
 | 命令 | 说明 |
 | :--- | :--- |
-| `cw run [-n node] [--dir dir] [--name name] [--token xxx] <cmd>` | 异步派发新任务并立即返回 `job-<hex>` 句柄；若携带 `--token` 则在鉴权成功后自动记忆更新至本地账本 |
-| `cw ps [-n node] [--all] [--limit <n>]` | 拉取全网或指定节点的任务运行状态与资源占用；RUNNING 任务优先置顶，默认展示最近 20 条，老任务自动截断省略，`--all` 展开全部 |
-| `cw clean <--days <n> \| --all> [-n node] [-y]` | 显式清理已结束任务记录与磁盘 `output.log`；支持按天数筛选或全量清理已完成任务；严格保护 RUNNING 任务不受影响 |
-| `cw kill [<node>:]<job_id> [-n node]` | 终止任务并销毁整棵子进程树（支持 `--node` 或 `node:job_id` 定向秒级查杀，免去全网广播） |
-| `cw logs [<node>:]<job_id> [--node node] [-f] [-n lines]` | 查看任务日志；带 `-f` 实时跟随，`-n` 截取末尾行数（默认 100），支持 `--node` 或 `node:job_id` 定向直连 |
-| `cw ui [--port <port>] [--no-open]` | 启动本地集中式 Web 控制台（严格监听 127.0.0.1，单文件 Go embed 内置前端，提供节点治理、任务生命周期、流式日志终端与文件互传） |
-| `cw update [-y] [--check] [--force] [--proxy <url>] [--mirror <url>]` | 从官方 GitHub Releases (`crthu/cworker`) 手动拉包自升级；自动感知系统代理与环境变量；有 RUNNING 活跃任务时严格报错拦截（除非 `--force`）；原地 Rename-Replace 无锁替换并重启服务 |
+| `cw run [-n node] [-w] [-c] [--dir dir] [--name name] [--token xxx] <cmd>` | 派发任务；默认异步后台执行；`-w` 同步阻塞并对齐 ExitCode，`-c` 执行完自毁清理（合写即 `-wc`） |
+| `cw ps [-n node] [--all] [--limit <n>]` | 查询任务运行状态与资源占用；`RUNNING` 优先置顶，默认展示最近 20 条，`--all` 展开全部 |
+| `cw clean [[<node>:]<job_id>] [--days <n> \| --all] [-n node] [-y]` | 清理已终态任务及其磁盘日志；支持单任务精准清理与批量清空；正在运行的任务严格受保护 |
+| `cw kill [<node>:]<job_id> [-n node]` | 终止任务并销毁整棵进程树（Win32 Job Object 内核治理，支持 `node:job_id` 定向查杀） |
+| `cw logs [<node>:]<job_id> [-f] [-n lines] [--head <n>] [-L <range>] [--all]` | 查看任务日志（默认 $\le$ 1MB 全量，超限截取末尾 100 行；支持 `-f` 跟随、行切片与全量输出） |
+| `cw ui [--port <port>] [--no-open]` | 启动本地 Web 控制台（严格监听 127.0.0.1，单文件内嵌 Svelte 5 SPA，提供节点管理、任务运维与文件互传） |
+| `cw update [-y] [--check] [--force] [--proxy <url>] [--mirror <url>]` | 从官方 GitHub Releases 拉包自升级；无锁热替换并重启服务；有运行中任务时严格拦截 |
 | `cw version` / `cw -v` | 查看当前软件版本号、构建日期与 Go 运行环境 |
 
 ### 3. 跨机与本地文件治理
 | 命令 | 行为与特性 |
 | :--- | :--- |
-| `cw cp [-r] [-j <n>] [<node>:]<src> [<node>:]<dest>` | 支持文件与目录 本地 $\leftrightarrow$ 远端、远端 $\leftrightarrow$ 远端、本地 $\leftrightarrow$ 本地；单遍流式 SHA-256 校验；`-r` 递归拷贝，`-j` 并发连接数（默认 8） |
-| `cw diff [-r] [--limit <n>] [--all] [<node>:]<src> [<node>:]<dest>` | 跨机或本地文件/目录 SHA-256 强校验比对；`-r` 递归比对，默认排除相同文件，大差异自动截断（默认 50 条）；退出码：`0` 一致，`1` 差异，`2` 异常 |
-| `cw cat [<node>:]<path>` | 直接在控制台终端打印远端或本地文件文本内容 |
+| `cw cp [-r] [-j <n>] [<node>:]<src> [<node>:]<dest>` | 文件/目录传输（本地 $\leftrightarrow$ 远端、远端 $\leftrightarrow$ 远端、本地 $\leftrightarrow$ 本地）；单遍流式 SHA-256 校验；`-r` 递归，`-j` 并发数 |
+| `cw diff [-r] [--limit <n>] [--all] [<node>:]<src> [<node>:]<dest>` | 跨机或本地文件/目录 SHA-256 比对；`-r` 递归比对，默认排除相同文件；退出码：`0` 一致，`1` 差异，`2` 异常 |
+| `cw cat [<node>:]<path> [-n <lines>] [--head <n>] [-L <range>] [--all]` | 终端打印远端或本地文件内容（默认 $\le$ 1MB 全量，超限截取末尾 100 行；支持行切片与全量输出） |
 | `cw ls [<node>:]<path>` | 结构化输出远端或本地目录结构、大小与修改时间 |
 | `cw md [<node>:]<path>` | 远端或本地递归创建目录（等同 `mkdir -p`） |
-| `cw rm [-r] [-y] [<node>:]<path>` | 删除远端或本地文件或目录；非空目录需 `-r`，脚本调用带 `-y` 可跳过二次确认 |
+| `cw rm [-r] [-y] [<node>:]<path>` | 删除远端或本地文件或目录；非空目录需 `-r`，脚本调用带 `-y` 跳过交互确认 |
 
 ---
 

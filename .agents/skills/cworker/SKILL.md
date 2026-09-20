@@ -21,9 +21,16 @@ description: >-
 - **`cw cp` on Directories MUST include `-r`**: Copying directories requires `-r` (or `--recursive`). Concurrency can be tuned with `-j <num>` (default 8). Transfers include single-pass streaming SHA-256 integrity validation and clean non-TTY summary output.
 - **`cw diff` on Directories MUST include `-r`**: Directory comparison requires `-r`. Diffs are based on SHA-256 and size. Identical files are omitted by default to keep context clean. Returns exit code 0 if identical, 1 if differences exist, 2 on error.
 - **Unified Local & Remote Support**: All file commands (`cp`, `diff`, `cat`, `ls`, `md`, `rm`) natively support local paths (`[<node>:]<path>`). You can operate on local files, local directories, or cross-node seamlessly without switching tools.
-- **Async Execution**: `cw run` returns immediately with a `job-<hex>` handle. Do not block; poll status with `cw ps` or inspect output with `cw logs <job_id>`.
-- **Process Tree Cleanup**: `cw kill <job_id>` uses Win32 Job Objects to terminate the entire process hierarchy without leaving orphan processes.
-- **`cw clean` MUST include `-y`**: Cleaning finished job records and logs requires `-y` for non-interactive execution. You must also specify either `--days <n>` or `--all`. Active `RUNNING` jobs are strictly protected from deletion.
+- **Execution Modes (`cw run`)**:
+  - **Async Long-running (Default)**: `cw run` returns immediately with a `job-<hex>` handle. Do not block; poll status with `cw ps` or inspect output with `cw logs <job_id>`.
+  - **Foreground Sync with Auto-cleanup (Recommended for Probing: `-wc`)**: Use `cw run -wc "<cmd>"` (or `-w --clean`) for immediate tasks (e.g. `git status`, probes). It streams output live, propagates the remote ExitCode directly to the CLI, and auto-destroys the job and log files upon exit without polluting `cw ps`.
+- **Process Tree Cleanup**: `cw kill <job_id>` uses Win32 Job Objects to terminate the entire process hierarchy without leaving orphan processes. On `-w` synchronous runs, keyboard interrupts (Ctrl+C) automatically terminate the remote process tree and clean up.
+- **`cw clean` MUST include `-y`**:
+  - **Single Job Cleanup**: `cw clean [<node>:]<job_id> -y` deletes the specific finished job record and logs.
+  - **Batch Cleanup**: `cw clean <--days <n> | --all> [-n <node>] -y` cleans batches of finished jobs. Active `RUNNING` jobs are strictly protected from deletion.
+- **Text Slicing & 1MB Truncation (`cw cat` & `cw logs`)**:
+  - Content $\le$ 1MB outputs in full; content $>$ 1MB automatically truncates to the last 100 lines with an override notice.
+  - Flags: `-n/--tail <N>` (last N lines), `--head <N>` (first N lines), `-L/--lines <start:end>` (line range), `--all` (full output).
 - **`cw ui` is a Foreground Blocking Server**: `cw ui [--port <p>] [--no-open]` runs the embedded local Web console on 127.0.0.1. Do NOT execute it synchronously in non-daemon agent subshells as it blocks indefinitely; advise users to run it in a separate terminal or launch it as a background daemon process.
 - **401 Unauthorized Recovery**: If a command returns 401, the target node's token changed or is missing. Fetch the token via `cw show` on that node. You can either update the ledger via `cw node add <node> <target> --token <token>`, or dispatch directly with `cw run -n <node> --token <token> ...` (the client will automatically persist valid tokens to the local ledger upon successful handshake).
 
@@ -35,15 +42,15 @@ description: >-
 | **Local Identity** | `cw show [--refresh]` | Displays machine name, IP addresses, service state, token |
 | **Add Node** | `cw node add <name> [target] [--token <t>]` | Registers remote node to known ledger (auto-infers `:19000`) |
 | **Remove Node** | `cw node rm <name>` | Unregisters node from local ledger |
-| **Dispatch Job** | `cw run -n <node> [--token <t>] [--dir <dir>] [--name <n>] "<cmd>"` | Dispatches async command; returns `job-<hex>` (PID: `12345`). Valid tokens automatically saved to ledger on success |
+| **Dispatch / Exec** | `cw run [-w] [-c] [-n <node>] "<cmd>"` | Default: async job. Use `-wc` for foreground sync execution, live streaming, exit code alignment & auto-cleanup |
 | **List Jobs** | `cw ps [-n <node>] [--all] [--limit <n>]` | Lists jobs across cluster or node (`RUNNING` pinned to top, default 20 recent, `--all` shows all) |
-| **Clean Jobs** | `cw clean <--days <n> \| --all> [-n <node>] [-y]` | Cleans completed/failed/stopped jobs and removes disk logs; protects RUNNING tasks |
-| **Read Logs** | `cw logs [<node>:]<job_id> [--node <node>] [-n <lines>]` | Reads trailing lines (default 100); supports direct node targeting or cluster discovery |
+| **Clean Jobs** | `cw clean [<node>:]<job_id> [-y]` / `cw clean <--days <n> \| --all> -y` | Cleans specific job or batches of finished jobs; deletes disk logs; protects RUNNING tasks |
+| **Read Logs** | `cw logs [<node>:]<job_id> [-n <lines>] [--head <n>] [-L <range>] [--all]` | Reads logs (1MB auto-guard; supports tail, head, range & --all); supports direct node targeting |
 | **Stream Logs** | `cw logs [<node>:]<job_id> [--node <node>] -f` | Live WebSocket streaming; supports direct node targeting |
 | **Kill Job** | `cw kill [<node>:]<job_id> [-n <node>]` | Win32 Job Object tree termination; supports direct node targeting or cluster broadcast |
 | **Copy File/Dir** | `cw cp [-r] [-j <n>] [<node>:]<src> [<node>:]<dest>` | Supports `local <-> remote`, `remote <-> remote`, `local <-> local` (auto mkdir, `-r` recursive, `-j` concurrency) |
 | **Diff File/Dir** | `cw diff [-r] [--limit <n>] [--all] [<node>:]<src> [<node>:]<dest>` | Cross-node or local SHA-256 diff (omits matched; truncates large diffs >50; exit 0: match, 1: diff, 2: err) |
-| **Read File** | `cw cat [<node>:]<path>` | Prints remote or local text file directly to stdout |
+| **Read File** | `cw cat [<node>:]<path> [-n <t>] [--head <h>] [-L <r>] [--all]` | Prints remote or local text file (1MB auto-guard; supports tail, head, range & --all) |
 | **List Dir** | `cw ls [<node>:]<path>` | Lists directory entries, mode, size, and mod time (remote or local) |
 | **Make Dir** | `cw md [<node>:]<path>` | Recursive directory creation (`mkdir -p`) on remote or local |
 | **Remove** | `cw rm -r -y [<node>:]<path>` | Non-interactive recursive deletion on remote or local |

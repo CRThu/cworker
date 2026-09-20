@@ -97,14 +97,31 @@ type KillJobRequest struct {
 
 // CleanJobsRequest 任务与日志清理请求
 type CleanJobsRequest struct {
-	Days int  `json:"days"` // 清理早于多少天的终态任务；0 配合 All 使用
-	All  bool `json:"all"`  // 是否清空所有已终态任务
+	JobID string `json:"job_id,omitempty"` // 单任务精准清理 (与 Days/All 互斥优先)
+	Days  int    `json:"days"`              // 清理早于多少天的终态任务；0 配合 All 使用
+	All   bool   `json:"all"`               // 是否清空所有已终态任务
 }
 
 // CleanJobsResponse 任务与日志清理响应
 type CleanJobsResponse struct {
 	CleanedCount int   `json:"cleaned_count"` // 清理的任务数
 	FreedBytes   int64 `json:"freed_bytes"`   // 释放的磁盘日志大小 (字节)
+}
+
+// 文本切片与安全防线常量 (SSOT 单一事实来源)
+const (
+	// DefaultTextSafetyThresholdBytes 文本输出默认安全阈值 (1MB)，超过自动保底末尾行数
+	DefaultTextSafetyThresholdBytes int64 = 1024 * 1024
+	// DefaultTextTailLines 超过安全阈值或未指定切片时的默认回溯行数
+	DefaultTextTailLines = 100
+)
+
+// TextSliceOptions 统一文本行切片与安全读取选项
+type TextSliceOptions struct {
+	Tail      int    `json:"tail,omitempty"`  // 末尾 N 行
+	Head      int    `json:"head,omitempty"`  // 开头 N 行
+	LineRange string `json:"lines,omitempty"` // 指定行号区间 (如 "100:200", "50:", ":30")
+	All       bool   `json:"all,omitempty"`       // 输出全量内容 (无截断)
 }
 
 // KnownNode 客户端本地记忆账本中的节点条目 (Target 包含 host[:port] 与可选的认证 Token)

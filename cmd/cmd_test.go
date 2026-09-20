@@ -20,6 +20,9 @@ import (
 	"cworker/pkg/client"
 	"cworker/pkg/protocol"
 	"cworker/pkg/updater"
+	"errors"
+
+	"nhooyr.io/websocket"
 )
 
 func TestCmd_Show(t *testing.T) {
@@ -1455,6 +1458,409 @@ func TestCmd_Run(t *testing.T) {
 		t.Fatalf("runCmd failed: %v", err)
 	}
 }
+
+func TestRunCmd_MutualExclusion(t *testing.T) {
+	runClean = true
+	runWait = false
+	defer func() {
+		runClean = false
+		runWait = false
+	}()
+
+	err := runCmd.RunE(runCmd, []string{"echo", "hi"})
+	if err == nil || !strings.Contains(err.Error(), "requires '-w / --wait'") {
+		t.Fatalf("expected mutual exclusion error, got: %v", err)
+	}
+}
+
+func TestRunCmd_WaitAndClean(t *testing.T) {
+	var cleanCalled bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/jobs/run":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(protocol.JobInfo{
+				ID:   "job-sync-test",
+				Node: "mock-worker",
+				PID:  1234,
+			})
+		case "/api/v1/jobs/stream":
+			conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+			if err == nil {
+				_ = conn.Write(r.Context(), websocket.MessageText, []byte("sync output log\n"))
+				_ = conn.Close(websocket.StatusNormalClosure, "")
+			}
+		case "/api/v1/jobs/ps":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]protocol.JobInfo{
+				{
+					ID:       "job-sync-test",
+					Node:     "mock-worker",
+					Status:   protocol.JobStatusFailed,
+					ExitCode: 42,
+				},
+			})
+		case "/api/v1/jobs/clean":
+			var req protocol.CleanJobsRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			if req.JobID == "job-sync-test" {
+				cleanCalled = true
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(protocol.CleanJobsResponse{CleanedCount: 1, FreedBytes: 512})
+				return
+			}
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	cli := client.NewClient()
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "mock-worker", Target: u.Host})
+
+	runNodeName = "mock-worker"
+	runWait = true
+	runClean = true
+	defer func() {
+		runNodeName = ""
+		runWait = false
+		runClean = false
+	}()
+
+	err := runCmd.RunE(runCmd, []string{"exit", "42"})
+	if err == nil {
+		t.Fatal("expected ExitError, got nil")
+	}
+	var exitErr *ExitError
+	if !errors.As(err, &exitErr) || exitErr.Code != 42 {
+		t.Fatalf("expected ExitError with code 42, got: %v", err)
+	}
+	if !cleanCalled {
+		t.Fatal("expected clean API to be called on --clean")
+	}
+}
+
+func TestCleanCmd_SingleJob(t *testing.T) {
+	var cleanedJob string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/jobs/clean" {
+			var req protocol.CleanJobsRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			cleanedJob = req.JobID
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(protocol.CleanJobsResponse{CleanedCount: 1, FreedBytes: 256})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	cli := client.NewClient()
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "clean-worker", Target: u.Host})
+
+	cleanYes = true
+	cleanNode = "clean-worker"
+	defer func() {
+		cleanYes = false
+		cleanNode = ""
+	}()
+
+	err := cleanCmd.RunE(cleanCmd, []string{"job-single-1"})
+	if err != nil {
+		t.Fatalf("cleanCmd single job failed: %v", err)
+	}
+	if cleanedJob != "job-single-1" {
+		t.Fatalf("expected cleaned job 'job-single-1', got %q", cleanedJob)
+	}
+}
+
+func TestCatCmd_Slicing(t *testing.T) {
+	tempDir := t.TempDir()
+	sampleFile := filepath.Join(tempDir, "sample.txt")
+	var sb strings.Builder
+	for i := 1; i <= 20; i++ {
+		fmt.Fprintf(&sb, "cat line %02d\n", i)
+	}
+	_ = os.WriteFile(sampleFile, []byte(sb.String()), 0644)
+
+	// 测试 --head 3
+	catHead = 3
+	defer func() {
+		catHead = 0
+		catTail = 0
+		catLines = ""
+		catAll = false
+	}()
+
+	err := catCmd.RunE(catCmd, []string{sampleFile})
+	if err != nil {
+		t.Fatalf("catCmd --head failed: %v", err)
+	}
+}
+
+func TestCatCmd_ThresholdProtection(t *testing.T) {
+	tempDir := t.TempDir()
+	largeFile := filepath.Join(tempDir, "large.txt")
+
+	f, err := os.Create(largeFile)
+	if err != nil {
+		t.Fatalf("create large file failed: %v", err)
+	}
+	// 写入超过 1.2MB 文本
+	lineChunk := strings.Repeat("X", 90) + "\n"
+	for i := 0; i < 15000; i++ {
+		_, _ = f.WriteString(lineChunk)
+	}
+	f.Close()
+
+	// 运行 catCmd，未传参数触发 1MB 水位线自动截断并打印 [NOTICE]
+	err = catCmd.RunE(catCmd, []string{largeFile})
+	if err != nil {
+		t.Fatalf("catCmd default threshold failed: %v", err)
+	}
+
+	// 运行 catCmd --all，强制全量输出
+	catAll = true
+	defer func() {
+		catAll = false
+	}()
+	err = catCmd.RunE(catCmd, []string{largeFile})
+	if err != nil {
+		t.Fatalf("catCmd --all failed: %v", err)
+	}
+}
+
+func TestLogsCmd_HeadAndRange(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/jobs/logs" {
+			q := r.URL.Query()
+			if q.Get("head") == "5" {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte("log head line 1\nlog head line 2\n"))
+				return
+			}
+			if q.Get("range") == "10:20" {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte("log range line 10\n"))
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("default log line\n"))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	cli := client.NewClient()
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "log-worker", Target: u.Host})
+
+	logsNode = "log-worker"
+	logsHead = 5
+	defer func() {
+		logsNode = ""
+		logsHead = 0
+		logsRange = ""
+		logsAll = false
+	}()
+
+	err := logsCmd.RunE(logsCmd, []string{"job-log-slice"})
+	if err != nil {
+		t.Fatalf("logsCmd --head failed: %v", err)
+	}
+
+	logsHead = 0
+	logsRange = "10:20"
+	err = logsCmd.RunE(logsCmd, []string{"job-log-slice"})
+	if err != nil {
+		t.Fatalf("logsCmd --range failed: %v", err)
+	}
+}
+
+func TestCleanCmd_InteractiveAndPrefix(t *testing.T) {
+	var targetNodeSeen, jobIDSeen string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/jobs/clean" {
+			var req protocol.CleanJobsRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			jobIDSeen = req.JobID
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(protocol.CleanJobsResponse{CleanedCount: 1, FreedBytes: 128})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	cli := client.NewClient()
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "prefix-worker", Target: u.Host})
+
+	// 1. <node>:<job_id> 语法糖测试
+	cleanYes = true
+	defer func() {
+		cleanYes = false
+		cleanNode = ""
+		cleanAll = false
+		cleanDays = 0
+	}()
+
+	err := cleanCmd.RunE(cleanCmd, []string{"prefix-worker:job-prefix-99"})
+	if err != nil {
+		t.Fatalf("cleanCmd with prefix failed: %v", err)
+	}
+	if jobIDSeen != "job-prefix-99" {
+		t.Fatalf("expected job-prefix-99, got %q", jobIDSeen)
+	}
+
+	// 2. 交互式取消 (输入 n) - 单任务
+	cleanYes = false
+	oldStdin := os.Stdin
+	rPipe, wPipe, _ := os.Pipe()
+	os.Stdin = rPipe
+	_, _ = wPipe.WriteString("n\n")
+
+	err = cleanCmd.RunE(cleanCmd, []string{"job-cancel-single"})
+	_ = rPipe.Close()
+	_ = wPipe.Close()
+	os.Stdin = oldStdin
+	if err != nil {
+		t.Fatalf("expected nil when user cancels single job clean, got: %v", err)
+	}
+
+	// 3. 交互式取消 (输入 n) - 批量模式
+	cleanAll = true
+	rPipe2, wPipe2, _ := os.Pipe()
+	os.Stdin = rPipe2
+	_, _ = wPipe2.WriteString("n\n")
+
+	err = cleanCmd.RunE(cleanCmd, []string{})
+	_ = rPipe2.Close()
+	_ = wPipe2.Close()
+	os.Stdin = oldStdin
+	if err != nil {
+		t.Fatalf("expected nil when user cancels batch clean, got: %v", err)
+	}
+	_ = targetNodeSeen
+}
+
+func TestRunCmd_WaitSyncZeroExitCode_And_CleanWarning(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/jobs/run":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(protocol.JobInfo{
+				ID:   "job-zero-exit",
+				Node: "zero-worker",
+				PID:  9999,
+			})
+		case "/api/v1/jobs/ps":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]protocol.JobInfo{
+				{
+					ID:       "job-zero-exit",
+					ExitCode: 0,
+				},
+			})
+		case "/api/v1/jobs/clean":
+			// 模拟清理返回 500 异常，验证不破坏原本的 0 退出码
+			http.Error(w, "disk failure during clean", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	cli := client.NewClient()
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "zero-worker", Target: u.Host})
+
+	runNodeName = "zero-worker"
+	runWait = true
+	runClean = true
+	defer func() {
+		runNodeName = ""
+		runWait = false
+		runClean = false
+	}()
+
+	err := runCmd.RunE(runCmd, []string{"echo", "hello"})
+	if err != nil {
+		t.Fatalf("expected nil for exit code 0 even when clean warns, got: %v", err)
+	}
+}
+
+func TestCatCmd_RemoteAndFlags(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/fs/cat" {
+			q := r.URL.Query()
+			if q.Get("tail") == "5" && q.Get("range") == "1:10" {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte("mock cat remote lines"))
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("default remote cat"))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	cli := client.NewClient()
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "remote-cat-worker", Target: u.Host})
+
+	catTail = 5
+	catLines = "1:10"
+	defer func() {
+		catTail = 0
+		catLines = ""
+	}()
+
+	err := catCmd.RunE(catCmd, []string{"remote-cat-worker:/data/remote.log"})
+	if err != nil {
+		t.Fatalf("catCmd remote with flags failed: %v", err)
+	}
+}
+
+func TestLogsCmd_PrefixAndAll(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/jobs/logs" {
+			if r.URL.Query().Get("all") == "true" {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte("all remote logs"))
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("some remote logs"))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	cli := client.NewClient()
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "prefix-log-worker", Target: u.Host})
+
+	logsAll = true
+	defer func() {
+		logsAll = false
+	}()
+
+	err := logsCmd.RunE(logsCmd, []string{"prefix-log-worker:job-all-test"})
+	if err != nil {
+		t.Fatalf("logsCmd prefix with --all failed: %v", err)
+	}
+}
+
+
+
 
 
 

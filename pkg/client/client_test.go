@@ -2208,6 +2208,276 @@ func TestClient_ContextCancellation(t *testing.T) {
 	}
 }
 
+func TestClient_CleanJob_And_GetJobInfo(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/jobs/clean":
+			var req protocol.CleanJobsRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			if req.JobID == "job-test-1" {
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(protocol.CleanJobsResponse{CleanedCount: 1, FreedBytes: 1024})
+				return
+			}
+			http.NotFound(w, r)
+		case "/api/v1/jobs/ps":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]protocol.JobInfo{
+				{
+					ID:       "job-test-1",
+					Status:   protocol.JobStatusCompleted,
+					ExitCode: 42,
+				},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	cli := NewClient()
+	cli.dataDir = t.TempDir()
+	u, _ := url.Parse(server.URL)
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "mock-worker", Target: u.Host})
+
+	// 1. GetJobInfoWithContext
+	info, err := cli.GetJobInfoWithContext(context.Background(), "mock-worker", "job-test-1")
+	if err != nil {
+		t.Fatalf("GetJobInfoWithContext failed: %v", err)
+	}
+	if info.ExitCode != 42 || info.Status != protocol.JobStatusCompleted {
+		t.Fatalf("unexpected info: %+v", info)
+	}
+
+	// 2. CleanJobWithContext
+	res, err := cli.CleanJobWithContext(context.Background(), "mock-worker", "job-test-1")
+	if err != nil {
+		t.Fatalf("CleanJobWithContext failed: %v", err)
+	}
+	if res.CleanedCount != 1 || res.FreedBytes != 1024 {
+		t.Fatalf("unexpected clean res: %+v", res)
+	}
+}
+
+func TestClient_CatWithSlice(t *testing.T) {
+	tempDir := t.TempDir()
+	localFile := filepath.Join(tempDir, "local.txt")
+	var sb strings.Builder
+	for i := 1; i <= 30; i++ {
+		fmt.Fprintf(&sb, "data %02d\n", i)
+	}
+	_ = os.WriteFile(localFile, []byte(sb.String()), 0644)
+
+	cli := NewClient()
+
+	// 本地 head 5
+	var outHead bytes.Buffer
+	err := cli.CatWithSlice(context.Background(), "", localFile, protocol.TextSliceOptions{Head: 5}, &outHead)
+	if err != nil {
+		t.Fatalf("CatWithSlice local failed: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(outHead.String()), "\n")
+	if len(lines) != 5 || lines[0] != "data 01" || lines[4] != "data 05" {
+		t.Fatalf("unexpected lines: %v", lines)
+	}
+
+	// 本地不存在文件报错
+	var outErr bytes.Buffer
+	if err := cli.CatWithSlice(context.Background(), "", filepath.Join(tempDir, "missing.txt"), protocol.TextSliceOptions{}, &outErr); err == nil {
+		t.Fatal("expected error on missing local file, got nil")
+	}
+
+	// 本地大文件 (>1MB) 触发智能安全提示
+	largeLocal := filepath.Join(tempDir, "large_local.txt")
+	llf, _ := os.Create(largeLocal)
+	chunk := strings.Repeat("C", 90) + "\n"
+	for i := 0; i < 12000; i++ {
+		_, _ = llf.WriteString(chunk)
+	}
+	llf.Close()
+
+	var outLarge bytes.Buffer
+	if err := cli.CatWithSlice(context.Background(), "", largeLocal, protocol.TextSliceOptions{}, &outLarge); err != nil {
+		t.Fatalf("expected local large cat to succeed, got %v", err)
+	}
+	if !strings.Contains(outLarge.String(), "[NOTICE] File size") {
+		t.Fatalf("expected [NOTICE] File size in output for >1MB local file")
+	}
+}
+
+func TestClient_CatWithSlice_Remote_And_Fallback(t *testing.T) {
+	tempDir := t.TempDir()
+	remoteContent := "line 01 remote\nline 02 remote\nline 03 remote\nline 04 remote\n"
+
+	// 1. 模拟现代 Worker：支持 /api/v1/fs/cat
+	serverModern := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/fs/cat" {
+			q := r.URL.Query()
+			if q.Get("path") != "/remote/file.txt" {
+				http.Error(w, "bad path", http.StatusBadRequest)
+				return
+			}
+			if q.Get("tail") == "2" {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte("line 03 remote\nline 04 remote\n"))
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(remoteContent))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer serverModern.Close()
+
+	cli := NewClient()
+	cli.dataDir = tempDir
+	uModern, _ := url.Parse(serverModern.URL)
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "modern-worker", Target: uModern.Host})
+
+	// 测试远程获取并传参 tail=2, head=1, range=1:2, all=true
+	var outModern bytes.Buffer
+	opts := protocol.TextSliceOptions{
+		Tail:      2,
+		Head:      1,
+		LineRange: "1:2",
+		All:       true,
+	}
+	err := cli.CatWithSlice(context.Background(), "modern-worker", "/remote/file.txt", opts, &outModern)
+	if err != nil {
+		t.Fatalf("remote CatWithSlice failed: %v", err)
+	}
+	if !strings.Contains(outModern.String(), "line 03 remote") {
+		t.Fatalf("unexpected remote output: %q", outModern.String())
+	}
+
+	// 2. 模拟老版本 Worker：/api/v1/fs/cat 返回 404，回退到 /api/v1/fs/download 全量下载并在客户端切片
+	h := sha256.Sum256([]byte(remoteContent))
+	expectedLegacyHash := hex.EncodeToString(h[:])
+
+	serverLegacy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/fs/cat" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.URL.Path == "/api/v1/fs/download" {
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Header().Set("X-File-SHA256", expectedLegacyHash)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(remoteContent))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer serverLegacy.Close()
+
+	uLegacy, _ := url.Parse(serverLegacy.URL)
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "legacy-worker", Target: uLegacy.Host})
+
+	var outFallback bytes.Buffer
+	err = cli.CatWithSlice(context.Background(), "legacy-worker", "/remote/legacy.txt", protocol.TextSliceOptions{Head: 2}, &outFallback)
+	if err != nil {
+		t.Fatalf("fallback CatWithSlice failed: %v", err)
+	}
+	fallbackLines := strings.Split(strings.TrimSpace(outFallback.String()), "\n")
+	if len(fallbackLines) != 2 || fallbackLines[0] != "line 01 remote" || fallbackLines[1] != "line 02 remote" {
+		t.Fatalf("unexpected fallback lines: %v", fallbackLines)
+	}
+
+	// 3. 模拟服务端报错 500 InternalServerError
+	serverErr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "internal disk error", http.StatusInternalServerError)
+	}))
+	defer serverErr.Close()
+
+	uErr, _ := url.Parse(serverErr.URL)
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "err-worker", Target: uErr.Host})
+
+	var outErr2 bytes.Buffer
+	err = cli.CatWithSlice(context.Background(), "err-worker", "/err.txt", protocol.TextSliceOptions{}, &outErr2)
+	if err == nil || !strings.Contains(err.Error(), "500") {
+		t.Fatalf("expected error containing 500, got: %v", err)
+	}
+}
+
+func TestClient_CleanJob_And_GetJobInfo_Errors(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/jobs/clean":
+			var req protocol.CleanJobsRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			if req.JobID == "job-running" {
+				http.Error(w, "cannot clean running job", http.StatusConflict)
+				return
+			}
+			if req.JobID == "job-notfound" {
+				http.Error(w, "job not found", http.StatusNotFound)
+				return
+			}
+			http.Error(w, "unexpected error", http.StatusInternalServerError)
+		case "/api/v1/jobs/ps":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]protocol.JobInfo{
+				{
+					ID:     "job-other",
+					Status: protocol.JobStatusRunning,
+				},
+			})
+		case "/api/v1/jobs/logs":
+			q := r.URL.Query()
+			if q.Get("head") == "3" && q.Get("tail") == "5" && q.Get("range") == "1:10" && q.Get("all") == "true" {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte("mock query logs verified"))
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("default logs"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	cli := NewClient()
+	cli.dataDir = t.TempDir()
+	u, _ := url.Parse(server.URL)
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "error-node", Target: u.Host})
+
+	// 1. CleanJob 冲突 (409)
+	_, err := cli.CleanJobWithContext(context.Background(), "error-node", "job-running")
+	if err == nil || !strings.Contains(err.Error(), "409") {
+		t.Fatalf("expected 409 conflict error, got: %v", err)
+	}
+
+	// 2. CleanJob 未找到 (404)
+	_, err = cli.CleanJobWithContext(context.Background(), "error-node", "job-notfound")
+	if err == nil || !strings.Contains(err.Error(), "404") {
+		t.Fatalf("expected 404 not found error, got: %v", err)
+	}
+
+	// 3. GetJobInfo 任务不在列表中
+	_, err = cli.GetJobInfoWithContext(context.Background(), "error-node", "job-non-existent")
+	if err == nil || !strings.Contains(err.Error(), "not found on node") {
+		t.Fatalf("expected 'not found on node' error, got: %v", err)
+	}
+
+	// 4. GetLogsWithOptionsWithContext 全参数透传测试
+	logsOut, err := cli.GetLogsWithOptionsWithContext(context.Background(), "error-node", "job-test", protocol.TextSliceOptions{
+		Head:      3,
+		Tail:      5,
+		LineRange: "1:10",
+		All:       true,
+	})
+	if err != nil {
+		t.Fatalf("GetLogsWithOptionsWithContext failed: %v", err)
+	}
+	if logsOut != "mock query logs verified" {
+		t.Fatalf("expected 'mock query logs verified', got: %q", logsOut)
+	}
+}
+
+
+
 
 
 
