@@ -55,6 +55,8 @@ type NodeInfo struct {
 	Name       string      `json:"name"`
 	Address    string      `json:"address"` // 形如 192.168.1.102:19000
 	Status     NodeStatus  `json:"status"`
+	Version    string      `json:"version,omitempty"`    // cworker 程序版本，如 "1.6.1"
+	OSVersion  string      `json:"os_version,omitempty"` // 宿主操作系统版本，如 "Windows 10 22H2" 或 "Windows 11 23H2"
 	Metrics    NodeMetrics `json:"metrics"`
 	ActiveJobs int         `json:"active_jobs"`
 	LastSeen   time.Time   `json:"last_seen"`

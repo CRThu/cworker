@@ -223,6 +223,14 @@ body {
   text-align: left;
 }
 
+.data-table.fixed-table {
+  table-layout: fixed;
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
 .data-table th {
   background: var(--bg-elevated);
   padding: 10px 14px;

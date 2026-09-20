@@ -346,6 +346,65 @@ describe('NodesView component layout and interactions', () => {
     expect(cpuCell?.textContent?.trim()).toBe('-');
     expect(memCell?.textContent?.trim()).toBe('-');
   });
+
+  it('should render node version badge and OS subtitle with graceful degradation', () => {
+    const { container } = render(NodesView, {
+      props: {
+        nodes: [
+          {
+            name: 'NODE-WITH-VER',
+            address: '100.93.237.16:19000',
+            status: 'ONLINE',
+            version: '1.7.0',
+            os_version: 'Windows 11 25H2',
+            active_jobs: 0,
+          },
+          {
+            name: 'NODE-LEGACY',
+            address: '100.93.237.17:19000',
+            status: 'ONLINE',
+            active_jobs: 0,
+          },
+        ],
+        knownNodes: [],
+      },
+    });
+
+    const rows = container.querySelectorAll('tbody tr');
+    expect(rows.length).toBe(2);
+
+    // 第一个节点包含版本徽章与系统副标题
+    const firstRow = rows[0];
+    expect(firstRow.textContent).toContain('NODE-WITH-VER');
+    expect(firstRow.textContent).toContain('v1.7.0');
+    expect(firstRow.textContent).toContain('Windows 11 25H2');
+
+    // 第二个老节点优雅退化，名称单元格内不包含版本徽章，也不抛出任何异常
+    const secondRow = rows[1];
+    expect(secondRow.textContent).toContain('NODE-LEGACY');
+    const secondRowNameCell = secondRow.querySelectorAll('td')[1];
+    expect(secondRowNameCell.querySelector('.badge')).toBeNull();
+  });
+
+  it('should render table with fixed-table layout class and calibrated column widths', () => {
+    const { container } = render(NodesView, {
+      props: {
+        nodes: mockNodes,
+        knownNodes: mockKnownNodes,
+      },
+    });
+
+    const table = container.querySelector('table.data-table.fixed-table');
+    expect(table).not.toBeNull();
+
+    // 验证表头列宽有明确设定且符合物理最小尺寸防抖要求
+    const ths = container.querySelectorAll('thead th');
+    expect(ths[0].getAttribute('style')).toContain('width: 50px');
+    expect(ths[2].getAttribute('style')).toContain('width: 160px'); // 地址
+    expect(ths[3].getAttribute('style')).toContain('width: 210px'); // 主机 CPU
+    expect(ths[4].getAttribute('style')).toContain('width: 210px'); // 主机内存
+    expect(ths[6].getAttribute('style')).toContain('width: 180px'); // 操作
+  });
 });
 
 describe('AddNodeModal validation and computer name support', () => {

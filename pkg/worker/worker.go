@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -344,8 +345,10 @@ func (w *Worker) collectNodeInfo() protocol.NodeInfo {
 	cpuPercent := process.GetSystemCPUPercent()
 
 	return protocol.NodeInfo{
-		Name:   w.cfg.Name,
-		Status: protocol.NodeStatusOnline,
+		Name:      w.cfg.Name,
+		Status:    protocol.NodeStatusOnline,
+		Version:   protocol.Version,
+		OSVersion: process.GetWindowsOSVersion(),
 		Metrics: protocol.NodeMetrics{
 			CPUPercent: cpuPercent,
 			CPUCores:   runtime.NumCPU(),
@@ -423,6 +426,19 @@ func (w *Worker) handleListJobs(rw http.ResponseWriter, r *http.Request) {
 	for _, j := range w.jobs {
 		list = append(list, j.GetInfo())
 	}
+
+	// 权威时序下沉 (SSOT)：RUNNING 优先置顶，其余任务按启动时间 StartTime 倒序
+	sort.SliceStable(list, func(i, j int) bool {
+		iRunning := list[i].Status == protocol.JobStatusRunning
+		jRunning := list[j].Status == protocol.JobStatusRunning
+		if iRunning && !jRunning {
+			return true
+		}
+		if !iRunning && jRunning {
+			return false
+		}
+		return list[i].StartTime.After(list[j].StartTime)
+	})
 
 	rw.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(rw).Encode(list)

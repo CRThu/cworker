@@ -116,16 +116,16 @@
     </div>
 
     <div class="table-responsive">
-      <table class="data-table">
+      <table class="data-table fixed-table">
         <thead>
           <tr>
-            <th style="width: 46px; text-align: center;">状态</th>
+            <th style="width: 50px; text-align: center;">状态</th>
             <th>名称</th>
-            <th>地址</th>
-            <th style="min-width: 130px;">主机 CPU</th>
-            <th style="min-width: 150px;">主机内存</th>
+            <th style="width: 160px;">地址</th>
+            <th style="width: 210px;">主机 CPU</th>
+            <th style="width: 210px;">主机内存</th>
             <th style="width: 65px; text-align: center;">任务数</th>
-            <th style="text-align: right; width: 140px;">操作</th>
+            <th style="text-align: right; width: 180px;">操作</th>
           </tr>
         </thead>
         <tbody>
@@ -154,13 +154,25 @@
                   </span>
                 {/if}
               </td>
-              <td><strong>{n.name}</strong></td>
-              <td class="mono muted-text">{n.address}</td>
+              <td class="cell-ellipsis">
+                <div style="display: flex; flex-direction: column; gap: 2px;">
+                  <div style="display: flex; align-items: center; gap: 6px;">
+                    <strong class="cell-ellipsis" title={n.name}>{n.name}</strong>
+                    {#if n.version}
+                      <span class="badge" style="font-size: 10px; padding: 1px 5px; opacity: 0.85; flex-shrink: 0;">v{n.version.replace(/^v/, '')}</span>
+                    {/if}
+                  </div>
+                  {#if n.os_version}
+                    <span class="dim-text cell-ellipsis" style="font-size: 11px;" title={n.os_version}>{n.os_version}</span>
+                  {/if}
+                </div>
+              </td>
+              <td class="mono muted-text cell-ellipsis" title={n.address}>{n.address}</td>
               <td>
                 {#if isOnline}
                   <div class="metric-with-sparkline">
-                    <Sparkline values={cpuHistory} color="#f97316" width={70} height={20} />
-                    <span class="metric-val mono">{cpuStr}</span>
+                    <Sparkline values={cpuHistory} color="#f97316" width={54} height={18} />
+                    <span class="metric-val mono tabular-nums">{cpuStr}</span>
                   </div>
                 {:else}
                   <span class="dim-text">-</span>
@@ -169,8 +181,8 @@
               <td>
                 {#if isOnline}
                   <div class="metric-with-sparkline">
-                    <Sparkline values={memHistory} color="#38bdf8" width={70} height={20} />
-                    <span class="metric-val mono">{(memUsedMB / 1024).toFixed(1)}G / {(memTotalMB / 1024).toFixed(1)}G</span>
+                    <Sparkline values={memHistory} color="#38bdf8" width={54} height={18} />
+                    <span class="metric-val mono tabular-nums">{(memUsedMB / 1024).toFixed(1)}G / {(memTotalMB / 1024).toFixed(1)}G</span>
                   </div>
                 {:else}
                   <span class="dim-text">-</span>
@@ -345,6 +357,11 @@
   .dim-text {
     font-size: 12px;
     color: var(--text-dim);
+  }
+  .cell-ellipsis {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .empty-cell {
     text-align: center;

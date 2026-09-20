@@ -115,6 +115,64 @@ func TestCmd_Nodes(t *testing.T) {
 	if err := nodeLsCmd.RunE(nodeLsCmd, []string{}); err != nil {
 		t.Fatalf("nodeLsCmd failed: %v", err)
 	}
+
+	// 模拟返回带 Version 与 OSVersion 的节点
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			rw.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(rw).Encode(protocol.NodeInfo{
+				Name:      "test-worker-1",
+				Status:    protocol.NodeStatusOnline,
+				Version:   "1.6.1",
+				OSVersion: "Windows 10 22H2",
+				Metrics: protocol.NodeMetrics{
+					CPUPercent: 15.0,
+					CPUCores:   8,
+					MemFreeMB:  8192,
+					MemTotalMB: 16384,
+				},
+				ActiveJobs: 2,
+			})
+			return
+		}
+		http.NotFound(rw, r)
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	cli := client.NewClient()
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "test-worker-1", Target: u.Host})
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "offline-worker-2", Target: "127.0.0.1:59999"})
+
+	// 捕获 stdout 验证表格字段与占位符
+	oldStdout := os.Stdout
+	pipeR, pipeW, _ := os.Pipe()
+	os.Stdout = pipeW
+
+	err = nodeCmd.RunE(nodeCmd, []string{})
+
+	_ = pipeW.Close()
+	var outBuf bytes.Buffer
+	_, _ = io.Copy(&outBuf, pipeR)
+	os.Stdout = oldStdout
+
+	if err != nil {
+		t.Fatalf("nodeCmd with active node failed: %v", err)
+	}
+
+	outStr := outBuf.String()
+	// 验证表头包含 VERSION 与 OS 列
+	if !strings.Contains(outStr, "VERSION") || !strings.Contains(outStr, "OS") {
+		t.Errorf("expected table header to contain VERSION and OS, got:\n%s", outStr)
+	}
+	// 验证在线节点包含格式化版本号与操作系统
+	if !strings.Contains(outStr, "v1.6.1") || !strings.Contains(outStr, "Windows 10 22H2") {
+		t.Errorf("expected output to contain 'v1.6.1' and 'Windows 10 22H2', got:\n%s", outStr)
+	}
+	// 验证离线/老版本节点包含 '-' 占位符
+	if !strings.Contains(outStr, "offline-worker-2") || !strings.Contains(outStr, "-") {
+		t.Errorf("expected output to contain offline node with '-' placeholder, got:\n%s", outStr)
+	}
 }
 
 func TestCmd_Ps(t *testing.T) {

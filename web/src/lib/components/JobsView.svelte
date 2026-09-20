@@ -161,18 +161,18 @@
   <!-- 任务数据表格 -->
   <div class="table-card">
     <div class="table-responsive">
-      <table class="data-table">
+      <table class="data-table fixed-table">
         <thead>
           <tr>
-            <th style="width: 105px;">ID</th>
-            <th style="width: 76px;">节点</th>
-            <th style="min-width: 120px;">名称</th>
-            <th style="width: 76px; text-align: center;">状态</th>
-            <th style="width: 65px; text-align: right;" title="进程树 CPU 开销">CPU</th>
-            <th style="width: 65px; text-align: right;" title="进程树内存开销">内存</th>
-            <th style="width: 65px; text-align: right;">时长</th>
+            <th style="width: 120px;">ID</th>
+            <th style="width: 100px;">节点</th>
+            <th style="width: 120px;">名称</th>
+            <th style="width: 80px; text-align: center;">状态</th>
+            <th style="width: 95px; text-align: right;" title="进程树 CPU 开销">CPU</th>
+            <th style="width: 85px; text-align: right;" title="进程树内存开销">内存</th>
+            <th style="width: 95px; text-align: right;">时长</th>
             <th>命令</th>
-            <th style="text-align: right; width: 105px;">操作</th>
+            <th style="width: 140px;">操作</th>
           </tr>
         </thead>
         <tbody>
@@ -184,9 +184,9 @@
             {@const cmdDisplay = j.command.length > 40 ? j.command.slice(0, 36) + '...' : j.command}
 
             <tr>
-              <td class="mono font-semibold text-primary cell-nowrap">{j.id}</td>
-              <td class="cell-nowrap"><span class="node-badge mono">{j.node}</span></td>
-              <td class="cell-nowrap"><strong>{j.name || '-'}</strong></td>
+              <td class="mono font-semibold text-primary cell-nowrap cell-ellipsis" title={j.id}>{j.id}</td>
+              <td class="cell-nowrap cell-ellipsis"><span class="node-badge mono" title={j.node}>{j.node}</span></td>
+              <td class="cell-nowrap cell-ellipsis" title={j.name || '-'}><strong>{j.name || '-'}</strong></td>
               <td style="text-align: center;" class="cell-nowrap">
                 <span class="badge {
                   j.status === 'RUNNING' ? 'badge-running' :
@@ -196,28 +196,29 @@
                   {formatStatus(j.status)}
                 </span>
               </td>
-              <td class="mono text-sm cell-nowrap" style="text-align: right;">{cpuStr}</td>
-              <td class="mono text-sm cell-nowrap" style="text-align: right;">{memStr}</td>
-              <td class="text-muted text-sm cell-nowrap" style="text-align: right;">{uptime}</td>
-              <td class="mono cmd-text text-sm" title={j.command}>{cmdDisplay}</td>
-              <td class="cell-nowrap" style="text-align: right;">
-                <button
-                  class="btn btn-secondary btn-sm"
-                  type="button"
-                  on:click={() => handleViewLogs(j)}
-                >
-                  日志
-                </button>
-                {#if isRunning}
+              <td class="mono text-sm tabular-nums cell-nowrap" style="text-align: right;">{cpuStr}</td>
+              <td class="mono text-sm tabular-nums cell-nowrap" style="text-align: right;">{memStr}</td>
+              <td class="text-muted text-sm tabular-nums cell-nowrap" style="text-align: right;">{uptime}</td>
+              <td class="mono cmd-text text-sm cell-ellipsis" title={j.command}>{cmdDisplay}</td>
+              <td class="cell-nowrap">
+                <div class="row-actions">
                   <button
-                    class="btn btn-danger btn-sm"
+                    class="btn btn-secondary btn-sm"
                     type="button"
-                    style="margin-left: 6px;"
-                    on:click={() => handleKill(j)}
+                    on:click={() => handleViewLogs(j)}
                   >
-                    终止
+                    日志
                   </button>
-                {/if}
+                  {#if isRunning}
+                    <button
+                      class="btn btn-danger btn-sm"
+                      type="button"
+                      on:click={() => handleKill(j)}
+                    >
+                      终止
+                    </button>
+                  {/if}
+                </div>
               </td>
             </tr>
           {/each}
@@ -337,12 +338,22 @@
   .text-muted {
     color: var(--text-muted);
   }
-  .cmd-text {
-    color: var(--text-dim);
-    max-width: 260px;
+  .row-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .cell-ellipsis {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .cmd-text {
+    color: var(--text-dim);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    width: 100%;
   }
   .empty-cell {
     text-align: center;

@@ -414,4 +414,89 @@ describe('JobsView filtering, status pills and action dispatches', () => {
     expect(killedJob).toBeDefined();
     expect(killedJob?.id).toBe('job-101');
   });
+
+  it('should render table with fixed-table class and calibrated column widths for anti-jitter', () => {
+    const { container } = render(JobsView, {
+      props: { jobs: mockJobs, nodes: mockNodes },
+    });
+
+    const table = container.querySelector('table.data-table.fixed-table');
+    expect(table).not.toBeNull();
+
+    const ths = container.querySelectorAll('thead th');
+    expect(ths.length).toBe(9);
+    expect(ths[0].getAttribute('style')).toContain('width: 120px'); // ID
+    expect(ths[4].getAttribute('style')).toContain('width: 95px');  // CPU
+    expect(ths[5].getAttribute('style')).toContain('width: 85px');  // 内存
+    expect(ths[6].getAttribute('style')).toContain('width: 95px');  // 时长
+    expect(ths[8].getAttribute('style')).toContain('width: 140px'); // 操作
+  });
+
+  it('should render high-load metrics with tabular-nums and guarantee stable slot 1 position for log button', () => {
+    const highLoadJobs: JobInfo[] = [
+      {
+        id: 'job-heavy-1',
+        name: 'cuda-training',
+        node: 'node-A',
+        command: 'python train_distributed.py --world_size 8',
+        status: 'RUNNING',
+        pid: 2001,
+        start_time: new Date(Date.now() - 7200000).toISOString(), // 2 小时前
+        metrics: {
+          cpu_percent: 2800.0,
+          memory_mb: 14900,
+        },
+      },
+      {
+        id: 'job-done-1',
+        name: 'quick-eval',
+        node: 'node-A',
+        command: 'echo done',
+        status: 'COMPLETED',
+        pid: 2002,
+        start_time: new Date(Date.now() - 3600000).toISOString(),
+        end_time: new Date(Date.now() - 3590000).toISOString(),
+      },
+    ];
+
+    const { container } = render(JobsView, {
+      props: { jobs: highLoadJobs, nodes: mockNodes },
+    });
+
+    const rows = container.querySelectorAll('tbody tr');
+    expect(rows.length).toBe(2);
+
+    // 1. 验证高负荷 CPU (2800.0%) 和内存 (14900M) 正确渲染且具备 tabular-nums 防抖
+    const runningRow = rows[0];
+    const cpuCell = runningRow.querySelector('td:nth-child(5)');
+    expect(cpuCell?.textContent?.trim()).toBe('2800.0%');
+    expect(cpuCell?.classList.contains('tabular-nums')).toBe(true);
+
+    const memCell = runningRow.querySelector('td:nth-child(6)');
+    expect(memCell?.textContent?.trim()).toBe('14900M');
+    expect(memCell?.classList.contains('tabular-nums')).toBe(true);
+
+    // 2. 验证已完成任务指标展示为 '-'
+    const doneRow = rows[1];
+    expect(doneRow.querySelector('td:nth-child(5)')?.textContent?.trim()).toBe('-');
+    expect(doneRow.querySelector('td:nth-child(6)')?.textContent?.trim()).toBe('-');
+
+    // 3. 验证操作列槽位布局稳定性 (Slot 1 绝对位置守恒，彻底消除日志按钮瞬移)
+    const runningActions = runningRow.querySelector('.row-actions');
+    expect(runningActions).not.toBeNull();
+    const runningBtns = runningActions?.querySelectorAll('button');
+    expect(runningBtns?.length).toBe(2);
+    // 槽位 1 永远是 [日志] 按钮
+    expect(runningBtns?.[0].textContent?.trim()).toBe('日志');
+    // 槽位 2 为 [终止] 按钮
+    expect(runningBtns?.[1].textContent?.trim()).toBe('终止');
+
+    const doneActions = doneRow.querySelector('.row-actions');
+    expect(doneActions).not.toBeNull();
+    const doneBtns = doneActions?.querySelectorAll('button');
+    expect(doneBtns?.length).toBe(1);
+    // 槽位 1 同样是 [日志] 按钮（绝对位置与 running 行严格垂直对齐）
+    expect(doneBtns?.[0].textContent?.trim()).toBe('日志');
+  });
 });
+

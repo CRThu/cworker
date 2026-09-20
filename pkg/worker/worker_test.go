@@ -1974,6 +1974,151 @@ func TestWorker_HandleFsCat_And_HandleCleanJobs_EdgeCases(t *testing.T) {
 	}
 }
 
+func TestWorker_NodeInfo_Version_And_JobsSorting(t *testing.T) {
+	tempDir := t.TempDir()
+	w := &Worker{
+		cfg: Config{
+			Name:    "version-node",
+			DataDir: tempDir,
+		},
+		jobs: make(map[string]*process.ManagedJob),
+	}
+
+	// 1. 验证 collectNodeInfo 包含 Version 与 OSVersion
+	info := w.collectNodeInfo()
+	if info.Version != protocol.Version {
+		t.Fatalf("expected Version %q, got %q", protocol.Version, info.Version)
+	}
+	if !strings.Contains(info.OSVersion, "Windows") {
+		t.Fatalf("expected OSVersion to contain 'Windows', got %q", info.OSVersion)
+	}
+
+	// 2. 验证 handleListJobs 权威时序下沉 (RUNNING 优先置顶，其余按 StartTime 倒序)
+	now := time.Now()
+	w.jobs["job-completed-old"] = process.NewHistoricJob(protocol.JobInfo{
+		ID:        "job-completed-old",
+		Status:    protocol.JobStatusCompleted,
+		StartTime: now.Add(-10 * time.Minute),
+	}, tempDir)
+	w.jobs["job-completed-new"] = process.NewHistoricJob(protocol.JobInfo{
+		ID:        "job-completed-new",
+		Status:    protocol.JobStatusCompleted,
+		StartTime: now.Add(-1 * time.Minute),
+	}, tempDir)
+	w.jobs["job-running-1"] = process.NewHistoricJob(protocol.JobInfo{
+		ID:        "job-running-1",
+		Status:    protocol.JobStatusRunning,
+		StartTime: now.Add(-5 * time.Minute),
+	}, tempDir)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/jobs/ps", nil)
+	w.handleListJobs(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("handleListJobs failed: %d", rec.Code)
+	}
+
+	var jobs []protocol.JobInfo
+	if err := json.Unmarshal(rec.Body.Bytes(), &jobs); err != nil {
+		t.Fatalf("unmarshal jobs failed: %v", err)
+	}
+
+	if len(jobs) != 3 {
+		t.Fatalf("expected 3 jobs, got %d", len(jobs))
+	}
+
+	// 第一位必须是 RUNNING 任务
+	if jobs[0].ID != "job-running-1" {
+		t.Fatalf("expected first job to be RUNNING 'job-running-1', got %q", jobs[0].ID)
+	}
+	// 之后必须是较新的 completed 任务
+	if jobs[1].ID != "job-completed-new" {
+		t.Fatalf("expected second job to be 'job-completed-new', got %q", jobs[1].ID)
+	}
+	// 最后是较旧的 completed 任务
+	if jobs[2].ID != "job-completed-old" {
+		t.Fatalf("expected third job to be 'job-completed-old', got %q", jobs[2].ID)
+	}
+}
+
+func TestWorker_ListJobs_MultipleRunningAndHistoricSorting(t *testing.T) {
+	tempDir := t.TempDir()
+	w := &Worker{
+		cfg: Config{
+			Name:    "sort-node",
+			DataDir: tempDir,
+		},
+		jobs: make(map[string]*process.ManagedJob),
+	}
+
+	now := time.Now()
+	// 构造多组不同状态与启动时间的任务
+	w.jobs["job-run-older"] = process.NewHistoricJob(protocol.JobInfo{
+		ID:        "job-run-older",
+		Status:    protocol.JobStatusRunning,
+		StartTime: now.Add(-10 * time.Minute),
+	}, tempDir)
+	w.jobs["job-run-newer"] = process.NewHistoricJob(protocol.JobInfo{
+		ID:        "job-run-newer",
+		Status:    protocol.JobStatusRunning,
+		StartTime: now.Add(-2 * time.Minute),
+	}, tempDir)
+	w.jobs["job-failed-mid"] = process.NewHistoricJob(protocol.JobInfo{
+		ID:        "job-failed-mid",
+		Status:    protocol.JobStatusFailed,
+		StartTime: now.Add(-5 * time.Minute),
+	}, tempDir)
+	w.jobs["job-stopped-newest"] = process.NewHistoricJob(protocol.JobInfo{
+		ID:        "job-stopped-newest",
+		Status:    protocol.JobStatusStopped,
+		StartTime: now.Add(-1 * time.Minute),
+	}, tempDir)
+	w.jobs["job-completed-oldest"] = process.NewHistoricJob(protocol.JobInfo{
+		ID:        "job-completed-oldest",
+		Status:    protocol.JobStatusCompleted,
+		StartTime: now.Add(-20 * time.Minute),
+	}, tempDir)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/jobs/ps", nil)
+	w.handleListJobs(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("handleListJobs failed: %d", rec.Code)
+	}
+
+	var jobs []protocol.JobInfo
+	if err := json.Unmarshal(rec.Body.Bytes(), &jobs); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+
+	if len(jobs) != 5 {
+		t.Fatalf("expected 5 jobs, got %d", len(jobs))
+	}
+
+	// 顺序期望：
+	// 0: job-run-newer (RUNNING, -2m)
+	// 1: job-run-older (RUNNING, -10m)
+	// 2: job-stopped-newest (STOPPED, -1m)
+	// 3: job-failed-mid (FAILED, -5m)
+	// 4: job-completed-oldest (COMPLETED, -20m)
+	expectedIDs := []string{
+		"job-run-newer",
+		"job-run-older",
+		"job-stopped-newest",
+		"job-failed-mid",
+		"job-completed-oldest",
+	}
+
+	for i, expID := range expectedIDs {
+		if jobs[i].ID != expID {
+			t.Errorf("job[%d] = %q, want %q", i, jobs[i].ID, expID)
+		}
+	}
+}
+
+
 
 
 

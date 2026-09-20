@@ -54,7 +54,7 @@ func runNodeList(ctx ...context.Context) error {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 2, 8, 2, ' ', 0)
-	fmt.Fprintln(w, "NAME\tSTATUS\tADDRESS\tCPU\tMEM\tJOBS")
+	fmt.Fprintln(w, "NAME\tSTATUS\tVERSION\tOS\tADDRESS\tCPU\tMEM\tJOBS")
 	for _, n := range nodes {
 		var cpuStr string
 		if n.Metrics.CPUCores > 0 {
@@ -76,8 +76,20 @@ func runNodeList(ctx ...context.Context) error {
 			memStr = fmt.Sprintf("%dM / %dM", memUsedMB, n.Metrics.MemTotalMB)
 		}
 
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%d\n",
-			n.Name, n.Status, n.Address, cpuStr, memStr, n.ActiveJobs)
+		verStr := n.Version
+		if verStr == "" {
+			verStr = "-"
+		} else if !strings.HasPrefix(verStr, "v") {
+			verStr = "v" + verStr
+		}
+
+		osStr := n.OSVersion
+		if osStr == "" {
+			osStr = "-"
+		}
+
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\n",
+			n.Name, n.Status, verStr, osStr, n.Address, cpuStr, memStr, n.ActiveJobs)
 	}
 	return w.Flush()
 }

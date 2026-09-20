@@ -38,7 +38,7 @@ description: >-
 
 | Action | Command | Output / Notes |
 | :--- | :--- | :--- |
-| **Cluster Health** | `cw nodes` | Status (`ONLINE`/`OFFLINE`), CPU%, Free/Total RAM, Job count |
+| **Cluster Health** | `cw nodes` | Status (`ONLINE`/`OFFLINE`), Version, OS, CPU%, Free/Total RAM, Job count |
 | **Local Identity** | `cw show [--refresh]` | Displays machine name, IP addresses, service state, token |
 | **Add Node** | `cw node add <name> [target] [--token <t>]` | Registers remote node to known ledger (auto-infers `:19000`) |
 | **Remove Node** | `cw node rm <name>` | Unregisters node from local ledger |

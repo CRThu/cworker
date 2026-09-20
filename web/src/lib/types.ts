@@ -14,6 +14,8 @@ export interface NodeInfo {
   name: string;
   address: string;
   status: NodeStatus;
+  version?: string;
+  os_version?: string;
   active_jobs: number;
   metrics?: HostMetrics;
 }
