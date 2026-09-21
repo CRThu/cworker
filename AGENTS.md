@@ -200,3 +200,12 @@ cw ui --port 19001 --no-open
    * 根目录下维护的 `.\build.bat`：自动按序触发 Bun 前端编译、Go 产物链接与系统打包；
    * 测试运行：`.\build.bat test`。
 
+4. **测试环境物理隔离（严禁污染真实账本）**：
+   * 涉及 CLI 命令、Client 实例或配置文件读写的 Go 测试，**首行必须强制注入环境隔离**，严防测试节点写穿至宿主 `%USERPROFILE%\.cworker\nodes.json`：
+     ```go
+     t.Setenv("USERPROFILE", t.TempDir())
+     ```
+   * 直接构造 `client.Client` 单测时，显式重定向 `cli.dataDir = t.TempDir()`。
+
+
+

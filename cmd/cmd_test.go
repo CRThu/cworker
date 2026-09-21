@@ -1593,6 +1593,7 @@ func TestRunCmd_MutualExclusion(t *testing.T) {
 }
 
 func TestRunCmd_WaitAndClean(t *testing.T) {
+	t.Setenv("USERPROFILE", t.TempDir())
 	var cleanCalled bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -1662,6 +1663,7 @@ func TestRunCmd_WaitAndClean(t *testing.T) {
 }
 
 func TestCleanCmd_SingleJob(t *testing.T) {
+	t.Setenv("USERPROFILE", t.TempDir())
 	var cleanedJob string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/v1/jobs/clean" {
@@ -1697,6 +1699,7 @@ func TestCleanCmd_SingleJob(t *testing.T) {
 }
 
 func TestCatCmd_Slicing(t *testing.T) {
+	t.Setenv("USERPROFILE", t.TempDir())
 	tempDir := t.TempDir()
 	sampleFile := filepath.Join(tempDir, "sample.txt")
 	var sb strings.Builder
@@ -1721,6 +1724,7 @@ func TestCatCmd_Slicing(t *testing.T) {
 }
 
 func TestCatCmd_ThresholdProtection(t *testing.T) {
+	t.Setenv("USERPROFILE", t.TempDir())
 	tempDir := t.TempDir()
 	largeFile := filepath.Join(tempDir, "large.txt")
 
@@ -1753,6 +1757,7 @@ func TestCatCmd_ThresholdProtection(t *testing.T) {
 }
 
 func TestLogsCmd_HeadAndRange(t *testing.T) {
+	t.Setenv("USERPROFILE", t.TempDir())
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/v1/jobs/logs" {
 			q := r.URL.Query()
@@ -1801,6 +1806,7 @@ func TestLogsCmd_HeadAndRange(t *testing.T) {
 }
 
 func TestCleanCmd_InteractiveAndPrefix(t *testing.T) {
+	t.Setenv("USERPROFILE", t.TempDir())
 	var targetNodeSeen, jobIDSeen string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/v1/jobs/clean" {
@@ -1868,6 +1874,7 @@ func TestCleanCmd_InteractiveAndPrefix(t *testing.T) {
 }
 
 func TestRunCmd_WaitSyncZeroExitCode_And_CleanWarning(t *testing.T) {
+	t.Setenv("USERPROFILE", t.TempDir())
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v1/jobs/run":
@@ -1914,6 +1921,7 @@ func TestRunCmd_WaitSyncZeroExitCode_And_CleanWarning(t *testing.T) {
 }
 
 func TestCatCmd_RemoteAndFlags(t *testing.T) {
+	t.Setenv("USERPROFILE", t.TempDir())
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/v1/fs/cat" {
 			q := r.URL.Query()
@@ -1948,6 +1956,7 @@ func TestCatCmd_RemoteAndFlags(t *testing.T) {
 }
 
 func TestLogsCmd_PrefixAndAll(t *testing.T) {
+	t.Setenv("USERPROFILE", t.TempDir())
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/v1/jobs/logs" {
 			if r.URL.Query().Get("all") == "true" {
