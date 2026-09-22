@@ -3,9 +3,17 @@ package cmd
 import (
 	"bytes"
 	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
+
+	"cworker/pkg/client"
+	"cworker/pkg/protocol"
 )
 
 func TestCmd_Local_CatAndMd(t *testing.T) {
@@ -118,5 +126,121 @@ func TestCmd_Local_LsAndRm(t *testing.T) {
 	}
 	if _, err := os.Stat(subDir); !os.IsNotExist(err) {
 		t.Fatalf("directory %s should have been deleted", subDir)
+	}
+}
+
+// 验证在非 TTY (Agent 管道) 环境下，长时间目录递归删除会触发单行心跳保活日志，防止 Agent 超时
+func TestCmd_Rm_NonTTY_Heartbeat(t *testing.T) {
+	tempProfile := t.TempDir()
+	t.Setenv("USERPROFILE", tempProfile)
+
+	// 缩短心跳周期至 25ms 以便毫秒级测试
+	client.SetDefaultHeartbeatInterval(25 * time.Millisecond)
+	defer client.SetDefaultHeartbeatInterval(5 * time.Second)
+
+	f := false
+	client.SetTerminalOverride(&f)
+	defer client.SetTerminalOverride(nil)
+
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		// 模拟耗时 35ms 递归删除
+		time.Sleep(35 * time.Millisecond)
+		rw.WriteHeader(http.StatusOK)
+		_, _ = rw.Write([]byte("DELETED"))
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	cli := client.NewClient()
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "rm-hb-node", Target: u.Host})
+
+	rmCmd.Flags().Set("recursive", "true")
+	rmCmd.Flags().Set("yes", "true")
+	defer func() {
+		rmCmd.Flags().Set("recursive", "false")
+		rmCmd.Flags().Set("yes", "false")
+	}()
+
+	oldStdout := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+
+	err := rmCmd.RunE(rmCmd, []string{"rm-hb-node:D:/huge_dir"})
+
+	_ = w.Close()
+	os.Stdout = oldStdout
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, r)
+	output := buf.String()
+
+	if err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+
+	// 核心断言 1: 在非 TTY 管道中必须捕获到保活心跳日志
+	if !strings.Contains(output, "[cworker] Deleting 'rm-hb-node:D:/huge_dir'") {
+		t.Fatalf("expected non-TTY heartbeat in rm output, got:\n%s", output)
+	}
+
+	// 核心断言 2: 最终必须输出成功完成标识
+	if !strings.Contains(output, "[OK] Deleted 'rm-hb-node:D:/huge_dir'") {
+		t.Fatalf("expected deleted success output, got:\n%s", output)
+	}
+}
+
+// 验证在 TTY 模式下遇到长耗时删除时，终端在同一行原地刷新动态提示
+func TestCmd_Rm_TTY_Heartbeat(t *testing.T) {
+	tempProfile := t.TempDir()
+	t.Setenv("USERPROFILE", tempProfile)
+
+	client.SetDefaultHeartbeatInterval(25 * time.Millisecond)
+	defer client.SetDefaultHeartbeatInterval(5 * time.Second)
+
+	trueVal := true
+	client.SetTerminalOverride(&trueVal)
+	defer client.SetTerminalOverride(nil)
+
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		time.Sleep(35 * time.Millisecond)
+		rw.WriteHeader(http.StatusOK)
+		_, _ = rw.Write([]byte("DELETED"))
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	cli := client.NewClient()
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "rm-tty-node", Target: u.Host})
+
+	rmCmd.Flags().Set("recursive", "true")
+	rmCmd.Flags().Set("yes", "true")
+	defer func() {
+		rmCmd.Flags().Set("recursive", "false")
+		rmCmd.Flags().Set("yes", "false")
+	}()
+
+	oldStdout := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+
+	err := rmCmd.RunE(rmCmd, []string{"rm-tty-node:D:/tty_dir"})
+
+	_ = w.Close()
+	os.Stdout = oldStdout
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, r)
+	output := buf.String()
+
+	if err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+
+	// 核心断言 1: 在 TTY 模式下必须包含 \r 原地覆写提示
+	if !strings.Contains(output, "\rDeleting 'rm-tty-node:D:/tty_dir'") {
+		t.Fatalf("expected TTY carriage return prompt, got:\n%s", output)
+	}
+
+	// 核心断言 2: 最终包含成功输出
+	if !strings.Contains(output, "[OK] Deleted 'rm-tty-node:D:/tty_dir'") {
+		t.Fatalf("expected success message, got:\n%s", output)
 	}
 }

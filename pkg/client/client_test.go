@@ -2079,6 +2079,114 @@ func TestClient_HashRemotePath_LargeBatch_5000Files(t *testing.T) {
 	t.Logf("Streaming and parsing 5000 files took %v, diffing took %v", elapsed, diffElapsed)
 }
 
+// 验证当多个哈希数据流并发汇入同一个 ProgressTracker (如 cw diff 场景) 时，
+// 总量正确累加，已完成量绝不超过总量，零统计倒挂与分母覆盖
+func TestClient_Hash_ConcurrentStreams_SharedProgressTracker(t *testing.T) {
+	serverA := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		rw.Header().Set("Content-Type", "application/x-ndjson")
+		rw.WriteHeader(http.StatusOK)
+		flusher := rw.(http.Flusher)
+		enc := json.NewEncoder(rw)
+
+		_ = enc.Encode(protocol.FsHashEvent{
+			Event:      protocol.FsHashEventInit,
+			TotalFiles: 50,
+			TotalBytes: 5000,
+		})
+		flusher.Flush()
+
+		for i := 1; i <= 50; i++ {
+			_ = enc.Encode(protocol.FsHashEvent{
+				Event: protocol.FsHashEventEntry,
+				Entry: &protocol.FileInfo{
+					Name:   fmt.Sprintf("a_%d.txt", i),
+					Path:   fmt.Sprintf("a_%d.txt", i),
+					Size:   100,
+					SHA256: fmt.Sprintf("hash_a_%d", i),
+				},
+			})
+			flusher.Flush()
+			time.Sleep(1 * time.Millisecond)
+		}
+	}))
+	defer serverA.Close()
+
+	serverB := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		rw.Header().Set("Content-Type", "application/x-ndjson")
+		rw.WriteHeader(http.StatusOK)
+		flusher := rw.(http.Flusher)
+		enc := json.NewEncoder(rw)
+
+		_ = enc.Encode(protocol.FsHashEvent{
+			Event:      protocol.FsHashEventInit,
+			TotalFiles: 50,
+			TotalBytes: 5000,
+		})
+		flusher.Flush()
+
+		for i := 1; i <= 50; i++ {
+			_ = enc.Encode(protocol.FsHashEvent{
+				Event: protocol.FsHashEventEntry,
+				Entry: &protocol.FileInfo{
+					Name:   fmt.Sprintf("b_%d.txt", i),
+					Path:   fmt.Sprintf("b_%d.txt", i),
+					Size:   100,
+					SHA256: fmt.Sprintf("hash_b_%d", i),
+				},
+			})
+			flusher.Flush()
+			time.Sleep(1 * time.Millisecond)
+		}
+	}))
+	defer serverB.Close()
+
+	cli := NewClient()
+	cli.dataDir = t.TempDir()
+	uA, _ := url.Parse(serverA.URL)
+	uB, _ := url.Parse(serverB.URL)
+
+	tracker := NewProgressTracker(0, 0)
+	var renderBuf bytes.Buffer
+	tracker.SetOutput(&renderBuf)
+	tracker.SetTTY(true)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, _ = cli.HashRemotePath(context.Background(), uA.Host, "dirA", true, tracker)
+	}()
+	go func() {
+		defer wg.Done()
+		_, _ = cli.HashRemotePath(context.Background(), uB.Host, "dirB", true, tracker)
+	}()
+	wg.Wait()
+
+	snap := tracker.Snapshot()
+
+	// 核心断言 1: 总量必须是两端累加 (50 + 50 = 100 files, 5000 + 5000 = 10000 bytes)
+	if snap.TotalFiles != 100 {
+		t.Fatalf("expected TotalFiles 100, got %d (overwrite bug occurred!)", snap.TotalFiles)
+	}
+	if snap.TotalBytes != 10000 {
+		t.Fatalf("expected TotalBytes 10000, got %d (overwrite bug occurred!)", snap.TotalBytes)
+	}
+
+	// 核心断言 2: 完成量与总量精确对齐 (100 / 100)
+	if snap.CompletedFiles != 100 {
+		t.Fatalf("expected CompletedFiles 100, got %d", snap.CompletedFiles)
+	}
+	if snap.TransferredBytes != 10000 {
+		t.Fatalf("expected TransferredBytes 10000, got %d", snap.TransferredBytes)
+	}
+
+	// 核心断言 3: 渲染的进度日志中绝不能出现分子大于分母的倒挂 (例如 100/50 files)
+	rendered := renderBuf.String()
+	if strings.Contains(rendered, "/50 files") {
+		t.Fatalf("rendered output contained stale or unmerged denominator: %s", rendered)
+	}
+}
+
 
 // 验证多文件、大文件、空目录与嵌套多层级混合场景端到端比对
 func TestClient_Hash_MixedHierarchy_EndToEnd(t *testing.T) {

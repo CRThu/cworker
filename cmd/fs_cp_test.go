@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"cworker/pkg/client"
 	"cworker/pkg/pathutil"
@@ -435,6 +437,109 @@ func TestCmd_Cp_BulkDirectory_MoreThan8Files(t *testing.T) {
 	remoteEmpty := pathutil.JoinRemotePath("D:/remote_bulk_upload", "empty_dir")
 	if _, ok := createdDirs.Load(remoteEmpty); !ok {
 		t.Fatalf("empty directory '%s' was not created on remote worker", remoteEmpty)
+	}
+}
+
+// 验证通过 CLI cp -r 传输长任务目录时，在非 TTY 环境下定时输出单行进度心跳并在结束时输出单行摘要
+func TestCmd_Cp_NonTTY_Heartbeat(t *testing.T) {
+	tempProfile := t.TempDir()
+	t.Setenv("USERPROFILE", tempProfile)
+
+	client.SetDefaultHeartbeatInterval(25 * time.Millisecond)
+	defer client.SetDefaultHeartbeatInterval(5 * time.Second)
+
+	f := false
+	client.SetTerminalOverride(&f)
+	defer client.SetTerminalOverride(nil)
+
+	srcDir := filepath.Join(tempProfile, "src_heartbeat")
+	_ = os.MkdirAll(srcDir, 0755)
+
+	// 创建几个小文件
+	for i := 1; i <= 3; i++ {
+		_ = os.WriteFile(filepath.Join(srcDir, fmt.Sprintf("file_%d.txt", i)), []byte(strings.Repeat("D", 500)), 0644)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		// 模拟每处理一个文件消耗一定时间，确保跨越 25ms 心跳周期
+		time.Sleep(30 * time.Millisecond)
+		switch r.URL.Path {
+		case "/api/v1/fs/upload":
+			h := sha256.New()
+			_, _ = io.Copy(h, r.Body)
+			hashHex := hex.EncodeToString(h.Sum(nil))
+			rw.Header().Set("X-File-SHA256", hashHex)
+			rw.WriteHeader(http.StatusOK)
+			_, _ = rw.Write([]byte("OK"))
+		case "/api/v1/fs/md":
+			rw.WriteHeader(http.StatusOK)
+			_, _ = rw.Write([]byte("OK"))
+		default:
+			http.NotFound(rw, r)
+		}
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	cli := client.NewClient()
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "hb-cp-node", Target: u.Host})
+
+	cpCmd.Flags().Set("recursive", "true")
+	cpCmd.Flags().Set("concurrency", "1") // 串行上传强迫时间跨越
+	defer func() {
+		cpCmd.Flags().Set("recursive", "false")
+		cpCmd.Flags().Set("concurrency", "8")
+	}()
+
+	oldStdout := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+
+	err := cpCmd.RunE(cpCmd, []string{srcDir, "hb-cp-node:D:/uploaded_hb"})
+
+	_ = w.Close()
+	os.Stdout = oldStdout
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, r)
+	output := buf.String()
+
+	if err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+
+	// 核心断言 1: 在非 TTY 管道中必须捕获到阶段性心跳 "[cworker] Transferred: "
+	if !strings.Contains(output, "[cworker] Transferred:") {
+		t.Fatalf("expected non-TTY heartbeat in cp output, got:\n%s", output)
+	}
+
+	// 核心断言 2: 必须捕获到最终完成摘要 "[cworker] Transferred 3/3 files"
+	if !strings.Contains(output, "[cworker] Transferred 3/3 files") {
+		t.Fatalf("expected final finish summary in cp output, got:\n%s", output)
+	}
+
+	// 核心断言 3: 必须包含最终成功标识
+	if !strings.Contains(output, "[OK] Transfer completed successfully.") {
+		t.Fatalf("expected success message in cp output, got:\n%s", output)
+	}
+}
+
+// 验证当并发数参数传入 <= 0 (如 -j 0 或 -j -1) 时，自动回退至默认并发数 8 并正常传输
+func TestCmd_Cp_DefaultConcurrencyFallback(t *testing.T) {
+	tempDir := t.TempDir()
+	f1 := filepath.Join(tempDir, "f1.txt")
+	f2 := filepath.Join(tempDir, "f2.txt")
+	_ = os.WriteFile(f1, []byte("concurrency test"), 0644)
+
+	cpCmd.Flags().Set("concurrency", "0")
+	defer cpCmd.Flags().Set("concurrency", "8")
+
+	err := cpCmd.RunE(cpCmd, []string{f1, f2})
+	if err != nil {
+		t.Fatalf("expected nil error when concurrency is 0, got: %v", err)
+	}
+	content, err := os.ReadFile(f2)
+	if err != nil || string(content) != "concurrency test" {
+		t.Fatalf("unexpected content or error: %v, got %s", err, string(content))
 	}
 }
 

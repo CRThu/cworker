@@ -3,7 +3,7 @@ name: cworker
 description: >-
   Orchestrate and manage distributed Windows processes, jobs, and files across remote nodes
   using cworker (cw). Covers cluster inspection, async job execution, log retrieval,
-  JobObject process killing, remote file operations, and known-nodes ledger management.
+  JobObject process killing, remote file operations, and cluster node management.
 ---
 
 # cworker (cw) Agent Guide
@@ -18,6 +18,9 @@ description: >-
   - Workers execute with native host user privileges directly on the physical OS. **There is NO Docker container, VM, or sandbox isolation**.
   - All operations (`cw rm`, `cw cp`, `cw run`, `cw kill`) directly affect the target machine's physical filesystem and processes with irreversible consequences.
   - **Human Confirmation Gate**: Agents MUST NOT execute destructive operations (such as recursively deleting non-temporary/non-self-created directories via `cw rm -r -y`, overwriting key project directories via `cw cp -r`, or terminating unknown jobs via `cw kill`) without first explicitly notifying the user of the target node, physical path, and irreversible risks, and obtaining explicit confirmation.
+- **System Service Context & Mandatory `--dir`**:
+  - Workers run as Windows Services (`SYSTEM` context): only System PATH is available (User PATH and user `%USERPROFILE%` are not inherited).
+  - **Always specify `--dir "<path>"`** in `cw run` to avoid defaulting to `System32`. Use absolute paths for interpreters (or explicitly activate venvs) and target files.
 - **`cw rm` MUST include `-r -y`**: Non-interactive recursive deletion requires both flags. Omitting `-y` causes the CLI to block on interactive `[y/N]` confirmation, deadlocking the agent.
   ```bash
   cw rm -r -y [<node>:]<path>
@@ -36,7 +39,7 @@ description: >-
   - Content $\le$ 1MB outputs in full; content $>$ 1MB automatically truncates to the last 100 lines with an override notice.
   - Flags: `-n/--tail <N>` (last N lines), `--head <N>` (first N lines), `-L/--lines <start:end>` (line range), `--all` (full output).
 - **`cw ui` is a Foreground Blocking Server**: `cw ui [--port <p>] [--no-open]` runs the embedded local Web console on 127.0.0.1. Do NOT execute it synchronously in non-daemon agent subshells as it blocks indefinitely; advise users to run it in a separate terminal or launch it as a background daemon process.
-- **401 Unauthorized Recovery**: If a command returns 401, the target node's token changed or is missing. Fetch the token via `cw show` on that node. You can either update the ledger via `cw node add <node> <target> --token <token>`, or dispatch directly with `cw run -n <node> --token <token> ...` (the client will automatically persist valid tokens to the local ledger upon successful handshake).
+- **401 Unauthorized Recovery**: If a command returns 401, the target node's token changed or is missing. Fetch the token via `cw show` on that node. You can either update the node configuration via `cw node add <node> <target> --token <token>`, or dispatch directly with `cw run -n <node> --token <token> ...` (the client will automatically persist valid tokens upon successful handshake).
 
 ## 2. CLI Reference
 
@@ -44,8 +47,8 @@ description: >-
 | :--- | :--- | :--- |
 | **Cluster Health** | `cw nodes` | Status (`ONLINE`/`OFFLINE`), Version, OS, CPU%, Free/Total RAM, Job count |
 | **Local Identity** | `cw show [--refresh]` | Displays machine name, IP addresses, service state, token |
-| **Add Node** | `cw node add <name> [target] [--token <t>]` | Registers remote node to known ledger (auto-infers `:19000`) |
-| **Remove Node** | `cw node rm <name>` | Unregisters node from local ledger |
+| **Add Node** | `cw node add <name> [target] [--token <t>]` | Registers remote node to cluster (auto-infers `:19000`) |
+| **Remove Node** | `cw node rm <name>` | Unregisters node from cluster |
 | **Dispatch / Exec** | `cw run [-w] [-c] [-n <node>] "<cmd>"` | Default: async job. Use `-wc` for foreground sync execution, live streaming, exit code alignment & auto-cleanup |
 | **List Jobs** | `cw ps [-n <node>] [--all] [--limit <n>]` | Lists jobs across cluster or node (`RUNNING` pinned to top, default 20 recent, `--all` shows all) |
 | **Clean Jobs** | `cw clean [<node>:]<job_id> [-y]` / `cw clean <--days <n> \| --all> -y` | Cleans specific job or batches of finished jobs; deletes disk logs; protects RUNNING tasks |

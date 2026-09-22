@@ -10,8 +10,37 @@ import (
 	"time"
 )
 
+var (
+	terminalOverride         *bool
+	defaultHeartbeatInterval = 5 * time.Second
+)
+
+// SetDefaultHeartbeatInterval 允许在测试与配置中动态调整全局默认心跳周期 (默认 5 秒)
+func SetDefaultHeartbeatInterval(d time.Duration) {
+	if d <= 0 {
+		d = 5 * time.Second
+	}
+	defaultHeartbeatInterval = d
+}
+
+// GetDefaultHeartbeatInterval 获取全局默认心跳周期 (默认 5 秒)
+func GetDefaultHeartbeatInterval() time.Duration {
+	if defaultHeartbeatInterval <= 0 {
+		return 5 * time.Second
+	}
+	return defaultHeartbeatInterval
+}
+
+// SetTerminalOverride 允许在测试与特殊环境中显式指定或重置 TTY 判定
+func SetTerminalOverride(override *bool) {
+	terminalOverride = override
+}
+
 // IsTerminal 判断当前 os.Stdout 是否为交互式终端 (TTY)
 func IsTerminal() bool {
+	if terminalOverride != nil {
+		return *terminalOverride
+	}
 	fi, err := os.Stdout.Stat()
 	if err != nil {
 		return false
@@ -34,21 +63,23 @@ type ProgressSnapshot struct {
 	ActiveFiles      []string `json:"active_files,omitempty"`
 }
 
-// ProgressTracker 线程安全的流式进度追踪器 (TTY 环境平滑刷新，非 TTY/Agent 环境静默，支持回调)
+// ProgressTracker 线程安全的流式进度追踪器 (TTY 环境平滑刷新，非 TTY/Agent 环境低频心跳定时汇报，支持回调)
 type ProgressTracker struct {
-	totalFiles       int64
-	completedFiles   int64
-	totalBytes       int64
-	transferredBytes int64
-	startTime        time.Time
-	lastRender       time.Time
-	isTTY            bool
-	out              io.Writer
-	mu               sync.Mutex
-	finishOnce       sync.Once
-	activeFiles      map[string]struct{}
-	onUpdate         func(ProgressSnapshot)
-	label            string
+	totalFiles        int64
+	completedFiles    int64
+	totalBytes        int64
+	transferredBytes  int64
+	startTime         time.Time
+	lastRender        time.Time
+	lastHeartbeat     time.Time
+	heartbeatInterval time.Duration
+	isTTY             bool
+	out               io.Writer
+	mu                sync.Mutex
+	finishOnce        sync.Once
+	activeFiles       map[string]struct{}
+	onUpdate          func(ProgressSnapshot)
+	label             string
 }
 
 // SetLabel 设置动作标签 (如 "Hashed"、"Transferred")
@@ -61,6 +92,16 @@ func (p *ProgressTracker) SetLabel(label string) {
 	p.mu.Unlock()
 }
 
+// SetHeartbeatInterval 设置非 TTY / Agent 环境下的低频心跳汇报周期 (默认 5 秒)
+func (p *ProgressTracker) SetHeartbeatInterval(d time.Duration) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	p.heartbeatInterval = d
+	p.mu.Unlock()
+}
+
 // NewProgressTracker 创建并初始化传输进度追踪器
 func NewProgressTracker(totalFiles, totalBytes int64) *ProgressTracker {
 	if totalBytes < 0 {
@@ -69,15 +110,18 @@ func NewProgressTracker(totalFiles, totalBytes int64) *ProgressTracker {
 	if totalFiles < 0 {
 		totalFiles = 0
 	}
+	now := time.Now()
 	return &ProgressTracker{
-		totalFiles:  totalFiles,
-		totalBytes:  totalBytes,
-		startTime:   time.Now(),
-		lastRender:  time.Now(),
-		isTTY:       isTerminal(),
-		out:         os.Stdout,
-		activeFiles: make(map[string]struct{}),
-		label:       "Transferred",
+		totalFiles:        totalFiles,
+		totalBytes:        totalBytes,
+		startTime:         now,
+		lastRender:        now,
+		lastHeartbeat:     now,
+		heartbeatInterval: defaultHeartbeatInterval,
+		isTTY:             isTerminal(),
+		out:               os.Stdout,
+		activeFiles:       make(map[string]struct{}),
+		label:             "Transferred",
 	}
 }
 
@@ -101,7 +145,23 @@ func (p *ProgressTracker) SetTotals(totalFiles, totalBytes int64) {
 		p.totalFiles = totalFiles
 	}
 	if totalBytes >= 0 {
-		p.totalBytes = totalBytes
+		atomic.StoreInt64(&p.totalBytes, totalBytes)
+	}
+	p.mu.Unlock()
+	p.maybeRender(false)
+}
+
+// AddTotals 累加待处理/传输的总文件数与总字节量 (支持多源/双端并发场景原子累加)
+func (p *ProgressTracker) AddTotals(totalFiles, totalBytes int64) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	if totalFiles > 0 {
+		p.totalFiles += totalFiles
+	}
+	if totalBytes > 0 {
+		atomic.AddInt64(&p.totalBytes, totalBytes)
 	}
 	p.mu.Unlock()
 	p.maybeRender(false)
@@ -145,15 +205,27 @@ func (p *ProgressTracker) Snapshot() ProgressSnapshot {
 	trans := atomic.LoadInt64(&p.transferredBytes)
 	done := atomic.LoadInt64(&p.completedFiles)
 	totalB := atomic.LoadInt64(&p.totalBytes)
+	totalF := p.totalFiles
+
+	// 防御性校准：若已知分母且实际完成数超出分母，动态抬升分母确保百分比守恒
+	if totalF > 0 && done > totalF {
+		totalF = done
+	}
+	if totalB > 0 && trans > totalB {
+		totalB = trans
+	}
 
 	var percent float64
 	if totalB > 0 {
 		percent = float64(trans) / float64(totalB) * 100.0
-		if percent > 100.0 {
-			percent = 100.0
-		}
-	} else if p.totalFiles > 0 {
-		percent = float64(done) / float64(p.totalFiles) * 100.0
+	} else if totalF > 0 {
+		percent = float64(done) / float64(totalF) * 100.0
+	}
+	if percent > 100.0 {
+		percent = 100.0
+	}
+	if percent < 0.0 {
+		percent = 0.0
 	}
 
 	now := time.Now()
@@ -172,7 +244,7 @@ func (p *ProgressTracker) Snapshot() ProgressSnapshot {
 	}
 
 	return ProgressSnapshot{
-		TotalFiles:       p.totalFiles,
+		TotalFiles:       totalF,
 		CompletedFiles:   done,
 		TotalBytes:       totalB,
 		TransferredBytes: trans,
@@ -215,6 +287,9 @@ func (p *ProgressTracker) SetOutput(w io.Writer) {
 }
 
 func (p *ProgressTracker) getWriter() io.Writer {
+	if p == nil {
+		return os.Stdout
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.out != nil {
@@ -329,8 +404,12 @@ func (p *ProgressTracker) maybeRender(force bool) {
 
 	p.mu.Lock()
 	now := time.Now()
-	// 节流：每 100ms 最多渲染一次，避免刷屏卡顿终端与过度分发
-	if !force && now.Sub(p.lastRender) < 100*time.Millisecond {
+	// 节流：每 100ms 最多渲染一次 (非 TTY 且设定了更小心跳周期时对齐心跳周期)
+	throttle := 100 * time.Millisecond
+	if !p.isTTY && p.heartbeatInterval > 0 && p.heartbeatInterval < throttle {
+		throttle = p.heartbeatInterval
+	}
+	if !force && now.Sub(p.lastRender) < throttle {
 		p.mu.Unlock()
 		return
 	}
@@ -339,15 +418,25 @@ func (p *ProgressTracker) maybeRender(force bool) {
 	trans := atomic.LoadInt64(&p.transferredBytes)
 	done := atomic.LoadInt64(&p.completedFiles)
 	totalB := atomic.LoadInt64(&p.totalBytes)
+	totalFiles := p.totalFiles
+	if totalFiles > 0 && done > totalFiles {
+		totalFiles = done
+	}
+	if totalB > 0 && trans > totalB {
+		totalB = trans
+	}
 
 	var percent float64
 	if totalB > 0 {
 		percent = float64(trans) / float64(totalB) * 100.0
-		if percent > 100.0 {
-			percent = 100.0
-		}
-	} else if p.totalFiles > 0 {
-		percent = float64(done) / float64(p.totalFiles) * 100.0
+	} else if totalFiles > 0 {
+		percent = float64(done) / float64(totalFiles) * 100.0
+	}
+	if percent > 100.0 {
+		percent = 100.0
+	}
+	if percent < 0.0 {
+		percent = 0.0
 	}
 
 	// 计算瞬时速率 (字节/秒)
@@ -368,7 +457,22 @@ func (p *ProgressTracker) maybeRender(force bool) {
 	updateCb := p.onUpdate
 	isTTY := p.isTTY
 	out := p.out
-	totalFiles := p.totalFiles
+	action := p.label
+	if action == "" {
+		action = "Progress"
+	}
+
+	shouldHeartbeat := false
+	if !isTTY {
+		interval := p.heartbeatInterval
+		if interval <= 0 {
+			interval = 5 * time.Second
+		}
+		if now.Sub(p.lastHeartbeat) >= interval {
+			p.lastHeartbeat = now
+			shouldHeartbeat = true
+		}
+	}
 	p.mu.Unlock()
 
 	if updateCb != nil {
@@ -384,6 +488,13 @@ func (p *ProgressTracker) maybeRender(force bool) {
 	}
 
 	if !isTTY {
+		if shouldHeartbeat {
+			if out == nil {
+				out = os.Stdout
+			}
+			fmt.Fprintf(out, "[cworker] %s: %5.1f%% (%s/%s, %d/%d files, %s)\n",
+				action, percent, FormatSize(trans), FormatSize(totalB), done, totalFiles, FormatSpeed(speedBytesSec))
+		}
 		return
 	}
 
@@ -421,6 +532,16 @@ func (p *ProgressTracker) Finish() {
 		done := atomic.LoadInt64(&p.completedFiles)
 		totalB := atomic.LoadInt64(&p.totalBytes)
 		totalFiles := p.totalFiles
+		if totalFiles == 0 && done > 0 {
+			totalFiles = done
+		} else if totalFiles > 0 && done > totalFiles {
+			totalFiles = done
+		}
+		if totalB == 0 && trans > 0 {
+			totalB = trans
+		} else if totalB > 0 && trans > totalB {
+			totalB = trans
+		}
 		updateCb := p.onUpdate
 
 		speedBytesSec := 0.0

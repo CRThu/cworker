@@ -907,4 +907,254 @@ func TestCmd_Diff_LargeBatch_1000Files(t *testing.T) {
 	t.Logf("Concurrent diff on 1000 items took %v", elapsed)
 }
 
+// 验证在 TTY 终端模式下，两端并发哈希时 ProgressTracker 进度条正确聚合两端总数，绝无分子大于分母的倒挂
+func TestCmd_Diff_TTY_SharedProgressTracker(t *testing.T) {
+	tempProfile := t.TempDir()
+	t.Setenv("USERPROFILE", tempProfile)
+
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		rw.Header().Set("Content-Type", "application/x-ndjson")
+		rw.WriteHeader(http.StatusOK)
+		flusher := rw.(http.Flusher)
+		if flusher != nil {
+			flusher.Flush()
+		}
+
+		path := r.URL.Query().Get("path")
+		isSrc := strings.Contains(path, "src")
+		enc := json.NewEncoder(rw)
+
+		// 模拟每端各有 20 个文件，各 2000 字节
+		_ = enc.Encode(protocol.FsHashEvent{
+			Event:      protocol.FsHashEventInit,
+			TotalFiles: 20,
+			TotalBytes: 2000,
+		})
+		if flusher != nil {
+			flusher.Flush()
+		}
+
+		prefix := "dst"
+		if isSrc {
+			prefix = "src"
+		}
+		for i := 1; i <= 20; i++ {
+			_ = enc.Encode(protocol.FsHashEvent{
+				Event: protocol.FsHashEventEntry,
+				Entry: &protocol.FileInfo{
+					Name:   fmt.Sprintf("%s_%d.txt", prefix, i),
+					Path:   fmt.Sprintf("file_%d.txt", i),
+					Size:   100,
+					SHA256: fmt.Sprintf("hash_%d", i),
+				},
+			})
+			if flusher != nil {
+				flusher.Flush()
+			}
+			time.Sleep(1 * time.Millisecond)
+		}
+
+		_ = enc.Encode(protocol.FsHashEvent{
+			Event: protocol.FsHashEventDone,
+		})
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	cli := client.NewClient()
+	_ = cli.SaveKnownNode(protocol.KnownNode{
+		Name:   "tty-node-src",
+		Target: u.Host,
+	})
+	_ = cli.SaveKnownNode(protocol.KnownNode{
+		Name:   "tty-node-dst",
+		Target: u.Host,
+	})
+
+	diffCmd.Flags().Set("recursive", "true")
+	defer diffCmd.Flags().Set("recursive", "false")
+
+	// 开启模拟 TTY 终端
+	trueVal := true
+	client.SetTerminalOverride(&trueVal)
+	defer client.SetTerminalOverride(nil)
+
+	oldStdout := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+
+	err := diffCmd.RunE(diffCmd, []string{"tty-node-src:D:/src", "tty-node-dst:D:/dst"})
+
+	_ = w.Close()
+	os.Stdout = oldStdout
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, r)
+	output := buf.String()
+
+	if err != nil {
+		t.Fatalf("expected diff on identical trees to succeed, got: %v", err)
+	}
+
+	// 核心断言 1: 最终 Finish 必须体现两端总和 (20 + 20 = 40 files, 2000 + 2000 = 4000 B)
+	if !strings.Contains(output, "40/40 files") {
+		t.Fatalf("expected progress bar to show combined 40/40 files, got output:\n%s", output)
+	}
+	if !strings.Contains(output, "3.9 KB") && !strings.Contains(output, "4000 B") && !strings.Contains(output, "4.0 KB") {
+		t.Fatalf("expected progress bar to show combined total bytes, got output:\n%s", output)
+	}
+
+	// 核心断言 2: 绝不能出现单端未累加导致的分母为 20 (例如 21/20 或 40/20 files)
+	if strings.Contains(output, "/20 files") {
+		t.Fatalf("output contained stale single-ended denominator /20 files:\n%s", output)
+	}
+}
+
+// 验证在非 TTY (Agent 管道) 环境下，长任务哈希过程中会定时按设定周期输出单行心跳日志，防止 Agent 挂起超时
+func TestCmd_Diff_NonTTY_Heartbeat(t *testing.T) {
+	tempProfile := t.TempDir()
+	t.Setenv("USERPROFILE", tempProfile)
+
+	// 缩短默认心跳周期至 30ms，以便单测毫秒级完成并稳定捕获
+	client.SetDefaultHeartbeatInterval(30 * time.Millisecond)
+	defer client.SetDefaultHeartbeatInterval(5 * time.Second)
+
+	// 强制非 TTY 模式
+	f := false
+	client.SetTerminalOverride(&f)
+	defer client.SetTerminalOverride(nil)
+
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		flusher, _ := rw.(http.Flusher)
+		rw.Header().Set("Content-Type", "application/x-ndjson")
+		rw.WriteHeader(http.StatusOK)
+		if flusher != nil {
+			flusher.Flush()
+		}
+
+		enc := json.NewEncoder(rw)
+		_ = enc.Encode(protocol.FsHashEvent{
+			Event:      protocol.FsHashEventInit,
+			TotalFiles: 3,
+			TotalBytes: 3000,
+		})
+		if flusher != nil {
+			flusher.Flush()
+		}
+
+		// 模拟延迟产生心跳
+		time.Sleep(40 * time.Millisecond)
+		_ = enc.Encode(protocol.FsHashEvent{
+			Event: protocol.FsHashEventEntry,
+			Entry: &protocol.FileInfo{Path: "f1.txt", Size: 1000, SHA256: "hash1"},
+		})
+		if flusher != nil {
+			flusher.Flush()
+		}
+
+		time.Sleep(40 * time.Millisecond)
+		_ = enc.Encode(protocol.FsHashEvent{
+			Event: protocol.FsHashEventEntry,
+			Entry: &protocol.FileInfo{Path: "f2.txt", Size: 1000, SHA256: "hash2"},
+		})
+		_ = enc.Encode(protocol.FsHashEvent{
+			Event: protocol.FsHashEventEntry,
+			Entry: &protocol.FileInfo{Path: "f3.txt", Size: 1000, SHA256: "hash3"},
+		})
+		_ = enc.Encode(protocol.FsHashEvent{
+			Event: protocol.FsHashEventDone,
+		})
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	cli := client.NewClient()
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "hb-src", Target: u.Host})
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "hb-dst", Target: u.Host})
+
+	diffCmd.Flags().Set("recursive", "true")
+	defer diffCmd.Flags().Set("recursive", "false")
+
+	oldStdout := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+
+	err := diffCmd.RunE(diffCmd, []string{"hb-src:D:/data", "hb-dst:D:/data"})
+
+	_ = w.Close()
+	os.Stdout = oldStdout
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, r)
+	output := buf.String()
+
+	if err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+
+	// 核心断言 1: 在非 TTY 管道中，必须捕获到阶段性的单行心跳日志 "[cworker] Hashed: xx.x%"
+	if !strings.Contains(output, "[cworker] Hashed:") {
+		t.Fatalf("expected non-TTY heartbeat lines in output, got:\n%s", output)
+	}
+
+	// 核心断言 2: 最终 Finish 摘要必须完整呈现 (3 + 3 = 6 files)
+	if !strings.Contains(output, "[cworker] Hashed 6/6 files") {
+		t.Fatalf("expected final finish summary, got:\n%s", output)
+	}
+
+	// 核心断言 3: 最终差异结果正确输出
+	if !strings.Contains(output, "All 3 files match") {
+		t.Fatalf("expected match summary, got:\n%s", output)
+	}
+}
+
+// 验证目标端为目录但源端为单文件且未带 -r 时，返回正确的 ExitError(Code: 2) 并提示 omitting directory
+func TestCmd_Diff_DestinationDirectory_WithoutRecursiveFlag(t *testing.T) {
+	tempDir := t.TempDir()
+	f1 := filepath.Join(tempDir, "file1.txt")
+	_ = os.WriteFile(f1, []byte("data"), 0644)
+	dir2 := filepath.Join(tempDir, "dir2")
+	_ = os.MkdirAll(dir2, 0755)
+
+	diffCmd.Flags().Set("recursive", "false")
+	err := diffCmd.RunE(diffCmd, []string{f1, dir2})
+	if err == nil {
+		t.Fatal("expected error when destination is a directory without -r")
+	}
+	exitErr, ok := err.(*ExitError)
+	if !ok || exitErr.ExitCode() != 2 {
+		t.Fatalf("expected ExitError with code 2, got: %v", err)
+	}
+	if !strings.Contains(exitErr.Error(), "omitting directory") || !strings.Contains(exitErr.Error(), "use -r") {
+		t.Fatalf("unexpected error message: %v", exitErr)
+	}
+}
+
+// 验证在 TTY 模式下遇到错误时，终端能够安全换行退出，避免错误信息与 \r 混排
+func TestCmd_Diff_TTY_Error_Println(t *testing.T) {
+	trueVal := true
+	client.SetTerminalOverride(&trueVal)
+	defer client.SetTerminalOverride(nil)
+
+	tempDir := t.TempDir()
+	f1 := filepath.Join(tempDir, "exist.txt")
+	_ = os.WriteFile(f1, []byte("data"), 0644)
+	fMissing := filepath.Join(tempDir, "missing.txt")
+
+	diffCmd.Flags().Set("recursive", "false")
+	err := diffCmd.RunE(diffCmd, []string{f1, fMissing})
+	if err == nil {
+		t.Fatal("expected error for missing file in TTY")
+	}
+	exitErr, ok := err.(*ExitError)
+	if !ok || exitErr.ExitCode() != 2 {
+		t.Fatalf("expected ExitCode 2, got %v", err)
+	}
+}
+
+
 

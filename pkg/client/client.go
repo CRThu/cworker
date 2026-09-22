@@ -2105,7 +2105,7 @@ func (c *Client) HashRemotePath(ctx context.Context, node, remotePath string, re
 			switch ev.Event {
 			case protocol.FsHashEventInit:
 				if tracker != nil {
-					tracker.SetTotals(ev.TotalFiles, ev.TotalBytes)
+					tracker.AddTotals(ev.TotalFiles, ev.TotalBytes)
 				}
 			case protocol.FsHashEventProgress:
 				if tracker != nil && ev.CurrentFile != "" {
@@ -2144,7 +2144,7 @@ func (c *Client) HashRemotePath(ctx context.Context, node, remotePath string, re
 		for _, item := range list {
 			totalBytes += item.Size
 		}
-		tracker.SetTotals(int64(len(list)), totalBytes)
+		tracker.AddTotals(int64(len(list)), totalBytes)
 		for _, item := range list {
 			tracker.AddBytes(item.Size)
 			tracker.AddFile()
@@ -2167,7 +2167,7 @@ func HashLocalPath(localPath string, recursive bool, trackers ...*ProgressTracke
 	_, err := fsengine.HashStream(localPath, recursive, func(ev protocol.FsHashEvent) error {
 		switch ev.Event {
 		case protocol.FsHashEventInit:
-			tracker.SetTotals(ev.TotalFiles, ev.TotalBytes)
+			tracker.AddTotals(ev.TotalFiles, ev.TotalBytes)
 		case protocol.FsHashEventProgress:
 			if ev.CurrentFile != "" {
 				tracker.StartFile(ev.CurrentFile)

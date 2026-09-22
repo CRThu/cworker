@@ -44,15 +44,109 @@ func TestProgressTracker_TTY_Rendering(t *testing.T) {
 }
 
 func TestProgressTracker_NonTTY_Silence(t *testing.T) {
+	var buf bytes.Buffer
 	tracker := NewProgressTracker(5, 5000)
 	tracker.SetTTY(false)
+	tracker.SetOutput(&buf)
 
 	tracker.AddBytes(1000)
 	tracker.AddFile()
 	tracker.maybeRender(false)
-	tracker.maybeRender(true) // non-TTY 下强制渲染也保持静默
+	tracker.maybeRender(true) // 默认 5s 周期内保持静默，不刷屏
+
+	if buf.Len() > 0 {
+		t.Fatalf("expected silent output before heartbeat interval, got: %q", buf.String())
+	}
 
 	tracker.Finish() // 仅在 finish 时输出单行摘要
+	if !strings.Contains(buf.String(), "[cworker] Transferred 1/5 files") {
+		t.Fatalf("expected finish summary in output, got: %q", buf.String())
+	}
+}
+
+func TestProgressTracker_NonTTY_Heartbeat(t *testing.T) {
+	var buf bytes.Buffer
+	tracker := NewProgressTracker(10, 10000)
+	tracker.SetTTY(false)
+	tracker.SetOutput(&buf)
+	tracker.SetHeartbeatInterval(20 * time.Millisecond) // 缩短心跳周期以便单测毫秒级验证
+	tracker.SetLabel("Hashed")
+
+	// 1. 初次传输数据（耗时 < 20ms），应严格静默
+	tracker.AddBytes(1000)
+	if buf.Len() > 0 {
+		t.Fatalf("expected no heartbeat within interval, got: %q", buf.String())
+	}
+
+	// 2. 等待超过心跳周期，产生新数据时应触发单行心跳汇报
+	time.Sleep(25 * time.Millisecond)
+	tracker.AddBytes(2000) // 累计 3000/10000 字节 = 30.0%
+
+	output := buf.String()
+	if !strings.Contains(output, "[cworker] Hashed:") || !strings.Contains(output, "30.0%") {
+		t.Fatalf("expected heartbeat progress line with 30.0%%, got: %q", output)
+	}
+	if !strings.HasSuffix(output, "\n") {
+		t.Fatalf("heartbeat line must end with newline, got: %q", output)
+	}
+
+	// 3. 再次等待超过心跳周期，累加文件并验证第二条心跳
+	buf.Reset()
+	time.Sleep(25 * time.Millisecond)
+	tracker.AddFile() // 1/10 files
+
+	output2 := buf.String()
+	if !strings.Contains(output2, "[cworker] Hashed:") || !strings.Contains(output2, "1/10 files") {
+		t.Fatalf("expected second heartbeat with file count, got: %q", output2)
+	}
+
+	// 4. 调用 Finish，断言输出最终完成摘要
+	buf.Reset()
+	tracker.Finish()
+	finishOut := buf.String()
+	if !strings.Contains(finishOut, "[cworker] Hashed 1/10 files") {
+		t.Fatalf("expected final finish line, got: %q", finishOut)
+	}
+}
+
+// 验证全为 0 字节小文件批量传输/哈希时，即使 totalBytes 为 0，百分比能平滑降级为按已完成文件数计算
+func TestProgressTracker_ZeroBytes_NonTTY_Heartbeat(t *testing.T) {
+	var buf bytes.Buffer
+	tracker := NewProgressTracker(5, 0) // 5 个文件，总字节为 0
+	tracker.SetTTY(false)
+	tracker.SetOutput(&buf)
+	tracker.SetHeartbeatInterval(20 * time.Millisecond)
+	tracker.SetLabel("Transferred")
+
+	// 1. 等待心跳周期到达，完成第 1 个文件 (1/5 files = 20%)
+	time.Sleep(25 * time.Millisecond)
+	tracker.AddFile()
+
+	output := buf.String()
+	if !strings.Contains(output, "[cworker] Transferred:") || !strings.Contains(output, "20.0%") || !strings.Contains(output, "1/5 files") {
+		t.Fatalf("expected 20.0%% progress based on file count when bytes are zero, got: %q", output)
+	}
+
+	// 2. 再次跨越心跳周期，完成第 2 个文件 (2/5 files = 40%)
+	buf.Reset()
+	time.Sleep(25 * time.Millisecond)
+	tracker.AddFile()
+
+	output2 := buf.String()
+	if !strings.Contains(output2, "[cworker] Transferred:") || !strings.Contains(output2, "40.0%") || !strings.Contains(output2, "2/5 files") {
+		t.Fatalf("expected 40.0%% progress for 2/5 files, got: %q", output2)
+	}
+
+	buf.Reset()
+	tracker.AddFile()
+	tracker.AddFile()
+	tracker.AddFile() // 5/5
+	tracker.Finish()
+
+	finishOut := buf.String()
+	if !strings.Contains(finishOut, "[cworker] Transferred 5/5 files") {
+		t.Fatalf("expected finish summary for 5/5 zero-byte files, got: %q", finishOut)
+	}
 }
 
 func TestProgressTracker_ZeroValues(t *testing.T) {
@@ -394,6 +488,66 @@ func TestProgressTracker_FallbackToFileCountWhenZeroBytes(t *testing.T) {
 	if snap2.Percent != 100 {
 		t.Fatalf("expected 100%% for 5/5 files, got %d%%", snap2.Percent)
 	}
+}
+
+// 验证 ProgressTracker 在各种空指针、非法负数参数及防御性降级分支下的绝对安全
+func TestProgressTracker_NilAndDefensiveBranches(t *testing.T) {
+	// 1. 全局配置接口测试
+	SetDefaultHeartbeatInterval(10 * time.Millisecond)
+	SetDefaultHeartbeatInterval(0) // 校验 <=0 时回退为 5s
+	if defaultHeartbeatInterval != 5*time.Second {
+		t.Fatalf("expected fallback to 5s, got %v", defaultHeartbeatInterval)
+	}
+
+	trueVal := true
+	SetTerminalOverride(&trueVal)
+	if !IsTerminal() {
+		t.Fatal("expected IsTerminal true with override")
+	}
+	falseVal := false
+	SetTerminalOverride(&falseVal)
+	if IsTerminal() {
+		t.Fatal("expected IsTerminal false with override")
+	}
+	SetTerminalOverride(nil)
+
+	// 2. 负数参数初始化
+	negTracker := NewProgressTracker(-5, -500)
+	if negTracker.TotalFiles() != 0 || negTracker.TotalBytes() != 0 {
+		t.Fatalf("expected 0 for negative totals, got files=%d bytes=%d", negTracker.TotalFiles(), negTracker.TotalBytes())
+	}
+
+	// 3. nil 指针方法调用（不 panic）
+	var nilTr *ProgressTracker
+	nilTr.SetLabel("Test")
+	nilTr.SetHeartbeatInterval(time.Second)
+	nilTr.SetUpdateCallback(nil)
+	nilTr.SetTotals(1, 1)
+	nilTr.AddTotals(1, 1)
+	nilTr.StartFile("a.txt")
+	nilTr.EndFile("a.txt")
+	nilTr.SetOutput(nil)
+	nilTr.maybeRender(true)
+	if nilTr.Snapshot().Percent != 0 {
+		t.Fatal("expected 0 for nil tracker snapshot")
+	}
+	if nilTr.getWriter() == nil {
+		t.Fatal("nil tracker getWriter should return os.Stdout")
+	}
+
+	// 4. 有效实例上的边界测试
+	tr := NewProgressTracker(2, 200)
+	tr.StartFile("") // 空文件名忽略
+	tr.EndFile("")   // 空文件名忽略
+	tr.AddBytes(-50) // 负数字节忽略
+	tr.SetTotals(-1, -1)
+	tr.SetOutput(nil) // 重置为 os.Stdout
+	if tr.getWriter() == nil {
+		t.Fatal("expected non-nil writer")
+	}
+	tr.SetHeartbeatInterval(0) // 自动回退为 5s
+	tr.maybeRender(true)
+	tr.Finish()
 }
 
 

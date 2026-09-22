@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"cworker/pkg/client"
 	"cworker/pkg/pathutil"
@@ -44,12 +45,52 @@ var rmCmd = &cobra.Command{
 		}
 
 		cli := client.NewClient()
-		if err := cli.DeleteWithContext(cmdContext(cmd), node, path, rmRecursive); err != nil {
+		startTime := time.Now()
+		interval := client.GetDefaultHeartbeatInterval()
+
+		var stopHeartbeat chan struct{}
+		if rmRecursive {
+			stopHeartbeat = make(chan struct{})
+			isTTY := client.IsTerminal()
+			go func() {
+				ticker := time.NewTicker(interval)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-stopHeartbeat:
+						return
+					case <-ticker.C:
+						elapsed := time.Since(startTime).Truncate(time.Second)
+						if isTTY {
+							fmt.Printf("\rDeleting '%s'... (elapsed %s)  ", targetName, elapsed)
+						} else {
+							fmt.Printf("[cworker] Deleting '%s' (elapsed %s)...\n", targetName, elapsed)
+						}
+					}
+				}
+			}()
+		}
+
+		err := cli.DeleteWithContext(cmdContext(cmd), node, path, rmRecursive)
+		if stopHeartbeat != nil {
+			close(stopHeartbeat)
+		}
+
+		elapsed := time.Since(startTime)
+
+		if err != nil {
+			if client.IsTerminal() && elapsed >= interval {
+				fmt.Println()
+			}
 			return fmt.Errorf("delete failed: %w", err)
 		}
 
-		if node == "" {
-			fmt.Printf("[OK] Deleted '%s'\n", path)
+		if client.IsTerminal() && elapsed >= interval {
+			fmt.Println()
+		}
+
+		if elapsed >= 3*time.Second {
+			fmt.Printf("[OK] Deleted '%s' in %s\n", targetName, elapsed.Truncate(10*time.Millisecond))
 		} else {
 			fmt.Printf("[OK] Deleted '%s'\n", targetName)
 		}

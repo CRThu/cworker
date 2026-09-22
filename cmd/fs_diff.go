@@ -40,12 +40,9 @@ var diffCmd = &cobra.Command{
 
 		cli := client.NewClient()
 
-		// 1. 并发获取源端与目标端的文件清单与哈希 (两端异步并行计算，加速一倍；支持极速熔断与统一进度聚合)
-		var tracker *client.ProgressTracker
-		if client.IsTerminal() {
-			tracker = client.NewProgressTracker(0, 0)
-			tracker.SetLabel("Hashed")
-		}
+		// 1. 并发获取源端与目标端的文件清单与哈希 (两端异步并行计算，加速一倍；支持极速熔断、统一聚合与 Agent 存活定时心跳)
+		tracker := client.NewProgressTracker(0, 0)
+		tracker.SetLabel("Hashed")
 
 		asyncCtx, cancel := context.WithCancel(ctx)
 		defer cancel()
@@ -78,7 +75,11 @@ var diffCmd = &cobra.Command{
 		wg.Wait()
 
 		if tracker != nil {
-			tracker.Finish()
+			if srcErr == nil && dstErr == nil {
+				tracker.Finish()
+			} else if client.IsTerminal() {
+				fmt.Println()
+			}
 		}
 
 		if srcErr != nil {
