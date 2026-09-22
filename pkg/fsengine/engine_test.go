@@ -13,6 +13,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+
+	"cworker/pkg/protocol"
 )
 
 type testTracker struct {
@@ -923,6 +925,281 @@ func TestFsEngine_CopyDir_ExtremeEdgeCases(t *testing.T) {
 		}
 	})
 }
+
+// 验证 HashStream 在单文件与目录模式下的完整事件生命周期 (init -> progress -> entry -> done)
+func TestFsEngine_HashStream_Events(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// 1. 单文件模式
+	f1 := filepath.Join(tmpDir, "single.txt")
+	content := []byte("hello stream hash")
+	if err := os.WriteFile(f1, content, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	var events []protocol.FsHashEvent
+	list, err := HashStream(f1, false, func(ev protocol.FsHashEvent) error {
+		events = append(events, ev)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("HashStream single file failed: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(list))
+	}
+	// 事件序列必须包含 init, entry, done
+	if len(events) < 3 {
+		t.Fatalf("expected at least 3 events for single file, got %d", len(events))
+	}
+	if events[0].Event != protocol.FsHashEventInit || events[0].TotalFiles != 1 || events[0].TotalBytes != int64(len(content)) {
+		t.Fatalf("unexpected init event: %+v", events[0])
+	}
+	lastEv := events[len(events)-1]
+	if lastEv.Event != protocol.FsHashEventDone || lastEv.TotalFiles != 1 {
+		t.Fatalf("unexpected done event: %+v", lastEv)
+	}
+
+	// 2. 目录多文件递归模式
+	subDir := filepath.Join(tmpDir, "nested")
+	_ = os.MkdirAll(subDir, 0755)
+	f2 := filepath.Join(subDir, "inner.txt")
+	_ = os.WriteFile(f2, []byte("inner world"), 0644)
+
+	var dirEvents []protocol.FsHashEvent
+	dirList, err := HashStream(tmpDir, true, func(ev protocol.FsHashEvent) error {
+		dirEvents = append(dirEvents, ev)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("HashStream dir failed: %v", err)
+	}
+	if len(dirList) != 2 {
+		t.Fatalf("expected 2 items, got %d", len(dirList))
+	}
+	if dirEvents[0].Event != protocol.FsHashEventInit || dirEvents[0].TotalFiles != 2 {
+		t.Fatalf("unexpected dir init event: %+v", dirEvents[0])
+	}
+	lastDirEv := dirEvents[len(dirEvents)-1]
+	if lastDirEv.Event != protocol.FsHashEventDone || lastDirEv.TotalFiles != 2 {
+		t.Fatalf("unexpected dir done event: %+v", lastDirEv)
+	}
+
+	// 3. 中途发生事件回调熔断 (例如网络连接断开)
+	abortedErr := errors.New("client connection closed")
+	_, err = HashStream(tmpDir, true, func(ev protocol.FsHashEvent) error {
+		if ev.Event == protocol.FsHashEventInit {
+			return abortedErr
+		}
+		return nil
+	})
+	if !errors.Is(err, abortedErr) {
+		t.Fatalf("expected HashStream to abort immediately on callback error, got: %v", err)
+	}
+}
+
+// 验证大文件 (>10MB) 计算 SHA-256 时按块产生 progress 步进心跳事件
+func TestFsEngine_HashStream_LargeFileChunking(t *testing.T) {
+	tmpDir := t.TempDir()
+	largeFile := filepath.Join(tmpDir, "large.bin")
+
+	// 生成一个 12MB 的文件 (超过 10MB 触发 chunked progress 阈值)
+	targetSize := 12 * 1024 * 1024
+	chunk := bytes.Repeat([]byte("X"), 1024*1024) // 1MB
+	f, err := os.Create(largeFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 12; i++ {
+		if _, err := f.Write(chunk); err != nil {
+			f.Close()
+			t.Fatal(err)
+		}
+	}
+	f.Close()
+
+	var progressCount int
+	var maxDoneBytes int64
+
+	list, err := HashStream(largeFile, false, func(ev protocol.FsHashEvent) error {
+		if ev.Event == protocol.FsHashEventProgress {
+			progressCount++
+			if ev.DoneBytes > maxDoneBytes {
+				maxDoneBytes = ev.DoneBytes
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("HashStream large file failed: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(list))
+	}
+	if progressCount == 0 {
+		t.Fatalf("expected at least 1 progress event for 12MB file, got %d", progressCount)
+	}
+	if maxDoneBytes != int64(targetSize) {
+		t.Fatalf("expected maxDoneBytes to reach %d, got %d", targetSize, maxDoneBytes)
+	}
+}
+
+// 验证小文件、大文件 (>10MB)、空目录、多层深层嵌套混合场景下的 HashStream 表现
+func TestFsEngine_HashStream_MixedHierarchy(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// 1. 空文件 (0 字节)
+	_ = os.WriteFile(filepath.Join(tmpDir, "zero.txt"), []byte(""), 0644)
+
+	// 2. 根目录小文件
+	_ = os.WriteFile(filepath.Join(tmpDir, "small.txt"), []byte("small hello"), 0644)
+
+	// 3. 空目录 (必须在统计与哈希列表中被正确跳过)
+	_ = os.MkdirAll(filepath.Join(tmpDir, "empty_dir"), 0755)
+
+	// 4. 多级嵌套子目录
+	deepDir := filepath.Join(tmpDir, "level1", "level2")
+	_ = os.MkdirAll(deepDir, 0755)
+	_ = os.WriteFile(filepath.Join(deepDir, "nested.txt"), []byte("nested text payload"), 0644)
+
+	// 5. 大文件 (11MB，触发分块心跳)
+	largeFile := filepath.Join(deepDir, "large.bin")
+	lf, err := os.Create(largeFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunk := bytes.Repeat([]byte("Z"), 1024*1024)
+	for i := 0; i < 11; i++ {
+		_, _ = lf.Write(chunk)
+	}
+	_ = lf.Close()
+
+	var events []protocol.FsHashEvent
+	var progressCount int
+
+	list, err := HashStream(tmpDir, true, func(ev protocol.FsHashEvent) error {
+		events = append(events, ev)
+		if ev.Event == protocol.FsHashEventProgress {
+			progressCount++
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("HashStream mixed hierarchy failed: %v", err)
+	}
+
+	// 必须准确包含 4 个有效文件 (zero.txt, small.txt, nested.txt, large.bin)
+	if len(list) != 4 {
+		t.Fatalf("expected 4 files in mixed list, got %d: %+v", len(list), list)
+	}
+
+	// 验证 init 事件统计准确性
+	if len(events) == 0 || events[0].Event != protocol.FsHashEventInit {
+		t.Fatalf("missing or invalid init event")
+	}
+	if events[0].TotalFiles != 4 {
+		t.Fatalf("expected TotalFiles 4 in init, got %d", events[0].TotalFiles)
+	}
+	expectedTotalBytes := int64(0 + len("small hello") + len("nested text payload") + 11*1024*1024)
+	if events[0].TotalBytes != expectedTotalBytes {
+		t.Fatalf("expected TotalBytes %d, got %d", expectedTotalBytes, events[0].TotalBytes)
+	}
+
+	// 必须触发了大文件 progress 步进心跳事件
+	if progressCount == 0 {
+		t.Fatalf("expected at least 1 progress heartbeat event for 11MB file in mixed hierarchy")
+	}
+
+	// 验证最终 done 事件
+	lastEv := events[len(events)-1]
+	if lastEv.Event != protocol.FsHashEventDone || lastEv.TotalFiles != 4 || lastEv.TotalBytes != expectedTotalBytes {
+		t.Fatalf("unexpected done event: %+v", lastEv)
+	}
+}
+
+// 验证 1000 级海量批量小文件场景下的哈希与事件流处理性能与正确性
+func TestFsEngine_HashStream_LargeBatch_1000Files(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	const numDirs = 10
+	const filesPerDir = 100
+	const totalExpected = numDirs * filesPerDir
+
+	var expectedTotalBytes int64
+	for d := 0; d < numDirs; d++ {
+		subDir := filepath.Join(tmpDir, fmt.Sprintf("dir_%02d", d))
+		_ = os.MkdirAll(subDir, 0755)
+		for f := 0; f < filesPerDir; f++ {
+			content := []byte(fmt.Sprintf("batch_data_d%d_f%d", d, f))
+			_ = os.WriteFile(filepath.Join(subDir, fmt.Sprintf("file_%03d.txt", f)), content, 0644)
+			expectedTotalBytes += int64(len(content))
+		}
+	}
+
+	var entryCount int64
+	var initFiles, initBytes int64
+
+	list, err := HashStream(tmpDir, true, func(ev protocol.FsHashEvent) error {
+		switch ev.Event {
+		case protocol.FsHashEventInit:
+			initFiles = ev.TotalFiles
+			initBytes = ev.TotalBytes
+		case protocol.FsHashEventEntry:
+			entryCount++
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("HashStream 1000 files failed: %v", err)
+	}
+
+	if initFiles != totalExpected || initBytes != expectedTotalBytes {
+		t.Fatalf("init event mismatch: files=%d, bytes=%d (expected %d, %d)", initFiles, initBytes, totalExpected, expectedTotalBytes)
+	}
+	if entryCount != totalExpected {
+		t.Fatalf("expected %d entry events, got %d", totalExpected, entryCount)
+	}
+	if len(list) != totalExpected {
+		t.Fatalf("expected list len %d, got %d", totalExpected, len(list))
+	}
+
+	// 验证每个文件的 SHA-256 均真实生成且合法
+	for _, item := range list {
+		if len(item.SHA256) != 64 {
+			t.Fatalf("invalid sha256 for item %s: %s", item.Path, item.SHA256)
+		}
+	}
+}
+
+// 验证流式回传中途报错或调用端主动终止时，HashStream 立即阻断并优雅退出
+func TestFsEngine_HashStream_AbortMidway(t *testing.T) {
+	tmpDir := t.TempDir()
+	for i := 1; i <= 30; i++ {
+		_ = os.WriteFile(filepath.Join(tmpDir, fmt.Sprintf("f%02d.txt", i)), []byte(fmt.Sprintf("test%d", i)), 0644)
+	}
+
+	expectedErr := errors.New("caller requested abort")
+	var processedCount int
+
+	_, err := HashStream(tmpDir, true, func(ev protocol.FsHashEvent) error {
+		if ev.Event == protocol.FsHashEventEntry {
+			processedCount++
+			if processedCount == 5 {
+				return expectedErr
+			}
+		}
+		return nil
+	})
+
+	if !errors.Is(err, expectedErr) {
+		t.Fatalf("expected abort error %v, got: %v", expectedErr, err)
+	}
+	if processedCount != 5 {
+		t.Fatalf("expected exactly 5 processed files before abort, got: %d", processedCount)
+	}
+}
+
+
 
 
 

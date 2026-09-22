@@ -158,3 +158,86 @@ func TestProtocol_NodeMetrics_BackwardCompatibility(t *testing.T) {
 		t.Fatalf("expected modern node CPUCores to be 32, got: %d", modernNode.Metrics.CPUCores)
 	}
 }
+
+func TestProtocol_FsHashEventSerialization(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+
+	// 1. Init event
+	initEv := FsHashEvent{
+		Event:      FsHashEventInit,
+		TotalFiles: 120,
+		TotalBytes: 104857600,
+	}
+	data, err := json.Marshal(initEv)
+	if err != nil {
+		t.Fatalf("marshal init event failed: %v", err)
+	}
+	var initDecoded FsHashEvent
+	if err := json.Unmarshal(data, &initDecoded); err != nil {
+		t.Fatalf("unmarshal init event failed: %v", err)
+	}
+	if initDecoded.Event != FsHashEventInit || initDecoded.TotalFiles != 120 || initDecoded.TotalBytes != 104857600 {
+		t.Fatalf("init event mismatch: %+v", initDecoded)
+	}
+
+	// 2. Progress event
+	progEv := FsHashEvent{
+		Event:       FsHashEventProgress,
+		CurrentFile: "large.iso",
+		DoneBytes:   52428800,
+		TotalBytes:  104857600,
+	}
+	data, err = json.Marshal(progEv)
+	if err != nil {
+		t.Fatalf("marshal progress event failed: %v", err)
+	}
+	var progDecoded FsHashEvent
+	if err := json.Unmarshal(data, &progDecoded); err != nil {
+		t.Fatalf("unmarshal progress event failed: %v", err)
+	}
+	if progDecoded.Event != FsHashEventProgress || progDecoded.CurrentFile != "large.iso" || progDecoded.DoneBytes != 52428800 {
+		t.Fatalf("progress event mismatch: %+v", progDecoded)
+	}
+
+	// 3. Entry event
+	entryEv := FsHashEvent{
+		Event: FsHashEventEntry,
+		Entry: &FileInfo{
+			Name:    "file.txt",
+			Path:    "sub/file.txt",
+			Size:    1024,
+			ModTime: now,
+			SHA256:  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+		},
+	}
+	data, err = json.Marshal(entryEv)
+	if err != nil {
+		t.Fatalf("marshal entry event failed: %v", err)
+	}
+	var entryDecoded FsHashEvent
+	if err := json.Unmarshal(data, &entryDecoded); err != nil {
+		t.Fatalf("unmarshal entry event failed: %v", err)
+	}
+	if entryDecoded.Event != FsHashEventEntry || entryDecoded.Entry == nil || entryDecoded.Entry.SHA256 != "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" {
+		t.Fatalf("entry event mismatch: %+v", entryDecoded)
+	}
+
+	// 4. Done event
+	doneEv := FsHashEvent{
+		Event:      FsHashEventDone,
+		TotalFiles: 120,
+		TotalBytes: 104857600,
+	}
+	data, err = json.Marshal(doneEv)
+	if err != nil {
+		t.Fatalf("marshal done event failed: %v", err)
+	}
+	var doneDecoded FsHashEvent
+	if err := json.Unmarshal(data, &doneDecoded); err != nil {
+		t.Fatalf("unmarshal done event failed: %v", err)
+	}
+	if doneDecoded.Event != FsHashEventDone || doneDecoded.TotalFiles != 120 {
+		t.Fatalf("done event mismatch: %+v", doneDecoded)
+	}
+}
+

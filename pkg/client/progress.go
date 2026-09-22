@@ -10,13 +10,17 @@ import (
 	"time"
 )
 
-// isTerminal 判断当前 os.Stdout 是否为交互式终端 (TTY)
-func isTerminal() bool {
+// IsTerminal 判断当前 os.Stdout 是否为交互式终端 (TTY)
+func IsTerminal() bool {
 	fi, err := os.Stdout.Stat()
 	if err != nil {
 		return false
 	}
 	return (fi.Mode() & os.ModeCharDevice) != 0
+}
+
+func isTerminal() bool {
+	return IsTerminal()
 }
 
 // ProgressSnapshot 进度快照契约 (供 Web UI 与自动化监听流式消费)
@@ -44,6 +48,17 @@ type ProgressTracker struct {
 	finishOnce       sync.Once
 	activeFiles      map[string]struct{}
 	onUpdate         func(ProgressSnapshot)
+	label            string
+}
+
+// SetLabel 设置动作标签 (如 "Hashed"、"Transferred")
+func (p *ProgressTracker) SetLabel(label string) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	p.label = label
+	p.mu.Unlock()
 }
 
 // NewProgressTracker 创建并初始化传输进度追踪器
@@ -62,6 +77,7 @@ func NewProgressTracker(totalFiles, totalBytes int64) *ProgressTracker {
 		isTTY:       isTerminal(),
 		out:         os.Stdout,
 		activeFiles: make(map[string]struct{}),
+		label:       "Transferred",
 	}
 }
 
@@ -425,14 +441,18 @@ func (p *ProgressTracker) Finish() {
 			})
 		}
 
+		action := p.label
+		if action == "" {
+			action = "Transferred"
+		}
 		out := p.getWriter()
 		if p.isTTY {
 			bar := strings.Repeat("=", 20)
 			fmt.Fprintf(out, "\r[%s] 100.0%% (%s, %d/%d files, %s) in %s\n",
 				bar, FormatSize(trans), done, totalFiles, FormatSpeed(speedBytesSec), elapsed.Truncate(10*time.Millisecond))
 		} else {
-			fmt.Fprintf(out, "[cworker] Transferred %d/%d files (%s) in %s (%s)\n",
-				done, totalFiles, FormatSize(trans), elapsed.Truncate(10*time.Millisecond), FormatSpeed(speedBytesSec))
+			fmt.Fprintf(out, "[cworker] %s %d/%d files (%s) in %s (%s)\n",
+				action, done, totalFiles, FormatSize(trans), elapsed.Truncate(10*time.Millisecond), FormatSpeed(speedBytesSec))
 		}
 	})
 }

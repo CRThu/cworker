@@ -291,3 +291,54 @@ func TestManagedJob_HistoricJob(t *testing.T) {
 		t.Errorf("GetInfo mismatch: %+v", gotInfo)
 	}
 }
+
+func TestManagedJob_KillOnDisconnect_Accessors(t *testing.T) {
+	tempDir := t.TempDir()
+
+	// 1. 测试显式开启标记
+	req := protocol.RunJobRequest{
+		Name:              "ephemeral-job",
+		Command:           "cmd.exe /c echo test",
+		KillOnDisconnect:  true,
+		CleanOnDisconnect: true,
+	}
+	job, err := StartJob(req, "test-job-eph", "local", tempDir)
+	if err != nil {
+		t.Fatalf("StartJob failed: %v", err)
+	}
+	defer job.Kill()
+
+	if !job.KillOnDisconnect() {
+		t.Errorf("expected KillOnDisconnect() to be true")
+	}
+	if !job.CleanOnDisconnect() {
+		t.Errorf("expected CleanOnDisconnect() to be true")
+	}
+
+	// 2. 测试默认关闭标记
+	reqDefault := protocol.RunJobRequest{
+		Name:    "normal-job",
+		Command: "cmd.exe /c echo normal",
+	}
+	jobDefault, err := StartJob(reqDefault, "test-job-def", "local", tempDir)
+	if err != nil {
+		t.Fatalf("StartJob default failed: %v", err)
+	}
+	defer jobDefault.Kill()
+
+	if jobDefault.KillOnDisconnect() {
+		t.Errorf("expected default KillOnDisconnect() to be false")
+	}
+	if jobDefault.CleanOnDisconnect() {
+		t.Errorf("expected default CleanOnDisconnect() to be false")
+	}
+
+	// 3. 边界测试：nil 指针安全防御
+	var nilJob *ManagedJob
+	if nilJob.KillOnDisconnect() != false {
+		t.Errorf("nil job KillOnDisconnect() should return false")
+	}
+	if nilJob.CleanOnDisconnect() != false {
+		t.Errorf("nil job CleanOnDisconnect() should return false")
+	}
+}

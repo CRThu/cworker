@@ -36,10 +36,12 @@ var runCmd = &cobra.Command{
 		cli := client.NewClient()
 
 		info, err := cli.RunJobWithContext(cmdContext(cmd), protocol.RunJobRequest{
-			Name:    runJobName,
-			Node:    runNodeName,
-			Command: rawCommand,
-			Dir:     runDir,
+			Name:              runJobName,
+			Node:              runNodeName,
+			Command:           rawCommand,
+			Dir:               runDir,
+			KillOnDisconnect:  runWait,
+			CleanOnDisconnect: runClean,
 		}, runToken)
 		if err != nil {
 			return fmt.Errorf("dispatch failed: %w", err)
@@ -56,8 +58,8 @@ var runCmd = &cobra.Command{
 		sigCtx, stopSig := signal.NotifyContext(cmdContext(cmd), os.Interrupt, syscall.SIGTERM)
 		defer stopSig()
 
-		// 挂接实时流式输出
-		streamErr := cli.StreamLogsNode(sigCtx, info.Node, info.ID, os.Stdout)
+		// 挂接实时流式输出 (声明当前连接为该前台同步任务的专属看门狗 Watchdog)
+		streamErr := cli.StreamLogsNode(sigCtx, info.Node, info.ID, os.Stdout, runWait)
 
 		// 响应本地信号中断：联动强杀远端 Win32 Job Object 进程树并清理现场
 		if sigCtx.Err() != nil {

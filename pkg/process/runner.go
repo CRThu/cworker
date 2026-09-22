@@ -59,14 +59,17 @@ func LoadJobMeta(jobDir string) (*protocol.JobInfo, error) {
 
 // ManagedJob 统一维护单个被管任务的全部运行时状态与物理资源句柄
 type ManagedJob struct {
-	mu          sync.Mutex
-	info        protocol.JobInfo
-	jobDir      string
-	cmd         *exec.Cmd
-	jobObj      *JobObject
-	logFile     *os.File
-	broadcaster *logstream.Broadcaster
-	done        chan struct{}
+	mu                sync.Mutex
+	info              protocol.JobInfo
+	jobDir            string
+	killOnDisconnect  bool
+	cleanOnDisconnect bool
+	watchdogConnected bool
+	cmd               *exec.Cmd
+	jobObj            *JobObject
+	logFile           *os.File
+	broadcaster       *logstream.Broadcaster
+	done              chan struct{}
 
 	lastCpuMs time.Duration
 	lastTime  time.Time
@@ -151,13 +154,15 @@ func StartJob(req protocol.RunJobRequest, jobID string, nodeName string, logRoot
 			PID:       cmd.Process.Pid,
 			StartTime: time.Now(),
 		},
-		jobDir:      jobLogDir,
-		cmd:         cmd,
-		jobObj:      jobObj,
-		logFile:     logFile,
-		broadcaster: broadcaster,
-		done:        make(chan struct{}),
-		lastTime:    time.Now(),
+		jobDir:            jobLogDir,
+		killOnDisconnect:  req.KillOnDisconnect,
+		cleanOnDisconnect: req.CleanOnDisconnect,
+		cmd:               cmd,
+		jobObj:            jobObj,
+		logFile:           logFile,
+		broadcaster:       broadcaster,
+		done:              make(chan struct{}),
+		lastTime:          time.Now(),
 	}
 
 	// 原子落盘初始元数据 (RUNNING)
@@ -285,4 +290,40 @@ func (j *ManagedJob) GetInfo() protocol.JobInfo {
 // Broadcaster 返回日志广播器，供 WebSocket 连接实时订阅输出
 func (j *ManagedJob) Broadcaster() *logstream.Broadcaster {
 	return j.broadcaster
+}
+
+// KillOnDisconnect 返回是否在客户端异常断开时联动终止任务
+func (j *ManagedJob) KillOnDisconnect() bool {
+	if j == nil {
+		return false
+	}
+	return j.killOnDisconnect
+}
+
+// CleanOnDisconnect 返回是否在客户端异常断开时自动清理现场
+func (j *ManagedJob) CleanOnDisconnect() bool {
+	if j == nil {
+		return false
+	}
+	return j.cleanOnDisconnect
+}
+
+// SetWatchdogConnected 标记专属看门狗连接已建立就绪
+func (j *ManagedJob) SetWatchdogConnected() {
+	if j == nil {
+		return
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.watchdogConnected = true
+}
+
+// HasWatchdogConnected 检查是否曾成功建立专属看门狗连接
+func (j *ManagedJob) HasWatchdogConnected() bool {
+	if j == nil {
+		return false
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.watchdogConnected
 }

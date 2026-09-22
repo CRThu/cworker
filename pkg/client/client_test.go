@@ -1685,6 +1685,456 @@ func TestClient_HashRemotePath(t *testing.T) {
 	}
 }
 
+// 验证 HashRemotePath 对 NDJSON 流式协议的解析以及对 ProgressTracker 的驱动
+func TestClient_HashRemotePath_NDJSON_Stream(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/fs/hash" {
+			rw.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if r.URL.Query().Get("path") == "stream_err" {
+			rw.Header().Set("Content-Type", "application/x-ndjson")
+			rw.WriteHeader(http.StatusOK)
+			flusher := rw.(http.Flusher)
+			flusher.Flush()
+			ev := protocol.FsHashEvent{
+				Event: protocol.FsHashEventError,
+				Error: "fatal permission denied",
+			}
+			_ = json.NewEncoder(rw).Encode(ev)
+			flusher.Flush()
+			return
+		}
+
+		rw.Header().Set("Content-Type", "application/x-ndjson")
+		rw.WriteHeader(http.StatusOK)
+		flusher := rw.(http.Flusher)
+		flusher.Flush()
+
+		enc := json.NewEncoder(rw)
+		// 1. Init event
+		_ = enc.Encode(protocol.FsHashEvent{
+			Event:      protocol.FsHashEventInit,
+			TotalFiles: 2,
+			TotalBytes: 3000,
+		})
+		flusher.Flush()
+
+		// 2. Progress event
+		_ = enc.Encode(protocol.FsHashEvent{
+			Event:       protocol.FsHashEventProgress,
+			CurrentFile: "file1.bin",
+			DoneBytes:   500,
+			TotalBytes:  1000,
+		})
+		flusher.Flush()
+
+		// 3. Entry 1
+		_ = enc.Encode(protocol.FsHashEvent{
+			Event: protocol.FsHashEventEntry,
+			Entry: &protocol.FileInfo{
+				Name:   "file1.bin",
+				Path:   "file1.bin",
+				Size:   1000,
+				SHA256: "hash111",
+			},
+		})
+		flusher.Flush()
+
+		// 4. Entry 2
+		_ = enc.Encode(protocol.FsHashEvent{
+			Event: protocol.FsHashEventEntry,
+			Entry: &protocol.FileInfo{
+				Name:   "file2.bin",
+				Path:   "sub/file2.bin",
+				Size:   2000,
+				SHA256: "hash222",
+			},
+		})
+		flusher.Flush()
+
+		// 5. Done event
+		_ = enc.Encode(protocol.FsHashEvent{
+			Event:      protocol.FsHashEventDone,
+			TotalFiles: 2,
+			TotalBytes: 3000,
+		})
+		flusher.Flush()
+	}))
+	defer server.Close()
+
+	cli := NewClient()
+	cli.dataDir = t.TempDir()
+
+	u, _ := url.Parse(server.URL)
+	tracker := NewProgressTracker(0, 0)
+	tracker.SetOutput(io.Discard)
+
+	list, err := cli.HashRemotePath(context.Background(), u.Host, "test/dir", true, tracker)
+	if err != nil {
+		t.Fatalf("HashRemotePath NDJSON failed: %v", err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("expected 2 items, got %d", len(list))
+	}
+	if list[0].SHA256 != "hash111" || list[1].SHA256 != "hash222" {
+		t.Fatalf("unexpected hash list: %+v", list)
+	}
+
+	snap := tracker.Snapshot()
+	if snap.TotalFiles != 2 || snap.CompletedFiles != 2 || snap.TotalBytes != 3000 || snap.TransferredBytes != 3000 {
+		t.Fatalf("unexpected tracker snapshot: %+v", snap)
+	}
+
+	// 测试流式错误事件抛出强类型错误
+	_, err = cli.HashRemotePath(context.Background(), u.Host, "stream_err", true)
+	if err == nil || !strings.Contains(err.Error(), "fatal permission denied") {
+		t.Fatalf("expected remote error event propagation, got: %v", err)
+	}
+}
+
+// 验证新版本客户端连接旧版本 Worker (仅返回普通 application/json) 时的完全向下兼容性与进度回退驱动
+func TestClient_HashRemotePath_LegacyWorker_Compatibility(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/fs/hash" {
+			rw.WriteHeader(http.StatusNotFound)
+			return
+		}
+		// 模拟老版本 Worker：严格返回 Content-Type: application/json 与普通 JSON 数组
+		rw.Header().Set("Content-Type", "application/json")
+		list := []protocol.FileInfo{
+			{Name: "legacy1.txt", Path: "legacy1.txt", Size: 500, SHA256: "hash_legacy_1"},
+			{Name: "legacy2.txt", Path: "sub/legacy2.txt", Size: 1500, SHA256: "hash_legacy_2"},
+		}
+		_ = json.NewEncoder(rw).Encode(list)
+	}))
+	defer server.Close()
+
+	cli := NewClient()
+	cli.dataDir = t.TempDir()
+
+	u, _ := url.Parse(server.URL)
+	tracker := NewProgressTracker(0, 0)
+	tracker.SetOutput(io.Discard)
+
+	list, err := cli.HashRemotePath(context.Background(), u.Host, "legacy/dir", true, tracker)
+	if err != nil {
+		t.Fatalf("HashRemotePath against legacy worker failed: %v", err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("expected 2 items from legacy worker, got %d", len(list))
+	}
+	if list[0].SHA256 != "hash_legacy_1" || list[1].SHA256 != "hash_legacy_2" {
+		t.Fatalf("unexpected legacy hash list: %+v", list)
+	}
+
+	// 验证 tracker 即使面对老 Worker 也能正确补齐 totals 并完成
+	snap := tracker.Snapshot()
+	if snap.TotalFiles != 2 || snap.CompletedFiles != 2 || snap.TotalBytes != 2000 || snap.TransferredBytes != 2000 {
+		t.Fatalf("unexpected tracker snapshot on legacy worker: %+v", snap)
+	}
+}
+
+// 验证在弱网、中途断开、乱码包或服务端突发故障时的容错与安全退出
+func TestClient_HashRemotePath_NetworkFailuresAndResilience(t *testing.T) {
+	// Case 1: 弱网/服务端挂死，客户端 Context 超时迅速中断退出 (不泄漏协程与句柄)
+	t.Run("ContextTimeoutMidway", func(t *testing.T) {
+		hangServer := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+			rw.Header().Set("Content-Type", "application/x-ndjson")
+			rw.WriteHeader(http.StatusOK)
+			flusher := rw.(http.Flusher)
+			flusher.Flush()
+			// 发送首包后故意阻塞网络
+			_ = json.NewEncoder(rw).Encode(protocol.FsHashEvent{
+				Event:      protocol.FsHashEventInit,
+				TotalFiles: 10,
+				TotalBytes: 10000,
+			})
+			flusher.Flush()
+			<-r.Context().Done()
+		}))
+		defer hangServer.Close()
+
+		cli := NewClient()
+		cli.dataDir = t.TempDir()
+		u, _ := url.Parse(hangServer.URL)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+
+		start := time.Now()
+		_, err := cli.HashRemotePath(ctx, u.Host, "timeout/path", true)
+		elapsed := time.Since(start)
+
+		if err == nil {
+			t.Fatal("expected error on timed out context, got nil")
+		}
+		if elapsed > 300*time.Millisecond {
+			t.Errorf("expected fast timeout exit < 300ms, took %v", elapsed)
+		}
+	})
+
+	// Case 2: 传输中途网络掉线/连接重置 (Broken Stream)
+	t.Run("AbruptConnectionDrop", func(t *testing.T) {
+		dropServer := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+			rw.Header().Set("Content-Type", "application/x-ndjson")
+			rw.WriteHeader(http.StatusOK)
+			flusher := rw.(http.Flusher)
+			flusher.Flush()
+
+			// 发送首包后直接暴力 Hijack 连接并关闭 TCP Socket
+			hj, ok := rw.(http.Hijacker)
+			if !ok {
+				t.Fatal("server does not support hijacking")
+			}
+			conn, _, _ := hj.Hijack()
+			_ = conn.Close()
+		}))
+		defer dropServer.Close()
+
+		cli := NewClient()
+		cli.dataDir = t.TempDir()
+		u, _ := url.Parse(dropServer.URL)
+
+		_, err := cli.HashRemotePath(context.Background(), u.Host, "drop/path", true)
+		if err == nil {
+			t.Fatal("expected error on broken stream, got nil")
+		}
+	})
+
+	// Case 3: 网络抖动出现个别 JSON 脏行 (自动跳过坏行并继续解析后续有效行)
+	t.Run("MalformedLineTolerance", func(t *testing.T) {
+		dirtyServer := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+			rw.Header().Set("Content-Type", "application/x-ndjson")
+			rw.WriteHeader(http.StatusOK)
+			flusher := rw.(http.Flusher)
+			flusher.Flush()
+
+			_, _ = rw.Write([]byte("{\"event\":\"init\",\"total_files\":1,\"total_bytes\":100}\n"))
+			flusher.Flush()
+			// 插入破损脏行
+			_, _ = rw.Write([]byte("{this is corrupted json packet\n"))
+			flusher.Flush()
+			// 插入有效条目
+			_, _ = rw.Write([]byte("{\"event\":\"entry\",\"entry\":{\"name\":\"ok.txt\",\"path\":\"ok.txt\",\"size\":100,\"sha256\":\"good_hash\"}}\n"))
+			flusher.Flush()
+			_, _ = rw.Write([]byte("{\"event\":\"done\",\"total_files\":1,\"total_bytes\":100}\n"))
+			flusher.Flush()
+		}))
+		defer dirtyServer.Close()
+
+		cli := NewClient()
+		cli.dataDir = t.TempDir()
+		u, _ := url.Parse(dirtyServer.URL)
+
+		list, err := cli.HashRemotePath(context.Background(), u.Host, "dirty/path", true)
+		if err != nil {
+			t.Fatalf("expected graceful tolerance on dirty lines, got error: %v", err)
+		}
+		if len(list) != 1 || list[0].SHA256 != "good_hash" {
+			t.Fatalf("expected 1 valid entry parsed, got: %+v", list)
+		}
+	})
+
+	// Case 4: 远端计算中途抛出显式 error 事件 (例如磁盘故障或只读权限拦截)
+	t.Run("RemoteWorkerReportedErrorEvent", func(t *testing.T) {
+		errServer := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+			rw.Header().Set("Content-Type", "application/x-ndjson")
+			rw.WriteHeader(http.StatusOK)
+			flusher := rw.(http.Flusher)
+			flusher.Flush()
+
+			_, _ = rw.Write([]byte("{\"event\":\"init\",\"total_files\":2,\"total_bytes\":200}\n"))
+			flusher.Flush()
+			_, _ = rw.Write([]byte("{\"event\":\"entry\",\"entry\":{\"name\":\"f1.txt\",\"path\":\"f1.txt\",\"size\":100,\"sha256\":\"hash1\"}}\n"))
+			flusher.Flush()
+			// 模拟中途发生 I/O 错误
+			_, _ = rw.Write([]byte("{\"event\":\"error\",\"error\":\"disk I/O failure on remote sector 4096\"}\n"))
+			flusher.Flush()
+		}))
+		defer errServer.Close()
+
+		cli := NewClient()
+		cli.dataDir = t.TempDir()
+		u, _ := url.Parse(errServer.URL)
+
+		_, err := cli.HashRemotePath(context.Background(), u.Host, "err/path", true)
+		if err == nil {
+			t.Fatal("expected error on remote error event, got nil")
+		}
+		if !strings.Contains(err.Error(), "remote hash error: disk I/O failure on remote sector 4096") {
+			t.Fatalf("unexpected error message: %v", err)
+		}
+	})
+
+	// Case 5: 物理网络不可达 / 连接拒绝 (零挂起，即刻抛错)
+	t.Run("ConnectionRefusedOrDeadHost", func(t *testing.T) {
+		cli := NewClient()
+		cli.dataDir = t.TempDir()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer cancel()
+
+		start := time.Now()
+		_, err := cli.HashRemotePath(ctx, "127.0.0.1:59998", "dead/path", true)
+		elapsed := time.Since(start)
+
+		if err == nil {
+			t.Fatal("expected error connecting to dead host, got nil")
+		}
+		if elapsed > 1*time.Second {
+			t.Errorf("expected quick refusal error, took %v", elapsed)
+		}
+	})
+}
+
+// 验证客户端对 5000 级海量批量文件 NDJSON 流的持续读取、ProgressTracker 驱动与比对性能
+func TestClient_HashRemotePath_LargeBatch_5000Files(t *testing.T) {
+	const batchCount = 5000
+	const perFileSize = 128
+	const totalExpectedBytes = int64(batchCount * perFileSize)
+
+	batchServer := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		rw.Header().Set("Content-Type", "application/x-ndjson")
+		rw.WriteHeader(http.StatusOK)
+		flusher, _ := rw.(http.Flusher)
+		if flusher != nil {
+			flusher.Flush()
+		}
+
+		enc := json.NewEncoder(rw)
+		_ = enc.Encode(protocol.FsHashEvent{
+			Event:      protocol.FsHashEventInit,
+			TotalFiles: batchCount,
+			TotalBytes: totalExpectedBytes,
+		})
+		if flusher != nil {
+			flusher.Flush()
+		}
+
+		for i := 1; i <= batchCount; i++ {
+			p := fmt.Sprintf("dir_%02d/sub/file_%04d.dat", i%50, i)
+			_ = enc.Encode(protocol.FsHashEvent{
+				Event: protocol.FsHashEventEntry,
+				Entry: &protocol.FileInfo{
+					Name:   filepath.Base(p),
+					Path:   p,
+					Size:   perFileSize,
+					SHA256: fmt.Sprintf("%064x", i),
+				},
+			})
+			// 每 200 个刷新一次缓冲
+			if i%200 == 0 && flusher != nil {
+				flusher.Flush()
+			}
+		}
+
+		_ = enc.Encode(protocol.FsHashEvent{
+			Event:      protocol.FsHashEventDone,
+			TotalFiles: batchCount,
+			TotalBytes: totalExpectedBytes,
+		})
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}))
+	defer batchServer.Close()
+
+	cli := NewClient()
+	cli.dataDir = t.TempDir()
+	u, _ := url.Parse(batchServer.URL)
+
+	tracker := NewProgressTracker(0, 0)
+	tracker.SetLabel("Hashed")
+
+	start := time.Now()
+	list, err := cli.HashRemotePath(context.Background(), u.Host, "big/batch", true, tracker)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("HashRemotePath 5000 files failed: %v", err)
+	}
+	if len(list) != batchCount {
+		t.Fatalf("expected %d files received, got %d", batchCount, len(list))
+	}
+	snap := tracker.Snapshot()
+	if snap.CompletedFiles != batchCount {
+		t.Fatalf("expected tracker.CompletedFiles %d, got %d", batchCount, snap.CompletedFiles)
+	}
+	if snap.TransferredBytes != totalExpectedBytes {
+		t.Fatalf("expected tracker.TransferredBytes %d, got %d", totalExpectedBytes, snap.TransferredBytes)
+	}
+
+	// 验证 5000 个文件的内存级差分计算极速完成 (< 100ms)
+	diffStart := time.Now()
+	diffRes := CompareFileInfos(list, list)
+	diffElapsed := time.Since(diffStart)
+
+	if diffRes.Matched != batchCount || diffRes.Modified != 0 || diffRes.Added != 0 || diffRes.Deleted != 0 {
+		t.Fatalf("unexpected diff result on identical 5000 files: %+v", diffRes)
+	}
+	if diffElapsed > 200*time.Millisecond {
+		t.Errorf("CompareFileInfos on 5000 items took too long: %v", diffElapsed)
+	}
+	t.Logf("Streaming and parsing 5000 files took %v, diffing took %v", elapsed, diffElapsed)
+}
+
+
+// 验证多文件、大文件、空目录与嵌套多层级混合场景端到端比对
+func TestClient_Hash_MixedHierarchy_EndToEnd(t *testing.T) {
+	tempDir := t.TempDir()
+
+	// 构建复合层级结构:
+	// 1. 根目录空文件 (0 字节)
+	_ = os.WriteFile(filepath.Join(tempDir, "empty.txt"), []byte(""), 0644)
+	// 2. 根目录小文件
+	_ = os.WriteFile(filepath.Join(tempDir, "small.txt"), []byte("small file text"), 0644)
+	// 3. 空子目录 (应被跳过不产生 entry)
+	_ = os.MkdirAll(filepath.Join(tempDir, "empty_sub"), 0755)
+	// 4. 多层深层嵌套子目录文件
+	deepDir := filepath.Join(tempDir, "a", "b", "c")
+	_ = os.MkdirAll(deepDir, 0755)
+	_ = os.WriteFile(filepath.Join(deepDir, "deep.txt"), []byte("deep file content"), 0644)
+	// 5. 大文件 (11MB，触发分块心跳)
+	largeFile := filepath.Join(deepDir, "large.bin")
+	lf, err := os.Create(largeFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunk := bytes.Repeat([]byte("K"), 1024*1024)
+	for i := 0; i < 11; i++ {
+		_, _ = lf.Write(chunk)
+	}
+	_ = lf.Close()
+
+	cli := NewClient()
+	cli.dataDir = t.TempDir()
+
+	tracker := NewProgressTracker(0, 0)
+	tracker.SetOutput(io.Discard)
+
+	list, err := cli.Hash(context.Background(), "", tempDir, true, tracker)
+	if err != nil {
+		t.Fatalf("Hash mixed hierarchy failed: %v", err)
+	}
+
+	// 必须包含 4 个有效文件 (empty.txt, small.txt, deep.txt, large.bin)
+	if len(list) != 4 {
+		t.Fatalf("expected 4 files in mixed hierarchy, got %d: %+v", len(list), list)
+	}
+
+	snap := tracker.Snapshot()
+	if snap.TotalFiles != 4 || snap.CompletedFiles != 4 {
+		t.Fatalf("unexpected tracker snapshot files: %+v", snap)
+	}
+	expectedTotalBytes := int64(0 + len("small file text") + len("deep file content") + 11*1024*1024)
+	if snap.TotalBytes != expectedTotalBytes || snap.TransferredBytes != expectedTotalBytes {
+		t.Fatalf("expected total bytes %d, got %d in snapshot", expectedTotalBytes, snap.TotalBytes)
+	}
+}
+
+
+
 func TestClient_LocalCopy(t *testing.T) {
 	tempDir := t.TempDir()
 	srcDir := filepath.Join(tempDir, "src")

@@ -94,9 +94,53 @@ func HashOnly(filePath string) (string, error) {
 	return hex.EncodeToString(hasher.Sum(nil)), nil
 }
 
-// HashDir 递归遍历目录，计算每个非符号链接文件的 SHA-256 并返回清单 (SSOT)
-func HashDir(dirPath string) ([]protocol.FileInfo, error) {
-	cleanPath, err := pathutil.NormalizeLocalPath(dirPath)
+// hashFileWithProgress 计算物理文件 SHA-256，大文件 (>10MB) 按块分步触发心跳回调
+func hashFileWithProgress(filePath string, totalSize int64, onProgress func(doneBytes int64) error) (string, error) {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	hasher := sha256.New()
+	if totalSize <= 10*1024*1024 || onProgress == nil {
+		if _, err := io.Copy(hasher, f); err != nil {
+			return "", err
+		}
+		return hex.EncodeToString(hasher.Sum(nil)), nil
+	}
+
+	buf := make([]byte, 4*1024*1024) // 4MB 块流式读取
+	var doneBytes int64
+	lastProgress := time.Now()
+
+	for {
+		n, rErr := f.Read(buf)
+		if n > 0 {
+			hasher.Write(buf[:n])
+			doneBytes += int64(n)
+			now := time.Now()
+			// 节流步进心跳：每 200ms 或达到文件末尾时上报一次
+			if now.Sub(lastProgress) >= 200*time.Millisecond || doneBytes == totalSize {
+				if err := onProgress(doneBytes); err != nil {
+					return "", err
+				}
+				lastProgress = now
+			}
+		}
+		if rErr != nil {
+			if rErr == io.EOF {
+				break
+			}
+			return "", rErr
+		}
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+// HashStream 统一物理路径哈希计算内核 (支持大文件心跳与目录分步流式回传, SSOT)
+func HashStream(path string, recursive bool, onEvent func(protocol.FsHashEvent) error) ([]protocol.FileInfo, error) {
+	cleanPath, err := pathutil.NormalizeLocalPath(path)
 	if err != nil {
 		return nil, err
 	}
@@ -105,16 +149,84 @@ func HashDir(dirPath string) ([]protocol.FileInfo, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// 1. 单文件模式
 	if !fi.IsDir() {
-		return nil, ErrPathIsFile
+		if onEvent != nil {
+			if err := onEvent(protocol.FsHashEvent{
+				Event:      protocol.FsHashEventInit,
+				TotalFiles: 1,
+				TotalBytes: fi.Size(),
+			}); err != nil {
+				return nil, err
+			}
+		}
+
+		hash, err := hashFileWithProgress(cleanPath, fi.Size(), func(doneBytes int64) error {
+			if onEvent == nil {
+				return nil
+			}
+			return onEvent(protocol.FsHashEvent{
+				Event:       protocol.FsHashEventProgress,
+				CurrentFile: fi.Name(),
+				DoneBytes:   doneBytes,
+				TotalBytes:  fi.Size(),
+			})
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		entry := protocol.FileInfo{
+			Name:    fi.Name(),
+			Path:    filepath.ToSlash(fi.Name()),
+			IsDir:   false,
+			Size:    fi.Size(),
+			ModTime: fi.ModTime(),
+			SHA256:  hash,
+		}
+
+		if onEvent != nil {
+			if err := onEvent(protocol.FsHashEvent{
+				Event: protocol.FsHashEventEntry,
+				Entry: &entry,
+			}); err != nil {
+				return nil, err
+			}
+			if err := onEvent(protocol.FsHashEvent{
+				Event:      protocol.FsHashEventDone,
+				TotalFiles: 1,
+				TotalBytes: fi.Size(),
+			}); err != nil {
+				return nil, err
+			}
+		}
+
+		return []protocol.FileInfo{entry}, nil
 	}
 
-	var list []protocol.FileInfo
-	err = filepath.WalkDir(cleanPath, func(path string, d os.DirEntry, err error) error {
+	// 2. 目录模式
+	if !recursive {
+		return nil, ErrDirRequiresRecursive
+	}
+
+	type scanItem struct {
+		absPath string
+		relPath string
+		name    string
+		size    int64
+		modTime time.Time
+	}
+
+	// 阶段一：轻量元数据扫描，快速获取总文件数与总字节数
+	var items []scanItem
+	var totalBytes int64
+
+	err = filepath.WalkDir(cleanPath, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if path == cleanPath {
+		if p == cleanPath {
 			return nil
 		}
 		info, err := d.Info()
@@ -132,61 +244,109 @@ func HashDir(dirPath string) ([]protocol.FileInfo, error) {
 			return nil
 		}
 
-		rel, err := filepath.Rel(cleanPath, path)
+		rel, err := filepath.Rel(cleanPath, p)
 		if err != nil {
 			return err
 		}
 
-		hash, err := HashOnly(path)
-		if err != nil {
-			return fmt.Errorf("hash file %s failed: %w", path, err)
-		}
-
-		list = append(list, protocol.FileInfo{
-			Name:    d.Name(),
-			Path:    filepath.ToSlash(rel),
-			IsDir:   false,
-			Size:    info.Size(),
-			ModTime: info.ModTime(),
-			SHA256:  hash,
+		items = append(items, scanItem{
+			absPath: p,
+			relPath: filepath.ToSlash(rel),
+			name:    d.Name(),
+			size:    info.Size(),
+			modTime: info.ModTime(),
 		})
+		totalBytes += info.Size()
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	if list == nil {
-		list = []protocol.FileInfo{}
+	totalFiles := int64(len(items))
+
+	if onEvent != nil {
+		if err := onEvent(protocol.FsHashEvent{
+			Event:      protocol.FsHashEventInit,
+			TotalFiles: totalFiles,
+			TotalBytes: totalBytes,
+		}); err != nil {
+			return nil, err
+		}
 	}
+
+	// 阶段二：逐个计算文件 SHA-256 并实时流式回传
+	list := make([]protocol.FileInfo, 0, len(items))
+	for _, item := range items {
+		hash, err := hashFileWithProgress(item.absPath, item.size, func(doneBytes int64) error {
+			if onEvent == nil {
+				return nil
+			}
+			return onEvent(protocol.FsHashEvent{
+				Event:       protocol.FsHashEventProgress,
+				CurrentFile: item.relPath,
+				DoneBytes:   doneBytes,
+				TotalBytes:  item.size,
+			})
+		})
+		if err != nil {
+			return nil, fmt.Errorf("hash file %s failed: %w", item.absPath, err)
+		}
+
+		entry := protocol.FileInfo{
+			Name:    item.name,
+			Path:    item.relPath,
+			IsDir:   false,
+			Size:    item.size,
+			ModTime: item.modTime,
+			SHA256:  hash,
+		}
+		list = append(list, entry)
+
+		if onEvent != nil {
+			if err := onEvent(protocol.FsHashEvent{
+				Event: protocol.FsHashEventEntry,
+				Entry: &entry,
+			}); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	if onEvent != nil {
+		if err := onEvent(protocol.FsHashEvent{
+			Event:      protocol.FsHashEventDone,
+			TotalFiles: totalFiles,
+			TotalBytes: totalBytes,
+		}); err != nil {
+			return nil, err
+		}
+	}
+
 	return list, nil
 }
 
-// Hash 统一物理路径哈希计算门面 (单文件返回切片含 1 条，目录未带 -r 显式返回 ErrDirRequiresRecursive)
-func Hash(path string, recursive bool) ([]protocol.FileInfo, error) {
-	cleanPath, err := pathutil.NormalizeLocalPath(path)
+// HashDir 递归遍历目录，计算每个非符号链接文件的 SHA-256 并返回清单 (委托给 HashStream, SSOT)
+func HashDir(dirPath string) ([]protocol.FileInfo, error) {
+	cleanPath, err := pathutil.NormalizeLocalPath(dirPath)
 	if err != nil {
 		return nil, err
 	}
-
 	fi, err := os.Stat(cleanPath)
 	if err != nil {
 		return nil, err
 	}
-
-	if fi.IsDir() {
-		if !recursive {
-			return nil, ErrDirRequiresRecursive
-		}
-		return HashDir(cleanPath)
+	if !fi.IsDir() {
+		return nil, ErrPathIsFile
 	}
-
-	info, err := HashFile(cleanPath)
-	if err != nil {
-		return nil, err
-	}
-	return []protocol.FileInfo{info}, nil
+	return HashStream(cleanPath, true, nil)
 }
+
+// Hash 统一物理路径哈希计算门面 (单文件返回切片含 1 条，目录未带 -r 显式返回 ErrDirRequiresRecursive)
+func Hash(path string, recursive bool) ([]protocol.FileInfo, error) {
+	return HashStream(path, recursive, nil)
+}
+
 
 // ListDir 列出目录条目 (支持单层平铺或递归完整树扫描)
 func ListDir(dirPath string, recursive bool) ([]protocol.FileInfo, error) {

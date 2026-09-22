@@ -1,9 +1,11 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"text/tabwriter"
 
 	"cworker/pkg/client"
@@ -38,21 +40,59 @@ var diffCmd = &cobra.Command{
 
 		cli := client.NewClient()
 
-		// 1. 获取源端与目标端的文件清单与哈希 (通过 Client.Hash 统一本地与远端)
-		srcFiles, err := cli.Hash(ctx, srcNode, srcPath, recursive)
-		if err != nil {
-			if strings.Contains(err.Error(), "requires recursive flag (-r)") {
-				return &ExitError{Code: 2, Msg: fmt.Sprintf("omitting directory '%s' (use -r to diff recursively)", srcRaw)}
-			}
-			return &ExitError{Code: 2, Msg: fmt.Sprintf("failed to inspect source '%s': %v", srcRaw, err)}
+		// 1. 并发获取源端与目标端的文件清单与哈希 (两端异步并行计算，加速一倍；支持极速熔断与统一进度聚合)
+		var tracker *client.ProgressTracker
+		if client.IsTerminal() {
+			tracker = client.NewProgressTracker(0, 0)
+			tracker.SetLabel("Hashed")
 		}
 
-		dstFiles, err := cli.Hash(ctx, dstNode, dstPath, recursive)
-		if err != nil {
-			if strings.Contains(err.Error(), "requires recursive flag (-r)") {
+		asyncCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
+		var (
+			srcFiles []protocol.FileInfo
+			dstFiles []protocol.FileInfo
+			srcErr   error
+			dstErr   error
+			wg       sync.WaitGroup
+		)
+
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			srcFiles, srcErr = cli.Hash(asyncCtx, srcNode, srcPath, recursive, tracker)
+			if srcErr != nil {
+				cancel() // 快速熔断对方
+			}
+		}()
+
+		go func() {
+			defer wg.Done()
+			dstFiles, dstErr = cli.Hash(asyncCtx, dstNode, dstPath, recursive, tracker)
+			if dstErr != nil {
+				cancel() // 快速熔断对方
+			}
+		}()
+
+		wg.Wait()
+
+		if tracker != nil {
+			tracker.Finish()
+		}
+
+		if srcErr != nil {
+			if strings.Contains(srcErr.Error(), "requires recursive flag (-r)") {
+				return &ExitError{Code: 2, Msg: fmt.Sprintf("omitting directory '%s' (use -r to diff recursively)", srcRaw)}
+			}
+			return &ExitError{Code: 2, Msg: fmt.Sprintf("failed to inspect source '%s': %v", srcRaw, srcErr)}
+		}
+
+		if dstErr != nil {
+			if strings.Contains(dstErr.Error(), "requires recursive flag (-r)") {
 				return &ExitError{Code: 2, Msg: fmt.Sprintf("omitting directory '%s' (use -r to diff recursively)", dstRaw)}
 			}
-			return &ExitError{Code: 2, Msg: fmt.Sprintf("failed to inspect destination '%s': %v", dstRaw, err)}
+			return &ExitError{Code: 2, Msg: fmt.Sprintf("failed to inspect destination '%s': %v", dstRaw, dstErr)}
 		}
 
 		// 2. 单文件对比模式

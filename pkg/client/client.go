@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -229,50 +230,47 @@ func resolveTargetToURL(target string) (string, error) {
 	return fmt.Sprintf("http://%s:%s", chosenIP, port), nil
 }
 
+// executeRequest 核心统一请求调度器 (SSOT: 负责鉴权 Token 注入、URL 拼接与 Content-Type 归一化)
+func (c *Client) executeRequest(ctx context.Context, rt *ResolvedTarget, method, path string, body io.Reader, httpClient *http.Client, headerMods ...func(req *http.Request)) (*http.Response, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	u := rt.BaseURL + path
+	req, err := http.NewRequestWithContext(ctx, method, u, body)
+	if err != nil {
+		return nil, err
+	}
+
+	if rt.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+rt.Token)
+	}
+	if (method == http.MethodPost || method == http.MethodPut) && req.Header.Get("Content-Type") == "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	for _, mod := range headerMods {
+		if mod != nil {
+			mod(req)
+		}
+	}
+
+	if httpClient == nil {
+		httpClient = c.streamClient
+	}
+	return httpClient.Do(req)
+}
+
 // 统一 HTTP 请求封装 (自动注入 Authorization Bearer Token)
 func (c *Client) doRequest(rt *ResolvedTarget, method, path string, body io.Reader) (*http.Response, error) {
 	return c.doRequestWithContext(context.Background(), rt, method, path, body)
 }
 
-func (c *Client) doRequestWithContext(ctx context.Context, rt *ResolvedTarget, method, path string, body io.Reader) (*http.Response, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	u := rt.BaseURL + path
-	req, err := http.NewRequestWithContext(ctx, method, u, body)
-	if err != nil {
-		return nil, err
-	}
-
-	if rt.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+rt.Token)
-	}
-	if method == http.MethodPost || method == http.MethodPut {
-		req.Header.Set("Content-Type", "application/json")
-	}
-
-	return c.httpClient.Do(req)
+func (c *Client) doRequestWithContext(ctx context.Context, rt *ResolvedTarget, method, path string, body io.Reader, headerMods ...func(req *http.Request)) (*http.Response, error) {
+	return c.executeRequest(ctx, rt, method, path, body, c.httpClient, headerMods...)
 }
 
 // 统一流式 HTTP 请求封装 (使用 streamClient，无 30s 硬超时截断，生命周期完全由 Context 精准控制)
-func (c *Client) doStreamRequestWithContext(ctx context.Context, rt *ResolvedTarget, method, path string, body io.Reader) (*http.Response, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	u := rt.BaseURL + path
-	req, err := http.NewRequestWithContext(ctx, method, u, body)
-	if err != nil {
-		return nil, err
-	}
-
-	if rt.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+rt.Token)
-	}
-	if method == http.MethodPost || method == http.MethodPut {
-		req.Header.Set("Content-Type", "application/json")
-	}
-
-	return c.streamClient.Do(req)
+func (c *Client) doStreamRequestWithContext(ctx context.Context, rt *ResolvedTarget, method, path string, body io.Reader, headerMods ...func(req *http.Request)) (*http.Response, error) {
+	return c.executeRequest(ctx, rt, method, path, body, c.streamClient, headerMods...)
 }
 
 // ListNodes 并发对账本中所有已知节点进行动态 DNS 解析与实时测活
@@ -854,7 +852,7 @@ func (c *Client) GetLogsWithOptionsWithContext(ctx context.Context, node string,
 	}
 
 	path := fmt.Sprintf("/api/v1/jobs/logs?%s", queryParams.Encode())
-	resp, err := c.doRequestWithContext(ctx, rt, http.MethodGet, path, nil)
+	resp, err := c.doStreamRequestWithContext(ctx, rt, http.MethodGet, path, nil)
 	if err != nil {
 		return "", err
 	}
@@ -883,8 +881,8 @@ func (c *Client) StreamLogs(ctx context.Context, jobID string, out io.Writer) er
 	return c.StreamLogsNode(ctx, "", jobID, out)
 }
 
-// StreamLogsNode 实时流式日志 (指定或探测节点)
-func (c *Client) StreamLogsNode(ctx context.Context, node string, jobID string, out io.Writer) error {
+// StreamLogsNode 实时流式日志 (指定或探测节点，支持可选的 watchdog 标记声明归属权)
+func (c *Client) StreamLogsNode(ctx context.Context, node string, jobID string, out io.Writer, isWatchdog ...bool) error {
 	rt, err := c.resolveTargetForJobWithContext(ctx, node, jobID)
 	if err != nil {
 		return err
@@ -893,6 +891,9 @@ func (c *Client) StreamLogsNode(ctx context.Context, node string, jobID string, 
 	wsURL := strings.Replace(rt.BaseURL, "http://", "ws://", 1)
 	wsURL = strings.Replace(wsURL, "https://", "wss://", 1)
 	wsURL = fmt.Sprintf("%s/api/v1/jobs/stream?job_id=%s", wsURL, url.QueryEscape(jobID))
+	if len(isWatchdog) > 0 && isWatchdog[0] {
+		wsURL += "&watchdog=1"
+	}
 	if rt.Token != "" {
 		wsURL += fmt.Sprintf("&token=%s", url.QueryEscape(rt.Token))
 	}
@@ -1301,7 +1302,7 @@ func (c *Client) ListDirWithContext(ctx context.Context, node, remotePath string
 	}
 
 	path := fmt.Sprintf("/api/v1/fs/ls?path=%s&recursive=%t", url.QueryEscape(remotePath), isRec)
-	resp, err := c.doRequestWithContext(ctx, rt, http.MethodGet, path, nil)
+	resp, err := c.doStreamRequestWithContext(ctx, rt, http.MethodGet, path, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -1376,7 +1377,7 @@ func (c *Client) DeleteWithContext(ctx context.Context, node, remotePath string,
 	}
 
 	path := fmt.Sprintf("/api/v1/fs/rm?path=%s&recursive=%t", url.QueryEscape(remotePath), recursive)
-	resp, err := c.doRequestWithContext(ctx, rt, http.MethodPost, path, nil)
+	resp, err := c.doStreamRequestWithContext(ctx, rt, http.MethodPost, path, nil)
 	if err != nil {
 		return err
 	}
@@ -1544,7 +1545,7 @@ func (c *Client) CatWithSlice(ctx context.Context, node, path string, opts proto
 	}
 
 	catURL := fmt.Sprintf("/api/v1/fs/cat?%s", queryParams.Encode())
-	resp, err := c.doRequestWithContext(ctx, rt, http.MethodGet, catURL, nil)
+	resp, err := c.doStreamRequestWithContext(ctx, rt, http.MethodGet, catURL, nil)
 	if err != nil {
 		return err
 	}
@@ -1578,8 +1579,8 @@ func (c *Client) CatWithSlice(ctx context.Context, node, path string, opts proto
 	return fmt.Errorf("cat remote file failed (%d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
 }
 
-// Hash 获取远端节点或本地路径的文件/目录 SHA-256 清单 (统一本地与远端)
-func (c *Client) Hash(ctx context.Context, node, path string, recursive bool) ([]protocol.FileInfo, error) {
+// Hash 获取远端节点或本地路径的文件/目录 SHA-256 清单 (统一本地与远端，支持进度追踪)
+func (c *Client) Hash(ctx context.Context, node, path string, recursive bool, trackers ...*ProgressTracker) ([]protocol.FileInfo, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1588,9 +1589,9 @@ func (c *Client) Hash(ctx context.Context, node, path string, recursive bool) ([
 		if err != nil {
 			return nil, err
 		}
-		return HashLocalPath(cleanLocal, recursive)
+		return HashLocalPath(cleanLocal, recursive, trackers...)
 	}
-	return c.HashRemotePath(ctx, node, path, recursive)
+	return c.HashRemotePath(ctx, node, path, recursive, trackers...)
 }
 
 // UploadDir 递归并发上传本地文件夹到远端节点 (两阶段目录治理 + 单遍流式 Hash + 自洽进度条)
@@ -2056,8 +2057,8 @@ func (c *Client) LocalCopyDir(ctx context.Context, srcBaseDir, dstBaseDir string
 	return err
 }
 
-// HashRemotePath 获取远端路径的文件/目录 SHA-256 清单
-func (c *Client) HashRemotePath(ctx context.Context, node, remotePath string, recursive bool) ([]protocol.FileInfo, error) {
+// HashRemotePath 获取远端路径的文件/目录 SHA-256 清单 (支持 NDJSON 流式接收与进度追踪，无 30s 截断)
+func (c *Client) HashRemotePath(ctx context.Context, node, remotePath string, recursive bool, trackers ...*ProgressTracker) ([]protocol.FileInfo, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -2066,8 +2067,15 @@ func (c *Client) HashRemotePath(ctx context.Context, node, remotePath string, re
 		return nil, err
 	}
 
-	path := fmt.Sprintf("/api/v1/fs/hash?path=%s&recursive=%t", url.QueryEscape(remotePath), recursive)
-	resp, err := c.doRequestWithContext(ctx, rt, http.MethodGet, path, nil)
+	var tracker *ProgressTracker
+	if len(trackers) > 0 && trackers[0] != nil {
+		tracker = trackers[0]
+	}
+
+	path := fmt.Sprintf("/api/v1/fs/hash?path=%s&recursive=%t&stream=true", url.QueryEscape(remotePath), recursive)
+	resp, err := c.doStreamRequestWithContext(ctx, rt, http.MethodGet, path, nil, func(req *http.Request) {
+		req.Header.Set("Accept", "application/x-ndjson, application/json")
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -2078,16 +2086,106 @@ func (c *Client) HashRemotePath(ctx context.Context, node, remotePath string, re
 		return nil, fmt.Errorf("hash remote path failed (%d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
+	contentType := resp.Header.Get("Content-Type")
+	if strings.Contains(contentType, "application/x-ndjson") {
+		var list []protocol.FileInfo
+		scanner := bufio.NewScanner(resp.Body)
+		buf := make([]byte, 64*1024)
+		scanner.Buffer(buf, 1024*1024)
+
+		for scanner.Scan() {
+			line := scanner.Bytes()
+			if len(bytes.TrimSpace(line)) == 0 {
+				continue
+			}
+			var ev protocol.FsHashEvent
+			if err := json.Unmarshal(line, &ev); err != nil {
+				continue
+			}
+			switch ev.Event {
+			case protocol.FsHashEventInit:
+				if tracker != nil {
+					tracker.SetTotals(ev.TotalFiles, ev.TotalBytes)
+				}
+			case protocol.FsHashEventProgress:
+				if tracker != nil && ev.CurrentFile != "" {
+					tracker.StartFile(ev.CurrentFile)
+				}
+			case protocol.FsHashEventEntry:
+				if ev.Entry != nil {
+					list = append(list, *ev.Entry)
+					if tracker != nil {
+						tracker.EndFile(ev.Entry.Path)
+						tracker.AddBytes(ev.Entry.Size)
+						tracker.AddFile()
+					}
+				}
+			case protocol.FsHashEventDone:
+				// 完成
+			case protocol.FsHashEventError:
+				if ev.Error != "" {
+					return nil, fmt.Errorf("remote hash error: %s", ev.Error)
+				}
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			return nil, fmt.Errorf("read ndjson stream failed: %w", err)
+		}
+		return list, nil
+	}
+
+	// 兼容老版本 Worker (返回普通 application/json)
 	var list []protocol.FileInfo
 	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
 		return nil, err
 	}
+	if tracker != nil {
+		var totalBytes int64
+		for _, item := range list {
+			totalBytes += item.Size
+		}
+		tracker.SetTotals(int64(len(list)), totalBytes)
+		for _, item := range list {
+			tracker.AddBytes(item.Size)
+			tracker.AddFile()
+		}
+	}
 	return list, nil
 }
 
-// HashLocalPath 获取本地路径的文件/目录 SHA-256 清单 (与远端 handleFsHash 契约保持一致)
-func HashLocalPath(localPath string, recursive bool) ([]protocol.FileInfo, error) {
-	return fsengine.Hash(localPath, recursive)
+// HashLocalPath 获取本地路径的文件/目录 SHA-256 清单 (支持进度追踪，与远端 handleFsHash 契约保持一致)
+func HashLocalPath(localPath string, recursive bool, trackers ...*ProgressTracker) ([]protocol.FileInfo, error) {
+	var tracker *ProgressTracker
+	if len(trackers) > 0 && trackers[0] != nil {
+		tracker = trackers[0]
+	}
+	if tracker == nil {
+		return fsengine.Hash(localPath, recursive)
+	}
+
+	var list []protocol.FileInfo
+	_, err := fsengine.HashStream(localPath, recursive, func(ev protocol.FsHashEvent) error {
+		switch ev.Event {
+		case protocol.FsHashEventInit:
+			tracker.SetTotals(ev.TotalFiles, ev.TotalBytes)
+		case protocol.FsHashEventProgress:
+			if ev.CurrentFile != "" {
+				tracker.StartFile(ev.CurrentFile)
+			}
+		case protocol.FsHashEventEntry:
+			if ev.Entry != nil {
+				list = append(list, *ev.Entry)
+				tracker.EndFile(ev.Entry.Path)
+				tracker.AddBytes(ev.Entry.Size)
+				tracker.AddFile()
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return list, nil
 }
 
 // CompareFileInfos 对比源端与目标端的文件清单并生成 Diff 汇总结果

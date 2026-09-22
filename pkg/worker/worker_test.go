@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -8,8 +9,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -271,7 +274,192 @@ func TestWorker_FsHash(t *testing.T) {
 	if rec5.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("expected 405 for POST method, got %d", rec5.Code)
 	}
+
+	// 6. 测试 NDJSON 流式模式 (stream=true 参数)
+	req6 := httptest.NewRequest(http.MethodGet, "/api/v1/fs/hash?path="+subDir+"&recursive=true&stream=true", nil)
+	rec6 := httptest.NewRecorder()
+	w.handleFsHash(rec6, req6)
+	if rec6.Code != http.StatusOK {
+		t.Fatalf("handleFsHash stream failed: %d, body: %s", rec6.Code, rec6.Body.String())
+	}
+	if ct := rec6.Header().Get("Content-Type"); !strings.Contains(ct, "application/x-ndjson") {
+		t.Fatalf("expected Content-Type application/x-ndjson, got: %s", ct)
+	}
+
+	var streamEvents []protocol.FsHashEvent
+	scanner := bufio.NewScanner(rec6.Body)
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		var ev protocol.FsHashEvent
+		if err := json.Unmarshal(line, &ev); err != nil {
+			t.Fatalf("unmarshal NDJSON line failed: %v, line: %s", err, string(line))
+		}
+		streamEvents = append(streamEvents, ev)
+	}
+	if len(streamEvents) < 3 {
+		t.Fatalf("expected at least 3 events in stream (init, entries, done), got %d", len(streamEvents))
+	}
+	if streamEvents[0].Event != protocol.FsHashEventInit || streamEvents[0].TotalFiles != 2 {
+		t.Fatalf("unexpected stream init event: %+v", streamEvents[0])
+	}
+	lastStreamEv := streamEvents[len(streamEvents)-1]
+	if lastStreamEv.Event != protocol.FsHashEventDone || lastStreamEv.TotalFiles != 2 {
+		t.Fatalf("unexpected stream done event: %+v", lastStreamEv)
+	}
+
+	// 7. 测试 Accept: application/x-ndjson 请求头触发流式响应
+	req7 := httptest.NewRequest(http.MethodGet, "/api/v1/fs/hash?path="+file1Path, nil)
+	req7.Header.Set("Accept", "application/x-ndjson")
+	rec7 := httptest.NewRecorder()
+	w.handleFsHash(rec7, req7)
+	if rec7.Code != http.StatusOK {
+		t.Fatalf("handleFsHash with Accept header failed: %d", rec7.Code)
+	}
+	if ct := rec7.Header().Get("Content-Type"); !strings.Contains(ct, "application/x-ndjson") {
+		t.Fatalf("expected Content-Type application/x-ndjson from Accept header, got: %s", ct)
+	}
 }
+
+// 验证旧版本客户端请求新版本 Worker 时，服务端准确识别并回退为纯净 application/json 单包响应
+func TestWorker_FsHash_LegacyClient_Compatibility(t *testing.T) {
+	tempDir := t.TempDir()
+	filePath := filepath.Join(tempDir, "legacy_compat.txt")
+	_ = os.WriteFile(filePath, []byte("legacy payload"), 0644)
+
+	w := &Worker{cfg: Config{DataDir: tempDir}}
+
+	// 模拟老客户端：无 stream 参数，默认 Accept: */*
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/fs/hash?path="+filePath, nil)
+	rec := httptest.NewRecorder()
+
+	w.handleFsHash(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("handleFsHash legacy client request failed: %d", rec.Code)
+	}
+	// 契约断言：必须为 application/json，绝不能返回 application/x-ndjson
+	ct := rec.Header().Get("Content-Type")
+	if ct != "application/json" {
+		t.Fatalf("expected Content-Type application/json for legacy client, got: %s", ct)
+	}
+
+	var list []protocol.FileInfo
+	if err := json.NewDecoder(rec.Body).Decode(&list); err != nil {
+		t.Fatalf("decode legacy JSON response failed: %v", err)
+	}
+	if len(list) != 1 || list[0].Name != "legacy_compat.txt" {
+		t.Fatalf("unexpected legacy response body: %+v", list)
+	}
+}
+
+// 验证客户端在中途断开连接时，服务端的 HashStream 和 handleFsHash 能够立即侦测并优雅退出，零句柄/Goroutine 泄漏
+func TestWorker_FsHash_ClientDisconnect_GracefulExit(t *testing.T) {
+	tempDir := t.TempDir()
+	// 创建多个文件
+	for i := 1; i <= 20; i++ {
+		_ = os.WriteFile(filepath.Join(tempDir, fmt.Sprintf("file_%d.txt", i)), []byte(fmt.Sprintf("content_%d", i)), 0644)
+	}
+
+	w := &Worker{cfg: Config{DataDir: tempDir}}
+
+	// 使用带 Cancel 的 Context 模拟客户端读取首包后立即断连
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/fs/hash?path="+tempDir+"&recursive=true&stream=true", nil).WithContext(ctx)
+
+	// 创建可感知写入中断的自定义 ResponseWriter
+	abortWriter := &abortableRecorder{
+		ResponseRecorder: httptest.NewRecorder(),
+		onWrite: func() {
+			// 在初次写入数据时立即触发客户端断连
+			cancel()
+		},
+	}
+
+	doneChan := make(chan struct{})
+	go func() {
+		w.handleFsHash(abortWriter, req)
+		close(doneChan)
+	}()
+
+	select {
+	case <-doneChan:
+		// 成功快速安全退出
+	case <-time.After(2 * time.Second):
+		t.Fatal("handleFsHash failed to exit promptly upon client disconnection")
+	}
+}
+
+type abortableRecorder struct {
+	*httptest.ResponseRecorder
+	onWrite func()
+}
+
+func (a *abortableRecorder) Write(buf []byte) (int, error) {
+	if a.onWrite != nil {
+		a.onWrite()
+	}
+	return a.ResponseRecorder.Write(buf)
+}
+
+func (a *abortableRecorder) Flush() {
+	if a.ResponseRecorder.Flushed {
+		return
+	}
+	a.ResponseRecorder.Flush()
+}
+
+// 验证真实 TCP Socket 物理层突然断开时，handleFsHash 能安全拦截 broken pipe 并安全释放句柄
+func TestWorker_FsHash_RealSocketDisconnect(t *testing.T) {
+	tempDir := t.TempDir()
+	for i := 1; i <= 30; i++ {
+		_ = os.WriteFile(filepath.Join(tempDir, fmt.Sprintf("file_%02d.txt", i)), []byte(fmt.Sprintf("data_%d", i)), 0644)
+	}
+
+	w := &Worker{cfg: Config{DataDir: tempDir}}
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		w.handleFsHash(rw, r)
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	conn, err := net.Dial("tcp", u.Host)
+	if err != nil {
+		t.Fatalf("dial server failed: %v", err)
+	}
+
+	reqStr := fmt.Sprintf("GET /api/v1/fs/hash?path=%s&recursive=true&stream=true HTTP/1.1\r\nHost: %s\r\nAccept: application/x-ndjson\r\n\r\n",
+		url.QueryEscape(tempDir), u.Host)
+	_, _ = conn.Write([]byte(reqStr))
+
+	reader := bufio.NewReader(conn)
+	statusLine, err := reader.ReadString('\n')
+	if err != nil || !strings.Contains(statusLine, "200") {
+		t.Fatalf("expected 200 OK status line, got %s, err: %v", statusLine, err)
+	}
+
+	// 消费 Headers
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil || strings.TrimSpace(line) == "" {
+			break
+		}
+	}
+
+	// 读取 1~2 行 NDJSON
+	_, _ = reader.ReadString('\n')
+	_, _ = reader.ReadString('\n')
+
+	// 模拟网络硬件断线或客户端进程崩溃：强制暴力关闭 TCP 连接
+	_ = conn.Close()
+
+	// 验证服务端不发生 panic，正常完成清理
+	time.Sleep(100 * time.Millisecond)
+}
+
+
 
 func TestWorker_JobHandlersAndHealth(t *testing.T) {
 	tempDir, err := os.MkdirTemp("", "cw_worker_jobs_test_*")
@@ -2117,6 +2305,275 @@ func TestWorker_ListJobs_MultipleRunningAndHistoricSorting(t *testing.T) {
 		}
 	}
 }
+
+func TestWorker_StreamLogs_KillOnDisconnect(t *testing.T) {
+	tempDir := t.TempDir()
+	w := &Worker{
+		cfg: Config{
+			Name:    "eph-node",
+			DataDir: tempDir,
+		},
+		jobs: make(map[string]*process.ManagedJob),
+	}
+
+	// 1. 启动一个带有 KillOnDisconnect=true 的慢速长任务
+	runReq := protocol.RunJobRequest{
+		Name:             "ephemeral-long-job",
+		Command:          "cmd.exe /c ping -n 10 127.0.0.1 >nul",
+		KillOnDisconnect: true,
+	}
+	jobID := "eph-job-1"
+	job, err := process.StartJob(runReq, jobID, w.cfg.Name, tempDir)
+	if err != nil {
+		t.Fatalf("StartJob failed: %v", err)
+	}
+	w.jobs[jobID] = job
+	defer job.Kill()
+
+	server := httptest.NewServer(http.HandlerFunc(w.handleStreamLogs))
+	defer server.Close()
+
+	// 作为专属看门狗连接 (附加 &watchdog=1)
+	wsURL := strings.Replace(server.URL, "http://", "ws://", 1) + "?job_id=" + jobID + "&watchdog=1"
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("websocket.Dial failed: %v", err)
+	}
+
+	// 确保连接已建立且任务仍处于 RUNNING 状态
+	if job.GetInfo().Status != protocol.JobStatusRunning {
+		t.Fatalf("expected job to be RUNNING initially")
+	}
+
+	// 模拟客户端外部硬杀/崩溃：直接粗暴关闭 WebSocket 连接
+	_ = conn.Close(websocket.StatusGoingAway, "client terminated")
+
+	// 轮询验证服务端在检测到断开后，毫秒级将任务强杀为 STOPPED
+	dead := false
+	for i := 0; i < 50; i++ {
+		time.Sleep(50 * time.Millisecond)
+		if job.GetInfo().Status == protocol.JobStatusStopped {
+			dead = true
+			break
+		}
+	}
+	if !dead {
+		t.Fatalf("expected job to be killed (STOPPED) on disconnect, but got: %s", job.GetInfo().Status)
+	}
+}
+
+func TestWorker_StreamLogs_CleanOnDisconnect(t *testing.T) {
+	tempDir := t.TempDir()
+	w := &Worker{
+		cfg: Config{
+			Name:    "clean-eph-node",
+			DataDir: tempDir,
+		},
+		jobs: make(map[string]*process.ManagedJob),
+	}
+
+	// 启动同时声明了 KillOnDisconnect 与 CleanOnDisconnect 的瞬时任务
+	runReq := protocol.RunJobRequest{
+		Name:              "clean-eph-job",
+		Command:           "cmd.exe /c ping -n 10 127.0.0.1 >nul",
+		KillOnDisconnect:  true,
+		CleanOnDisconnect: true,
+	}
+	jobID := "clean-job-1"
+	job, err := process.StartJob(runReq, jobID, w.cfg.Name, tempDir)
+	if err != nil {
+		t.Fatalf("StartJob failed: %v", err)
+	}
+	w.jobs[jobID] = job
+	defer job.Kill()
+
+	server := httptest.NewServer(http.HandlerFunc(w.handleStreamLogs))
+	defer server.Close()
+
+	// 附带 watchdog=1 证明所有权
+	wsURL := strings.Replace(server.URL, "http://", "ws://", 1) + "?job_id=" + jobID + "&watchdog=1"
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("websocket.Dial failed: %v", err)
+	}
+
+	// 模拟客户端突发掉线
+	_ = conn.Close(websocket.StatusGoingAway, "abrupt disconnect")
+
+	// 验证任务被移出内存且目录被物理清理
+	cleaned := false
+	dirCleaned := false
+	jobDir := filepath.Join(tempDir, "jobs", jobID)
+	for i := 0; i < 50; i++ {
+		time.Sleep(50 * time.Millisecond)
+		w.mu.RLock()
+		_, exists := w.jobs[jobID]
+		w.mu.RUnlock()
+		if !exists {
+			cleaned = true
+			if _, err := os.Stat(jobDir); os.IsNotExist(err) {
+				dirCleaned = true
+				break
+			}
+		}
+	}
+	if !cleaned {
+		t.Fatalf("expected job to be cleaned and removed from w.jobs on disconnect")
+	}
+	if !dirCleaned {
+		t.Errorf("expected job directory %s to be deleted, but it still exists", jobDir)
+	}
+}
+
+func TestWorker_StreamLogs_SpectatorDisconnectDoesNotKillJob(t *testing.T) {
+	tempDir := t.TempDir()
+	w := &Worker{
+		cfg: Config{
+			Name:    "spectator-node",
+			DataDir: tempDir,
+		},
+		jobs: make(map[string]*process.ManagedJob),
+	}
+
+	// 瞬时任务 (带有 KillOnDisconnect)
+	runReq := protocol.RunJobRequest{
+		Name:             "ephemeral-job-with-spectator",
+		Command:          "cmd.exe /c ping -n 10 127.0.0.1 >nul",
+		KillOnDisconnect: true,
+	}
+	jobID := "spec-job-1"
+	job, err := process.StartJob(runReq, jobID, w.cfg.Name, tempDir)
+	if err != nil {
+		t.Fatalf("StartJob failed: %v", err)
+	}
+	w.jobs[jobID] = job
+	defer job.Kill()
+
+	server := httptest.NewServer(http.HandlerFunc(w.handleStreamLogs))
+	defer server.Close()
+
+	// 关键测试：旁观者连接 (例如 Web 控制台或 cw logs -f)，未携带 watchdog=1
+	wsURL := strings.Replace(server.URL, "http://", "ws://", 1) + "?job_id=" + jobID
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("websocket.Dial failed: %v", err)
+	}
+
+	// 旁观者关闭连接
+	_ = conn.Close(websocket.StatusNormalClosure, "")
+
+	// 延时等待验证：旁观者断开绝不误杀主任务！
+	time.Sleep(200 * time.Millisecond)
+	if job.GetInfo().Status != protocol.JobStatusRunning {
+		t.Fatalf("spectator disconnect must NOT kill ephemeral job, but got: %s", job.GetInfo().Status)
+	}
+}
+
+func TestWorker_StreamLogs_NormalJobNotKilledOnDisconnect(t *testing.T) {
+	tempDir := t.TempDir()
+	w := &Worker{
+		cfg: Config{
+			Name:    "normal-node",
+			DataDir: tempDir,
+		},
+		jobs: make(map[string]*process.ManagedJob),
+	}
+
+	// 普通后台任务 (KillOnDisconnect=false)
+	runReq := protocol.RunJobRequest{
+		Name:             "normal-detached-job",
+		Command:          "cmd.exe /c ping -n 10 127.0.0.1 >nul",
+		KillOnDisconnect: false,
+	}
+	jobID := "normal-job-1"
+	job, err := process.StartJob(runReq, jobID, w.cfg.Name, tempDir)
+	if err != nil {
+		t.Fatalf("StartJob failed: %v", err)
+	}
+	w.jobs[jobID] = job
+	defer job.Kill()
+
+	server := httptest.NewServer(http.HandlerFunc(w.handleStreamLogs))
+	defer server.Close()
+
+	wsURL := strings.Replace(server.URL, "http://", "ws://", 1) + "?job_id=" + jobID
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("websocket.Dial failed: %v", err)
+	}
+
+	// 客户端断开 (例如用户用 cw logs -f 看看后 Ctrl+C 退出查看)
+	_ = conn.Close(websocket.StatusNormalClosure, "")
+
+	// 延时等待确认，任务依然稳定处于 RUNNING
+	time.Sleep(200 * time.Millisecond)
+	if job.GetInfo().Status != protocol.JobStatusRunning {
+		t.Fatalf("normal background job should NOT be killed on disconnect, but got: %s", job.GetInfo().Status)
+	}
+}
+
+func TestWorker_EphemeralJob_WatchdogNeverConnectedTimeout(t *testing.T) {
+	tempDir := t.TempDir()
+	w := &Worker{
+		cfg: Config{
+			Name:    "timeout-node",
+			DataDir: tempDir,
+		},
+		jobs: make(map[string]*process.ManagedJob),
+	}
+
+	oldPeriod := watchdogGracePeriod
+	watchdogGracePeriod = 100 * time.Millisecond
+	defer func() { watchdogGracePeriod = oldPeriod }()
+
+	runReq := protocol.RunJobRequest{
+		Name:              "never-connected-eph-job",
+		Command:           "cmd.exe /c ping -n 10 127.0.0.1 >nul",
+		KillOnDisconnect:  true,
+		CleanOnDisconnect: true,
+	}
+	body, _ := json.Marshal(runReq)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/jobs/run", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	w.handleRunJob(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("handleRunJob failed: %d", rec.Code)
+	}
+
+	var info protocol.JobInfo
+	_ = json.Unmarshal(rec.Body.Bytes(), &info)
+
+	// 验证在 100ms 后由于看门狗从未连接，任务被超时自动强杀并清理
+	cleaned := false
+	for i := 0; i < 30; i++ {
+		time.Sleep(20 * time.Millisecond)
+		w.mu.RLock()
+		_, exists := w.jobs[info.ID]
+		w.mu.RUnlock()
+		if !exists {
+			cleaned = true
+			break
+		}
+	}
+	if !cleaned {
+		t.Fatalf("expected ephemeral job without watchdog connection to be auto-killed after grace period")
+	}
+}
+
+
 
 
 

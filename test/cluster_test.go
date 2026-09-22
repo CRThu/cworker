@@ -940,4 +940,148 @@ func TestCluster_WorkerRebootAndHydrationInCluster(t *testing.T) {
 	}
 }
 
+// TestCluster_Diff_BatchFiles_NDJSONStream 验证在真实双节点集群回环中并发发起批量文件哈希流式比对
+func TestCluster_Diff_BatchFiles_NDJSONStream(t *testing.T) {
+	portAlpha := getFreePort(t)
+	portBeta := getFreePort(t)
+
+	dataAlpha := t.TempDir()
+	dataBeta := t.TempDir()
+
+	wAlpha, err := worker.NewWorker(worker.Config{
+		Name:     "cluster-alpha",
+		BindAddr: "127.0.0.1",
+		Port:     portAlpha,
+		DataDir:  dataAlpha,
+	})
+	if err != nil {
+		t.Fatalf("NewWorker alpha failed: %v", err)
+	}
+
+	wBeta, err := worker.NewWorker(worker.Config{
+		Name:     "cluster-beta",
+		BindAddr: "127.0.0.1",
+		Port:     portBeta,
+		DataDir:  dataBeta,
+	})
+	if err != nil {
+		t.Fatalf("NewWorker beta failed: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() { _ = wAlpha.Start(ctx) }()
+	go func() { _ = wBeta.Start(ctx) }()
+
+	time.Sleep(200 * time.Millisecond)
+
+	cliDataDir := t.TempDir()
+	t.Setenv("USERPROFILE", cliDataDir)
+	cli := client.NewClient()
+
+	_ = cli.SaveKnownNode(protocol.KnownNode{
+		Name:   "cluster-alpha",
+		Target: fmt.Sprintf("127.0.0.1:%d", portAlpha),
+		Token:  wAlpha.Token(),
+	})
+	_ = cli.SaveKnownNode(protocol.KnownNode{
+		Name:   "cluster-beta",
+		Target: fmt.Sprintf("127.0.0.1:%d", portBeta),
+		Token:  wBeta.Token(),
+	})
+
+	dirAlpha := filepath.Join(dataAlpha, "dataset")
+	dirBeta := filepath.Join(dataBeta, "dataset")
+
+	// 构建批量文件结构 (100 个文件分布于不同子目录)
+	for i := 1; i <= 98; i++ {
+		sub := fmt.Sprintf("sub_%02d", i%10)
+		pA := filepath.Join(dirAlpha, sub, fmt.Sprintf("file_%03d.txt", i))
+		pB := filepath.Join(dirBeta, sub, fmt.Sprintf("file_%03d.txt", i))
+		_ = os.MkdirAll(filepath.Dir(pA), 0755)
+		_ = os.MkdirAll(filepath.Dir(pB), 0755)
+		content := []byte(fmt.Sprintf("cluster_data_common_%d", i))
+		_ = os.WriteFile(pA, content, 0644)
+		_ = os.WriteFile(pB, content, 0644)
+	}
+
+	// 1. 修改项 (file_modified.txt)
+	pModA := filepath.Join(dirAlpha, "file_modified.txt")
+	pModB := filepath.Join(dirBeta, "file_modified.txt")
+	_ = os.WriteFile(pModA, []byte("content_alpha_ver"), 0644)
+	_ = os.WriteFile(pModB, []byte("content_beta_ver"), 0644)
+
+	// 2. 源端新增项 (file_alpha_only.txt)
+	pAddA := filepath.Join(dirAlpha, "file_alpha_only.txt")
+	_ = os.WriteFile(pAddA, []byte("content_only_on_alpha"), 0644)
+
+	// 3. 目标端独有/已删除项 (file_beta_only.txt)
+	pDelB := filepath.Join(dirBeta, "file_beta_only.txt")
+	_ = os.WriteFile(pDelB, []byte("content_only_on_beta"), 0644)
+
+	trackerA := client.NewProgressTracker(0, 0)
+	trackerB := client.NewProgressTracker(0, 0)
+
+	var (
+		alphaFiles []protocol.FileInfo
+		betaFiles  []protocol.FileInfo
+		errA       error
+		errB       error
+		wg         sync.WaitGroup
+	)
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		alphaFiles, errA = cli.HashRemotePath(ctx, "cluster-alpha", dirAlpha, true, trackerA)
+	}()
+	go func() {
+		defer wg.Done()
+		betaFiles, errB = cli.HashRemotePath(ctx, "cluster-beta", dirBeta, true, trackerB)
+	}()
+	wg.Wait()
+
+	if errA != nil {
+		t.Fatalf("HashRemotePath cluster-alpha failed: %v", errA)
+	}
+	if errB != nil {
+		t.Fatalf("HashRemotePath cluster-beta failed: %v", errB)
+	}
+
+	// 校验两端收到的文件总数
+	// alpha 有 98 (common) + 1 (mod) + 1 (add) = 100
+	if len(alphaFiles) != 100 {
+		t.Fatalf("expected 100 files on alpha, got %d", len(alphaFiles))
+	}
+	// beta 有 98 (common) + 1 (mod) + 1 (del) = 100
+	if len(betaFiles) != 100 {
+		t.Fatalf("expected 100 files on beta, got %d", len(betaFiles))
+	}
+
+	diffRes := client.CompareFileInfos(alphaFiles, betaFiles)
+	if diffRes.Matched != 98 {
+		t.Fatalf("expected 98 matched, got %d", diffRes.Matched)
+	}
+	if diffRes.Modified != 1 {
+		t.Fatalf("expected 1 modified, got %d", diffRes.Modified)
+	}
+	if diffRes.Added != 1 {
+		t.Fatalf("expected 1 added, got %d", diffRes.Added)
+	}
+	if diffRes.Deleted != 1 {
+		t.Fatalf("expected 1 deleted, got %d", diffRes.Deleted)
+	}
+
+	snapA := trackerA.Snapshot()
+	if snapA.CompletedFiles != 100 {
+		t.Fatalf("trackerA completed %d files, expected 100", snapA.CompletedFiles)
+	}
+	snapB := trackerB.Snapshot()
+	if snapB.CompletedFiles != 100 {
+		t.Fatalf("trackerB completed %d files, expected 100", snapB.CompletedFiles)
+	}
+}
+
+
 

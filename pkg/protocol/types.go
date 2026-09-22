@@ -85,10 +85,12 @@ type JobInfo struct {
 
 // RunJobRequest 任务创建与派发请求
 type RunJobRequest struct {
-	Name    string `json:"name"`
-	Node    string `json:"node"`
-	Command string `json:"command"`
-	Dir     string `json:"dir"`
+	Name              string `json:"name"`
+	Node              string `json:"node"`
+	Command           string `json:"command"`
+	Dir               string `json:"dir"`
+	KillOnDisconnect  bool   `json:"kill_on_disconnect,omitempty"`
+	CleanOnDisconnect bool   `json:"clean_on_disconnect,omitempty"`
 }
 
 // KillJobRequest 任务终止请求
@@ -171,3 +173,27 @@ type DiffResult struct {
 	Added    int         `json:"added"`
 	Deleted  int         `json:"deleted"`
 }
+
+// FsHashEventType 表示文件/目录哈希流式事件类型
+type FsHashEventType string
+
+const (
+	FsHashEventInit     FsHashEventType = "init"     // 扫描完成，报告总文件数与总预估字节
+	FsHashEventProgress FsHashEventType = "progress" // 正在计算大文件或心跳进度
+	FsHashEventEntry    FsHashEventType = "entry"    // 单个文件哈希计算完毕
+	FsHashEventDone     FsHashEventType = "done"     // 全部完成
+	FsHashEventError    FsHashEventType = "error"    // 流式计算中途发生致命错误
+)
+
+// FsHashEvent 远端文件/目录哈希计算的 NDJSON 流式事件 (单向流 SSOT)
+type FsHashEvent struct {
+	Event       FsHashEventType `json:"event"`
+	TotalFiles  int64           `json:"total_files,omitempty"`
+	TotalBytes  int64           `json:"total_bytes,omitempty"`
+	CurrentFile string          `json:"current_file,omitempty"`
+	DoneBytes   int64           `json:"done_bytes,omitempty"`
+	Entry       *FileInfo       `json:"entry,omitempty"`
+	Error       string          `json:"error,omitempty"`
+}
+
+

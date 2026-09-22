@@ -51,6 +51,9 @@ type Worker struct {
 	lock       *process.SingleInstanceLock
 }
 
+// watchdogGracePeriod 前台同步瞬时任务初始看门狗连接宽限期 (超时未接入视作客户端阵亡自动熔断)
+var watchdogGracePeriod = 15 * time.Second
+
 // GenerateToken 使用 Ed25519 随机种子派生高强度不可预测的 64 位十六进制安全 Token
 func GenerateToken() (string, error) {
 	_, privKey, err := ed25519.GenerateKey(rand.Reader)
@@ -387,6 +390,28 @@ func (w *Worker) handleRunJob(rw http.ResponseWriter, r *http.Request) {
 	w.mu.Lock()
 	w.jobs[jobID] = job
 	w.mu.Unlock()
+
+	// 若任务声明了 KillOnDisconnect，启动看门狗连接宽限期定时器 (防客户端在建立 WebSocket 连接前即意外阵亡残留孤儿)
+	if req.KillOnDisconnect {
+		time.AfterFunc(watchdogGracePeriod, func() {
+			w.mu.RLock()
+			j, exists := w.jobs[jobID]
+			w.mu.RUnlock()
+			if exists && j.GetInfo().Status == protocol.JobStatusRunning && !j.HasWatchdogConnected() {
+				slog.Warn("watchdog never connected to ephemeral job within 15s grace period, auto-killing", "job_id", jobID)
+				_ = j.Kill()
+				if j.CleanOnDisconnect() {
+					w.mu.Lock()
+					delete(w.jobs, jobID)
+					w.mu.Unlock()
+					go func() {
+						_ = j.WaitExit(3 * time.Second)
+						_ = os.RemoveAll(filepath.Join(w.cfg.DataDir, "jobs", jobID))
+					}()
+				}
+			}
+		})
+	}
 
 	rw.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(rw).Encode(job.GetInfo())
@@ -858,9 +883,30 @@ func (w *Worker) handleStreamLogs(rw http.ResponseWriter, r *http.Request) {
 	subCh, unsubscribe := job.Broadcaster().Subscribe()
 	defer unsubscribe()
 
+	// 异步监听客户端连接生命周期 (捕获 Close Frame、TCP 断开与外部硬杀)
+	clientDone := make(chan struct{})
+	go func() {
+		defer close(clientDone)
+		for {
+			_, _, err := conn.Read(r.Context())
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	isWatchdog := r.URL.Query().Get("watchdog") == "1"
+	if isWatchdog {
+		job.SetWatchdogConnected()
+	}
+
 	for {
 		select {
+		case <-clientDone:
+			w.handleEphemeralDisconnect(job, jobID, isWatchdog)
+			return
 		case <-r.Context().Done():
+			w.handleEphemeralDisconnect(job, jobID, isWatchdog)
 			return
 		case chunk, ok := <-subCh:
 			if !ok {
@@ -868,8 +914,34 @@ func (w *Worker) handleStreamLogs(rw http.ResponseWriter, r *http.Request) {
 			}
 			err := conn.Write(r.Context(), websocket.MessageText, logstream.EnsureUTF8(chunk))
 			if err != nil {
+				w.handleEphemeralDisconnect(job, jobID, isWatchdog)
 				return
 			}
+		}
+	}
+}
+
+// handleEphemeralDisconnect 响应瞬时任务客户端异常失联，执行内核级强杀与现场自动清理
+func (w *Worker) handleEphemeralDisconnect(job *process.ManagedJob, jobID string, isWatchdog bool) {
+	// 严格门禁：只有专属看门狗断开且声明了 KillOnDisconnect 才触发强杀
+	// 绝不允许普通的日志查看者 (cw logs -f 或 Web UI) 断开误杀他人任务
+	if !isWatchdog || job == nil || !job.KillOnDisconnect() {
+		return
+	}
+	if job.GetInfo().Status == protocol.JobStatusRunning {
+		slog.Warn("watchdog disconnected on ephemeral job, auto-killing process tree", "job_id", jobID)
+		_ = job.Kill()
+		if job.CleanOnDisconnect() {
+			// 立即从内存账本移出，保证 cw ps / API 查询毫秒级清空
+			w.mu.Lock()
+			delete(w.jobs, jobID)
+			w.mu.Unlock()
+
+			// 异步解耦物理清理：绝不阻塞当前 HTTP 请求协程，交由独立协程等待进程退出并擦除目录
+			go func() {
+				_ = job.WaitExit(3 * time.Second)
+				_ = os.RemoveAll(filepath.Join(w.cfg.DataDir, "jobs", jobID))
+			}()
 		}
 	}
 }
@@ -1060,16 +1132,60 @@ func (w *Worker) handleFsHash(rw http.ResponseWriter, r *http.Request) {
 	}
 
 	recursive := r.URL.Query().Get("recursive") == "true"
-	list, err := fsengine.Hash(cleanPath, recursive)
+
+	fi, err := os.Stat(cleanPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			http.Error(rw, "path not found", http.StatusNotFound)
 			return
 		}
-		if errors.Is(err, fsengine.ErrDirRequiresRecursive) {
-			http.Error(rw, "path is a directory, requires recursive flag (-r)", http.StatusBadRequest)
-			return
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if fi.IsDir() && !recursive {
+		http.Error(rw, "path is a directory, requires recursive flag (-r)", http.StatusBadRequest)
+		return
+	}
+
+	isStream := r.URL.Query().Get("stream") == "true" || strings.Contains(r.Header.Get("Accept"), "application/x-ndjson")
+
+	if isStream {
+		rw.Header().Set("Content-Type", "application/x-ndjson")
+		rw.WriteHeader(http.StatusOK)
+		flusher, hasFlusher := rw.(http.Flusher)
+		if hasFlusher {
+			flusher.Flush()
 		}
+
+		enc := json.NewEncoder(rw)
+		_, err = fsengine.HashStream(cleanPath, recursive, func(ev protocol.FsHashEvent) error {
+			if ctxErr := r.Context().Err(); ctxErr != nil {
+				return ctxErr
+			}
+			if encErr := enc.Encode(ev); encErr != nil {
+				return encErr
+			}
+			if hasFlusher {
+				flusher.Flush()
+			}
+			return nil
+		})
+		if err != nil {
+			errEv := protocol.FsHashEvent{
+				Event: protocol.FsHashEventType("error"),
+				Error: err.Error(),
+			}
+			_ = enc.Encode(errEv)
+			if hasFlusher {
+				flusher.Flush()
+			}
+		}
+		return
+	}
+
+	list, err := fsengine.Hash(cleanPath, recursive)
+	if err != nil {
 		http.Error(rw, "hash failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -1077,3 +1193,4 @@ func (w *Worker) handleFsHash(rw http.ResponseWriter, r *http.Request) {
 	rw.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(rw).Encode(list)
 }
+
