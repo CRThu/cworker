@@ -316,8 +316,8 @@ func (c *Client) ListNodesWithContext(ctx context.Context) ([]protocol.NodeInfo,
 				return
 			}
 
-			// 统一走 doRequestWithContext：复用 Proxy: nil 隔离系统代理，并设定 1500ms 探活超时 (受父 ctx 约束)
-			probeCtx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+			// 统一走 doRequestWithContext：复用 Proxy: nil 隔离系统代理，设定 3000ms 探活超时以覆盖 Tailscale/异地冷启动打洞 (受父 ctx 约束)
+			probeCtx, cancel := context.WithTimeout(ctx, 3000*time.Millisecond)
 			defer cancel()
 
 			resp, err := c.doRequestWithContext(probeCtx, rt, http.MethodGet, "/api/v1/health", nil)

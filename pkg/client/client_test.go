@@ -505,12 +505,12 @@ func TestClient_ListNodes_ProxyImmunity(t *testing.T) {
 	}
 }
 
-// TestClient_ListNodes_TimeoutFailsafe 验证目标节点假死时，1500ms 短超时即时熔断且不阻塞全局
+// TestClient_ListNodes_TimeoutFailsafe 验证目标节点假死时，3000ms 短超时即时熔断且不阻塞全局
 func TestClient_ListNodes_TimeoutFailsafe(t *testing.T) {
-	// 模拟挂起延迟 3 秒的假死节点（监听 r.Context().Done() 以便在客户端超时取消后快速释放连接）
+	// 模拟挂起延迟 5 秒的假死节点（监听 r.Context().Done() 以便在客户端超时取消后快速释放连接）
 	slowServer := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		select {
-		case <-time.After(3 * time.Second):
+		case <-time.After(5 * time.Second):
 			_ = json.NewEncoder(rw).Encode(protocol.NodeInfo{
 				Name:   "slow-node",
 				Status: protocol.NodeStatusOnline,
@@ -540,9 +540,9 @@ func TestClient_ListNodes_TimeoutFailsafe(t *testing.T) {
 	if len(nodes) != 1 || nodes[0].Status != protocol.NodeStatusOffline {
 		t.Fatalf("expected slow node to be marked OFFLINE on timeout, got: %+v", nodes)
 	}
-	// 耗时应在 1500ms 左右，大幅小于服务端的 3 秒延迟
-	if elapsed > 2500*time.Millisecond {
-		t.Fatalf("ListNodes timeout took too long: %v (expected ~1500ms)", elapsed)
+	// 耗时应在 3000ms 左右，大幅小于服务端的 5 秒延迟
+	if elapsed > 4500*time.Millisecond {
+		t.Fatalf("ListNodes timeout took too long: %v (expected ~3000ms)", elapsed)
 	}
 }
 
