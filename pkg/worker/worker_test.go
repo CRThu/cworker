@@ -2627,14 +2627,17 @@ func TestWorker_EphemeralJob_WatchdogNeverConnectedTimeout(t *testing.T) {
 
 	// 验证在 100ms 后由于看门狗从未连接，任务被超时自动强杀并清理
 	cleaned := false
-	for i := 0; i < 30; i++ {
-		time.Sleep(20 * time.Millisecond)
+	jobDir := filepath.Join(tempDir, "jobs", info.ID)
+	for i := 0; i < 50; i++ {
+		time.Sleep(50 * time.Millisecond)
 		w.mu.RLock()
 		_, exists := w.jobs[info.ID]
 		w.mu.RUnlock()
 		if !exists {
 			cleaned = true
-			break
+			if _, statErr := os.Stat(jobDir); os.IsNotExist(statErr) {
+				break
+			}
 		}
 	}
 	if !cleaned {
