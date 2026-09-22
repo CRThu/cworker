@@ -120,8 +120,8 @@ func hashFileWithProgress(filePath string, totalSize int64, onProgress func(done
 			hasher.Write(buf[:n])
 			doneBytes += int64(n)
 			now := time.Now()
-			// 节流步进心跳：每 200ms 或达到文件末尾时上报一次
-			if now.Sub(lastProgress) >= 200*time.Millisecond || doneBytes == totalSize {
+			// 节流步进心跳：每 100ms 或达到文件末尾时上报一次 (与服务端网络 Flush 及终端 UI 渲染节拍对齐)
+			if now.Sub(lastProgress) >= 100*time.Millisecond || doneBytes == totalSize {
 				if err := onProgress(doneBytes); err != nil {
 					return "", err
 				}

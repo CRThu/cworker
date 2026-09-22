@@ -1156,5 +1156,45 @@ func TestCmd_Diff_TTY_Error_Println(t *testing.T) {
 	}
 }
 
+// 验证目录递归对比包含大文件 (>10MB) 时，两端哈希流式推进，
+// 且 ProgressTracker 能够正常承载大文件增量字节与收尾汇总
+func TestCmd_Diff_LargeFile_IncrementalStreaming(t *testing.T) {
+	tempProfile := t.TempDir()
+	t.Setenv("USERPROFILE", tempProfile)
+
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+
+	// 创建一个 12MB 的大文件 (超过 10MB 分块心跳阈值)
+	chunk := bytes.Repeat([]byte("K"), 1024*1024)
+
+	fA := filepath.Join(dirA, "large.dat")
+	fB := filepath.Join(dirB, "large.dat")
+
+	f1, err := os.Create(fA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f2, err := os.Create(fB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 12; i++ {
+		_, _ = f1.Write(chunk)
+		_, _ = f2.Write(chunk)
+	}
+	f1.Close()
+	f2.Close()
+
+	diffCmd.Flags().Set("recursive", "true")
+	diffCmd.Flags().Set("all", "false")
+	defer diffCmd.Flags().Set("recursive", "false")
+
+	err = diffCmd.RunE(diffCmd, []string{dirA, dirB})
+	if err != nil {
+		t.Fatalf("diff command on large file failed: %v", err)
+	}
+}
+
 
 

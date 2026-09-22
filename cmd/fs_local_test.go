@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -242,5 +243,36 @@ func TestCmd_Rm_TTY_Heartbeat(t *testing.T) {
 	// 核心断言 2: 最终包含成功输出
 	if !strings.Contains(output, "[OK] Deleted 'rm-tty-node:D:/tty_dir'") {
 		t.Fatalf("expected success message, got:\n%s", output)
+	}
+}
+
+// 验证本地递归删除深层且包含大量子目录和文件的层级时，能够完全物理清理且正确报告
+func TestCmd_Rm_Local_LargeHierarchy_WithFiles(t *testing.T) {
+	tempDir := t.TempDir()
+	rootDir := filepath.Join(tempDir, "tree_root")
+
+	// 创建多层嵌套目录与几十个文件
+	for i := 1; i <= 5; i++ {
+		sub := filepath.Join(rootDir, fmt.Sprintf("sub_%d", i), "nested")
+		_ = os.MkdirAll(sub, 0755)
+		for j := 1; j <= 5; j++ {
+			_ = os.WriteFile(filepath.Join(sub, fmt.Sprintf("file_%d.dat", j)), []byte("payload"), 0644)
+		}
+	}
+
+	rmCmd.Flags().Set("recursive", "true")
+	rmCmd.Flags().Set("yes", "true")
+	defer func() {
+		rmCmd.Flags().Set("recursive", "false")
+		rmCmd.Flags().Set("yes", "false")
+	}()
+
+	err := rmCmd.RunE(rmCmd, []string{rootDir})
+	if err != nil {
+		t.Fatalf("local rm recursive on hierarchy failed: %v", err)
+	}
+
+	if _, err := os.Stat(rootDir); !os.IsNotExist(err) {
+		t.Fatalf("rootDir should have been completely removed, got err: %v", err)
 	}
 }

@@ -543,4 +543,40 @@ func TestCmd_Cp_DefaultConcurrencyFallback(t *testing.T) {
 	}
 }
 
+// 验证通过 cw cp 传输大文件 (>10MB) 时，流式管道、CountingReader/CountingWriter 与哈希核验全链路无损
+func TestCmd_Cp_LargeFile_Streaming(t *testing.T) {
+	tempDir := t.TempDir()
+	srcFile := filepath.Join(tempDir, "large_src.dat")
+	dstFile := filepath.Join(tempDir, "large_dst.dat")
+
+	// 构造 12MB 的大文件
+	targetSize := 12 * 1024 * 1024
+	chunk := bytes.Repeat([]byte("M"), 1024*1024)
+	f, err := os.Create(srcFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 12; i++ {
+		_, _ = f.Write(chunk)
+	}
+	f.Close()
+
+	cpCmd.Flags().Set("recursive", "false")
+	cpCmd.Flags().Set("concurrency", "4")
+	defer cpCmd.Flags().Set("concurrency", "8")
+
+	err = cpCmd.RunE(cpCmd, []string{srcFile, dstFile})
+	if err != nil {
+		t.Fatalf("cp command on large file failed: %v", err)
+	}
+
+	fi, err := os.Stat(dstFile)
+	if err != nil {
+		t.Fatalf("stat dstFile failed: %v", err)
+	}
+	if fi.Size() != int64(targetSize) {
+		t.Fatalf("expected dstFile size %d, got %d", targetSize, fi.Size())
+	}
+}
+
 

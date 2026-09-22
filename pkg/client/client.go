@@ -2092,6 +2092,8 @@ func (c *Client) HashRemotePath(ctx context.Context, node, remotePath string, re
 		scanner := bufio.NewScanner(resp.Body)
 		buf := make([]byte, 64*1024)
 		scanner.Buffer(buf, 1024*1024)
+		var currentFile string
+		var currentFileDoneBytes int64
 
 		for scanner.Scan() {
 			line := scanner.Bytes()
@@ -2108,15 +2110,36 @@ func (c *Client) HashRemotePath(ctx context.Context, node, remotePath string, re
 					tracker.AddTotals(ev.TotalFiles, ev.TotalBytes)
 				}
 			case protocol.FsHashEventProgress:
-				if tracker != nil && ev.CurrentFile != "" {
-					tracker.StartFile(ev.CurrentFile)
+				if ev.CurrentFile != currentFile {
+					currentFile = ev.CurrentFile
+					currentFileDoneBytes = 0
+				}
+				if tracker != nil {
+					if ev.CurrentFile != "" {
+						tracker.StartFile(ev.CurrentFile)
+					}
+					delta := ev.DoneBytes - currentFileDoneBytes
+					if delta > 0 {
+						tracker.AddBytes(delta)
+						currentFileDoneBytes = ev.DoneBytes
+					}
 				}
 			case protocol.FsHashEventEntry:
 				if ev.Entry != nil {
 					list = append(list, *ev.Entry)
 					if tracker != nil {
 						tracker.EndFile(ev.Entry.Path)
-						tracker.AddBytes(ev.Entry.Size)
+						var delta int64
+						if ev.Entry.Path == currentFile {
+							delta = ev.Entry.Size - currentFileDoneBytes
+						} else {
+							delta = ev.Entry.Size
+						}
+						if delta > 0 {
+							tracker.AddBytes(delta)
+						}
+						currentFile = ""
+						currentFileDoneBytes = 0
 						tracker.AddFile()
 					}
 				}
@@ -2164,19 +2187,41 @@ func HashLocalPath(localPath string, recursive bool, trackers ...*ProgressTracke
 	}
 
 	var list []protocol.FileInfo
+	var currentFile string
+	var currentFileDoneBytes int64
+
 	_, err := fsengine.HashStream(localPath, recursive, func(ev protocol.FsHashEvent) error {
 		switch ev.Event {
 		case protocol.FsHashEventInit:
 			tracker.AddTotals(ev.TotalFiles, ev.TotalBytes)
 		case protocol.FsHashEventProgress:
+			if ev.CurrentFile != currentFile {
+				currentFile = ev.CurrentFile
+				currentFileDoneBytes = 0
+			}
 			if ev.CurrentFile != "" {
 				tracker.StartFile(ev.CurrentFile)
+			}
+			delta := ev.DoneBytes - currentFileDoneBytes
+			if delta > 0 {
+				tracker.AddBytes(delta)
+				currentFileDoneBytes = ev.DoneBytes
 			}
 		case protocol.FsHashEventEntry:
 			if ev.Entry != nil {
 				list = append(list, *ev.Entry)
 				tracker.EndFile(ev.Entry.Path)
-				tracker.AddBytes(ev.Entry.Size)
+				var delta int64
+				if ev.Entry.Path == currentFile {
+					delta = ev.Entry.Size - currentFileDoneBytes
+				} else {
+					delta = ev.Entry.Size
+				}
+				if delta > 0 {
+					tracker.AddBytes(delta)
+				}
+				currentFile = ""
+				currentFileDoneBytes = 0
 				tracker.AddFile()
 			}
 		}

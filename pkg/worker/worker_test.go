@@ -459,7 +459,76 @@ func TestWorker_FsHash_RealSocketDisconnect(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 }
 
+// 验证面对密集小文件并发哈希时，服务端对网络 Flush 执行 100ms 节流合并（Batching），
+// 并验证大文件 Progress 事件与 Init/Done 事件立即 Flush，全量事件无损解析
+func TestWorker_FsHash_Stream_ThrottledFlushing_Batching(t *testing.T) {
+	tempDir := t.TempDir()
+	// 创建 30 个小文件
+	for i := 1; i <= 30; i++ {
+		_ = os.WriteFile(filepath.Join(tempDir, fmt.Sprintf("small_%02d.txt", i)), []byte(fmt.Sprintf("data_%d", i)), 0644)
+	}
 
+	w := &Worker{cfg: Config{DataDir: tempDir}}
+
+	flushCount := 0
+	flusherRecorder := &countingFlusherRecorder{
+		ResponseRecorder: httptest.NewRecorder(),
+		onFlush: func() {
+			flushCount++
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/fs/hash?path="+tempDir+"&recursive=true&stream=true", nil)
+	w.handleFsHash(flusherRecorder, req)
+
+	if flusherRecorder.Code != http.StatusOK {
+		t.Fatalf("handleFsHash stream failed: %d, body: %s", flusherRecorder.Code, flusherRecorder.Body.String())
+	}
+
+	// 验证所有事件均无损到达
+	scanner := bufio.NewScanner(flusherRecorder.Body)
+	var events []protocol.FsHashEvent
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var ev protocol.FsHashEvent
+		if err := json.Unmarshal(line, &ev); err != nil {
+			t.Fatalf("unmarshal event failed: %v, line: %s", err, string(line))
+		}
+		events = append(events, ev)
+	}
+
+	// 30 个文件 + 1 个 Init + 1 个 Done = 32 个事件
+	if len(events) != 32 {
+		t.Fatalf("expected 32 events (1 init + 30 entries + 1 done), got %d", len(events))
+	}
+
+	if events[0].Event != protocol.FsHashEventInit || events[0].TotalFiles != 30 {
+		t.Fatalf("unexpected init event: %+v", events[0])
+	}
+	if events[len(events)-1].Event != protocol.FsHashEventDone || events[len(events)-1].TotalFiles != 30 {
+		t.Fatalf("unexpected done event: %+v", events[len(events)-1])
+	}
+
+	// 核心断言：32 个事件在毫秒级内跑完，经 100ms 节流合并后，Flush 调用次数必须远小于 30（发生显著 Batching 攒批）
+	if flushCount >= 20 {
+		t.Fatalf("expected flushCount to be throttled/batched (< 20), got %d flushes for 32 events", flushCount)
+	}
+}
+
+type countingFlusherRecorder struct {
+	*httptest.ResponseRecorder
+	onFlush func()
+}
+
+func (c *countingFlusherRecorder) Flush() {
+	if c.onFlush != nil {
+		c.onFlush()
+	}
+	c.ResponseRecorder.Flush()
+}
 
 func TestWorker_JobHandlersAndHealth(t *testing.T) {
 	tempDir, err := os.MkdirTemp("", "cw_worker_jobs_test_*")

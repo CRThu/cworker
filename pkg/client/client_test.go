@@ -1793,6 +1793,144 @@ func TestClient_HashRemotePath_NDJSON_Stream(t *testing.T) {
 	}
 }
 
+// 验证大文件计算哈希过程中，客户端能实时捕获并累加分块进度 (FsHashEventProgress)，
+// 确保字节数与进度条在单个大文件计算期间持续递增，而不是仅在文件结束时暴涨
+func TestClient_HashRemotePath_LargeFile_IncrementalStreaming(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		rw.Header().Set("Content-Type", "application/x-ndjson")
+		enc := json.NewEncoder(rw)
+		flusher := rw.(http.Flusher)
+
+		// 1. Init
+		_ = enc.Encode(protocol.FsHashEvent{
+			Event:      protocol.FsHashEventInit,
+			TotalFiles: 1,
+			TotalBytes: 12 * 1024 * 1024,
+		})
+		flusher.Flush()
+		time.Sleep(5 * time.Millisecond)
+
+		// 2. Progress step 1: 4MB
+		_ = enc.Encode(protocol.FsHashEvent{
+			Event:       protocol.FsHashEventProgress,
+			CurrentFile: "big.iso",
+			DoneBytes:   4 * 1024 * 1024,
+			TotalBytes:  12 * 1024 * 1024,
+		})
+		flusher.Flush()
+		time.Sleep(5 * time.Millisecond)
+
+		// 3. Progress step 2: 8MB
+		_ = enc.Encode(protocol.FsHashEvent{
+			Event:       protocol.FsHashEventProgress,
+			CurrentFile: "big.iso",
+			DoneBytes:   8 * 1024 * 1024,
+			TotalBytes:  12 * 1024 * 1024,
+		})
+		flusher.Flush()
+		time.Sleep(5 * time.Millisecond)
+
+		// 4. Entry: 12MB complete
+		_ = enc.Encode(protocol.FsHashEvent{
+			Event: protocol.FsHashEventEntry,
+			Entry: &protocol.FileInfo{
+				Name:    "big.iso",
+				Path:    "big.iso",
+				Size:    12 * 1024 * 1024,
+				SHA256:  "fake-hash-big",
+				ModTime: time.Now(),
+			},
+		})
+		flusher.Flush()
+		time.Sleep(5 * time.Millisecond)
+
+		// 5. Done
+		_ = enc.Encode(protocol.FsHashEvent{
+			Event:      protocol.FsHashEventDone,
+			TotalFiles: 1,
+			TotalBytes: 12 * 1024 * 1024,
+		})
+		flusher.Flush()
+	}))
+	defer server.Close()
+
+	cli := NewClient()
+	cli.dataDir = t.TempDir()
+
+	u, _ := url.Parse(server.URL)
+	var observedBytes []int64
+	tracker := NewProgressTracker(0, 0)
+	tracker.SetOutput(io.Discard)
+	tracker.SetTTY(false)
+	tracker.SetHeartbeatInterval(time.Millisecond)
+	tracker.SetUpdateCallback(func(snap ProgressSnapshot) {
+		observedBytes = append(observedBytes, snap.TransferredBytes)
+	})
+
+	list, err := cli.HashRemotePath(context.Background(), u.Host, "big.iso", false, tracker)
+	if err != nil {
+		t.Fatalf("HashRemotePath failed: %v", err)
+	}
+	if len(list) != 1 || list[0].SHA256 != "fake-hash-big" {
+		t.Fatalf("unexpected list: %+v", list)
+	}
+
+	snap := tracker.Snapshot()
+	if snap.TransferredBytes != 12*1024*1024 {
+		t.Fatalf("expected 12MB total transferred bytes, got: %d", snap.TransferredBytes)
+	}
+	if snap.CompletedFiles != 1 {
+		t.Fatalf("expected 1 completed file, got: %d", snap.CompletedFiles)
+	}
+
+	// 核心断言：必须在中间捕获到了分块渐增的字节数（4MB 和 8MB），证明增量进度生效
+	hasIntermediateProgress := false
+	for _, b := range observedBytes {
+		if b > 0 && b < 12*1024*1024 {
+			hasIntermediateProgress = true
+			break
+		}
+	}
+	if !hasIntermediateProgress {
+		t.Fatalf("expected intermediate incremental bytes to be observed during progress events, got updates: %v", observedBytes)
+	}
+}
+
+// 验证本地 HashLocalPath 也能正确累加总字节数与完成文件数
+func TestClient_HashLocalPath_LargeFile_Streaming(t *testing.T) {
+	tempDir := t.TempDir()
+	largePath := filepath.Join(tempDir, "large_local.bin")
+	targetSize := 12 * 1024 * 1024
+	chunk := bytes.Repeat([]byte("A"), 1024*1024)
+	f, err := os.Create(largePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 12; i++ {
+		_, _ = f.Write(chunk)
+	}
+	f.Close()
+
+	tracker := NewProgressTracker(0, 0)
+	tracker.SetOutput(io.Discard)
+
+	list, err := HashLocalPath(largePath, false, tracker)
+	if err != nil {
+		t.Fatalf("HashLocalPath failed: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(list))
+	}
+
+	snap := tracker.Snapshot()
+	if snap.TransferredBytes != int64(targetSize) {
+		t.Fatalf("expected %d total bytes, got %d", targetSize, snap.TransferredBytes)
+	}
+	if snap.CompletedFiles != 1 {
+		t.Fatalf("expected 1 completed file, got %d", snap.CompletedFiles)
+	}
+}
+
 // 验证新版本客户端连接旧版本 Worker (仅返回普通 application/json) 时的完全向下兼容性与进度回退驱动
 func TestClient_HashRemotePath_LegacyWorker_Compatibility(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {

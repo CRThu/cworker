@@ -1159,6 +1159,7 @@ func (w *Worker) handleFsHash(rw http.ResponseWriter, r *http.Request) {
 		}
 
 		enc := json.NewEncoder(rw)
+		lastFlush := time.Now()
 		_, err = fsengine.HashStream(cleanPath, recursive, func(ev protocol.FsHashEvent) error {
 			if ctxErr := r.Context().Err(); ctxErr != nil {
 				return ctxErr
@@ -1167,10 +1168,24 @@ func (w *Worker) handleFsHash(rw http.ResponseWriter, r *http.Request) {
 				return encErr
 			}
 			if hasFlusher {
-				flusher.Flush()
+				now := time.Now()
+				// 节流推送策略：
+				// 1. 任务初始化 (Init) 与完成 (Done) 立即推，保证首尾毫秒级响应；
+				// 2. 大文件分块进度 (Progress) 立即推，保证连接看门狗与实时心跳；
+				// 3. 密集小文件条目 (Entry) 按 100ms 时间窗口合并 Flush，消除高频碎包对网络的严重占用。
+				if ev.Event == protocol.FsHashEventInit ||
+					ev.Event == protocol.FsHashEventDone ||
+					ev.Event == protocol.FsHashEventProgress ||
+					now.Sub(lastFlush) >= 100*time.Millisecond {
+					flusher.Flush()
+					lastFlush = now
+				}
 			}
 			return nil
 		})
+		if hasFlusher {
+			flusher.Flush()
+		}
 		if err != nil {
 			errEv := protocol.FsHashEvent{
 				Event: protocol.FsHashEventType("error"),
