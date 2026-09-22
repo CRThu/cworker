@@ -2,6 +2,10 @@
 
 > 本文档专为 AI Agent（如 Claude Code、OpenCode、Cursor、Codex、Antigravity 等）、自动化脚本与 LLM 工具链编写，旨在提供最高确定性、无歧义的 `cw` 工具调用规范。
 
+- **官方仓库**：[https://github.com/crthu/cworker](https://github.com/crthu/cworker)
+- **权威部署**：`~/.cworker/bin/cw.exe`
+- **自升级指令**：`cw update -y`（从 GitHub Releases 自动拉包原子替换升级）
+
 ---
 
 ## 一、给 Agent 的核心特性与边界认知

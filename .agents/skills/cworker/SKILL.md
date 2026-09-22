@@ -8,6 +8,10 @@ description: >-
 
 # cworker (cw) Agent Guide
 
+- **Official Repository**: [https://github.com/crthu/cworker](https://github.com/crthu/cworker)
+- **Primary Binary**: `cw` / `cw.exe` (Default deployment: `~/.cworker/bin/cw.exe`)
+- **Self-Update**: Use `cw update -y` to upgrade `cworker` non-interactively to the latest GitHub release.
+
 ## 1. Safety & Execution Rules
 
 - **Native Host OS (Zero Sandbox) & Confirmation Gate**:
@@ -23,7 +27,7 @@ description: >-
 - **Unified Local & Remote Support**: All file commands (`cp`, `diff`, `cat`, `ls`, `md`, `rm`) natively support local paths (`[<node>:]<path>`). You can operate on local files, local directories, or cross-node seamlessly without switching tools.
 - **Execution Modes (`cw run`)**:
   - **Async Long-running (Default)**: `cw run` returns immediately with a `job-<hex>` handle. Do not block; poll status with `cw ps` or inspect output with `cw logs <job_id>`.
-  - **Foreground Sync with Auto-cleanup (Recommended for Probing: `-wc`)**: Use `cw run -wc "<cmd>"` (or `-w --clean`) for immediate tasks (e.g. `git status`, probes). It streams output live, propagates the remote ExitCode directly to the CLI, and auto-destroys the job and log files upon exit without polluting `cw ps`.
+  - **Foreground Sync with Auto-cleanup (Recommended for Probing: `-wc`)**: Use `cw run -wc "<cmd>"` (or `-w --clean`) for immediate tasks (e.g. `git status`, environment probing, short scripts). It streams output live, propagates the remote ExitCode directly to the CLI, and auto-destroys the job and log files upon exit without polluting `cw ps`.
 - **Process Tree Cleanup**: `cw kill <job_id>` uses Win32 Job Objects to terminate the entire process hierarchy without leaving orphan processes. On `-w` synchronous runs, keyboard interrupts (Ctrl+C) automatically terminate the remote process tree and clean up.
 - **`cw clean` MUST include `-y`**:
   - **Single Job Cleanup**: `cw clean [<node>:]<job_id> -y` deletes the specific finished job record and logs.
@@ -56,62 +60,62 @@ description: >-
 | **Remove** | `cw rm -r -y [<node>:]<path>` | Non-interactive recursive deletion on remote or local |
 | **Web Console** | `cw ui [--port <p>] [--no-open]` | Local Web console (127.0.0.1; foreground blocking server; embedded Svelte SPA) |
 | **Service Control**| `cw service <start\|stop\|status>` | Manages background service (requires Admin) |
-| **Update** | `cw update [-y] [--check] [--force] [--proxy <url>] [--mirror <url>]` | Manual self-update from GitHub (`crthu/cworker`); auto detects registry proxy; aborts if jobs running |
+| **Update** | `cw update [-y] [--check] [--force] [--proxy <url>] [--mirror <url>]` | Self-update from GitHub (`crthu/cworker`); auto detects registry proxy; atomic rename-replace |
 | **Version** | `cw -v` / `cw version` | Outputs version, build date, Go runtime |
 
 ## 3. Core Agent Workflows
 
-### Pattern 1: Async Dispatch & Poll
+### Pattern 1: Rapid Probing & Synchronous Execution (-wc)
+```bash
+# Execute immediate command synchronously with auto-cleanup (zero leftovers in cw ps)
+cw run -n desktop-4090 -wc "nvidia-smi"
+cw run -n desktop-4090 -wc --dir "D:/workspace" "git status"
+```
+
+### Pattern 2: Async Dispatch & Poll
 ```bash
 # 1. Dispatch and extract job handle
 cw run -n desktop-4090 --dir "D:/workspace" "python train.py"
 # Output: [OK] Job job-1a2b3c4d dispatched to node 'desktop-4090' (PID: 12345)
 
-# 2. Poll status until COMPLETED or FAILED
+# 2. Poll status until COMPLETED or FAILED (RUNNING tasks are always pinned to top)
 cw ps
 
 # 3. If FAILED, inspect trailing logs for root cause (direct node targeting recommended)
 cw logs desktop-4090:job-1a2b3c4d -n 100
-# Or omit node to search across the entire cluster:
-# cw logs job-1a2b3c4d -n 100
+# Or inspect startup issues with --head:
+# cw logs desktop-4090:job-1a2b3c4d --head 50
 ```
 
-### Pattern 2: Remote File Staging & Cleanup
+### Pattern 3: Remote File Staging, Pre-flight Diff & Cleanup
 ```bash
-# 1. Prepare directory and upload input (single file or recursive directory)
+# 1. Prepare directory and upload input
 cw md desktop-4090:D:/tmp/work
-cw cp ./input.csv desktop-4090:D:/tmp/work/input.csv
-# Or upload entire local project directory recursively:
 cw cp -r ./project_dir desktop-4090:D:/tmp/work
 
-# 2. Execute task & inspect results
+# 2. Pre-flight diff verification before sync (exit code: 0=identical, 1=different, 2=error)
+cw diff -r ./project_dir desktop-4090:D:/tmp/work
+
+# 3. Execute task & inspect results
 cw run -n desktop-4090 --dir "D:/tmp/work" "python process.py"
 cw cat desktop-4090:D:/tmp/work/result.json
 
-# 3. Mandatory cleanup (always use -r -y)
+# 4. Mandatory cleanup (always use -r -y)
 cw rm -r -y desktop-4090:D:/tmp/work
 ```
 
-### Pattern 3: Runaway Process Termination
+### Pattern 4: Runaway Process Termination
 ```bash
-# Inspect high CPU tasks and terminate whole process tree (direct node targeting recommended)
+# Inspect high CPU tasks and terminate whole Win32 process tree (direct node targeting recommended)
 cw ps
 cw kill desktop-4090:job-1a2b3c4d
-# Or omit node to broadcast kill across the entire cluster:
-# cw kill job-1a2b3c4d
-```
-
-### Pattern 4: Pre-flight Diff Verification & Selective Sync
-```bash
-# 1. Compare directory trees before sync (exit code: 0=identical, 1=different, 2=error)
-cw diff -r ./src desktop-4090:D:/workspace/src
-
-# 2. If differences exist, sync remote directory
-cw cp -r ./src desktop-4090:D:/workspace/src
 ```
 
 ### Pattern 5: Finished Jobs & Disk Log Retention Cleanup
 ```bash
+# Clean a single finished job and remove its disk log
+cw clean desktop-4090:job-1a2b3c4d -y
+
 # Clean jobs older than 7 days across all nodes (always include -y to prevent CLI blocking)
 cw clean --days 7 -y
 
