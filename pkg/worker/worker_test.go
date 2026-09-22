@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -845,6 +846,71 @@ func TestWorker_FsMakeDir_And_Remove_EdgeCases(t *testing.T) {
 		t.Fatal("file should have been removed")
 	}
 }
+
+func TestWorker_FsRemove_Streaming(t *testing.T) {
+	tempDir := t.TempDir()
+	w, err := NewWorker(Config{
+		Name:     "test-rm-worker",
+		BindAddr: "127.0.0.1",
+		Port:     0,
+		DataDir:  tempDir,
+	})
+	if err != nil {
+		t.Fatalf("create worker failed: %v", err)
+	}
+
+	// 准备包含 10 个文件的多层级测试目录
+	streamDir := filepath.Join(tempDir, "stream_rm")
+	for i := 0; i < 3; i++ {
+		sub := filepath.Join(streamDir, fmt.Sprintf("sub_%d", i))
+		_ = os.MkdirAll(sub, 0755)
+		for j := 0; j < 3; j++ {
+			_ = os.WriteFile(filepath.Join(sub, fmt.Sprintf("file_%d.txt", j)), []byte("data"), 0644)
+		}
+	}
+	// 额外加一个根级文件: 总共 1(streamDir) + 3(sub) + 9(files) + 1 = 14 项
+	_ = os.WriteFile(filepath.Join(streamDir, "root.txt"), []byte("root"), 0644)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/fs/rm?path="+streamDir+"&recursive=true&stream=true", nil)
+	w.handleFsRemove(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "application/x-ndjson") {
+		t.Fatalf("expected application/x-ndjson content type, got: %s", ct)
+	}
+
+	// 解析返回的 NDJSON 事件
+	dec := json.NewDecoder(rec.Body)
+	var gotDone bool
+	var finalCount int64
+	for {
+		var ev protocol.FsRmEvent
+		if err := dec.Decode(&ev); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			t.Fatalf("decode FsRmEvent failed: %v", err)
+		}
+		if ev.Event == protocol.FsRmEventDone {
+			gotDone = true
+			finalCount = ev.RemovedCount
+		}
+	}
+
+	if !gotDone {
+		t.Fatal("expected FsRmEventDone in stream output")
+	}
+	if finalCount != 14 {
+		t.Fatalf("expected 14 items deleted, got %d", finalCount)
+	}
+	if _, err := os.Stat(streamDir); !os.IsNotExist(err) {
+		t.Fatal("streamDir should be physically removed")
+	}
+}
+
 
 func TestWorker_StreamLogs_WebSocket(t *testing.T) {
 	tempDir, err := os.MkdirTemp("", "cw_worker_ws_test_*")

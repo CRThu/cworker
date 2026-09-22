@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"cworker/pkg/pathutil"
@@ -440,34 +441,178 @@ func MakeDir(dirPath string) error {
 	return os.MkdirAll(cleanPath, 0755)
 }
 
-// Remove 安全删除文件或目录 (非空目录必须显式指定 recursive)
+// FsRmProgressFunc 进度回调函数，用于流式报告已删除项数
+type FsRmProgressFunc func(removedCount int64)
+
+func removeSingleItem(path string) error {
+	err := os.Remove(path)
+	if err != nil && os.IsPermission(err) {
+		_ = os.Chmod(path, 0666)
+		err = os.Remove(path)
+	}
+	return err
+}
+
+func removeDirTree(ctx context.Context, dirPath string, count *int64) error {
+	if ctx != nil && ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	f, err := os.Open(dirPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+
+	var readErr error
+	for {
+		if ctx != nil && ctx.Err() != nil {
+			_ = f.Close()
+			return ctx.Err()
+		}
+
+		entries, rErr := f.ReadDir(1024)
+		if rErr != nil {
+			if rErr != io.EOF {
+				readErr = rErr
+			}
+			break
+		}
+
+		for _, entry := range entries {
+			childPath := filepath.Join(dirPath, entry.Name())
+
+			// 若为符号链接或 Windows Junction，不可递归深入其目标，直接解除链接
+			if entry.Type()&os.ModeSymlink != 0 {
+				if err := removeSingleItem(childPath); err != nil && !os.IsNotExist(err) {
+					_ = f.Close()
+					return err
+				}
+				atomic.AddInt64(count, 1)
+				continue
+			}
+
+			if entry.IsDir() {
+				if err := removeDirTree(ctx, childPath, count); err != nil {
+					_ = f.Close()
+					return err
+				}
+			} else {
+				if err := removeSingleItem(childPath); err != nil && !os.IsNotExist(err) {
+					_ = f.Close()
+					return err
+				}
+				atomic.AddInt64(count, 1)
+			}
+		}
+	}
+	_ = f.Close()
+
+	if readErr != nil {
+		return readErr
+	}
+
+	// 删除当前目录本身
+	if err := removeSingleItem(dirPath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	atomic.AddInt64(count, 1)
+	return nil
+}
+
+// Remove 安全删除文件或目录 (非空目录必须显式指定 recursive, 统一委托给 RemoveWithProgress, SSOT)
 func Remove(targetPath string, recursive bool) error {
+	_, err := RemoveWithProgress(context.Background(), targetPath, recursive, nil)
+	return err
+}
+
+// RemoveWithProgress 安全删除文件或目录并支持流式项数统计与上下文中断 (SSOT)
+func RemoveWithProgress(ctx context.Context, targetPath string, recursive bool, onProgress FsRmProgressFunc) (int64, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	cleanPath, err := pathutil.NormalizeLocalPath(targetPath)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
-	fi, err := os.Stat(cleanPath)
+	fi, err := os.Lstat(cleanPath)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
-	if fi.IsDir() {
-		if !recursive {
-			entries, err := os.ReadDir(cleanPath)
-			if err != nil {
-				return err
-			}
-			if len(entries) > 0 {
-				return ErrNonEmptyDirRequiresRecursive
-			}
-			return os.Remove(cleanPath)
+	// 1. 单文件或符号链接
+	if !fi.IsDir() {
+		if err := removeSingleItem(cleanPath); err != nil {
+			return 0, err
 		}
-		return os.RemoveAll(cleanPath)
+		if onProgress != nil {
+			onProgress(1)
+		}
+		return 1, nil
 	}
 
-	return os.Remove(cleanPath)
+	// 2. 目录但未指定递归
+	if !recursive {
+		f, err := os.Open(cleanPath)
+		if err != nil {
+			return 0, err
+		}
+		entries, err := f.ReadDir(1)
+		_ = f.Close()
+		if err != nil && err != io.EOF {
+			return 0, err
+		}
+		if len(entries) > 0 {
+			return 0, ErrNonEmptyDirRequiresRecursive
+		}
+		if err := removeSingleItem(cleanPath); err != nil {
+			return 0, err
+		}
+		if onProgress != nil {
+			onProgress(1)
+		}
+		return 1, nil
+	}
+
+	// 3. 递归删除目录树 (DFS 单遍遍历即删，零预扫，节流汇报)
+	var count int64
+	var stopTicker chan struct{}
+	if onProgress != nil {
+		stopTicker = make(chan struct{})
+		defer func() {
+			close(stopTicker)
+		}()
+		go func() {
+			ticker := time.NewTicker(100 * time.Millisecond)
+			defer ticker.Stop()
+			var lastReported int64
+			for {
+				select {
+				case <-stopTicker:
+					return
+				case <-ticker.C:
+					cur := atomic.LoadInt64(&count)
+					if cur != lastReported {
+						lastReported = cur
+						onProgress(cur)
+					}
+				}
+			}
+		}()
+	}
+
+	err = removeDirTree(ctx, cleanPath, &count)
+	finalCount := atomic.LoadInt64(&count)
+	if onProgress != nil {
+		onProgress(finalCount)
+	}
+	return finalCount, err
 }
+
 
 // SaveStreamWithValidator 将输入流原子落盘至指定目标文件，并在原子替换提交前执行校验回调 (SSOT)
 func SaveStreamWithValidator(dstPath string, r io.Reader, validator func(computedHash string) error) (string, error) {

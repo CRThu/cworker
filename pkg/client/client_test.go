@@ -2822,6 +2822,82 @@ func TestClient_UnifiedLocalFS(t *testing.T) {
 	}
 }
 
+func TestClient_DeleteWithProgress_RemoteAndLocal(t *testing.T) {
+	tempProfile := t.TempDir()
+	t.Setenv("USERPROFILE", tempProfile)
+
+	cli := NewClient()
+
+	// 1. 本地删除与进度跟踪
+	localDir := filepath.Join(tempProfile, "local_del")
+	_ = os.MkdirAll(localDir, 0755)
+	for i := 0; i < 5; i++ {
+		_ = os.WriteFile(filepath.Join(localDir, fmt.Sprintf("%d.txt", i)), []byte("a"), 0644)
+	}
+	var localProg int64
+	count, err := cli.DeleteWithProgress(context.Background(), "", localDir, true, func(c int64) {
+		localProg = c
+	})
+	if err != nil {
+		t.Fatalf("local DeleteWithProgress failed: %v", err)
+	}
+	if count != 6 || localProg != 6 { // 5 files + 1 dir = 6
+		t.Fatalf("expected count 6, got count=%d, prog=%d", count, localProg)
+	}
+
+	// 2. 远端 NDJSON 流式删除
+	remoteServer := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/v1/fs/rm") {
+			rw.Header().Set("Content-Type", "application/x-ndjson")
+			rw.WriteHeader(http.StatusOK)
+			enc := json.NewEncoder(rw)
+			_ = enc.Encode(protocol.FsRmEvent{Event: protocol.FsRmEventProgress, RemovedCount: 50})
+			_ = enc.Encode(protocol.FsRmEvent{Event: protocol.FsRmEventProgress, RemovedCount: 100})
+			_ = enc.Encode(protocol.FsRmEvent{Event: protocol.FsRmEventDone, RemovedCount: 120})
+			return
+		}
+		http.NotFound(rw, r)
+	}))
+	defer remoteServer.Close()
+
+	u, _ := url.Parse(remoteServer.URL)
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "rm-stream-node", Target: u.Host})
+
+	var remoteProg int64
+	count, err = cli.DeleteWithProgress(context.Background(), "rm-stream-node", "D:/remote/dir", true, func(c int64) {
+		remoteProg = c
+	})
+	if err != nil {
+		t.Fatalf("remote DeleteWithProgress failed: %v", err)
+	}
+	if count != 120 || remoteProg != 120 {
+		t.Fatalf("expected count 120, got count=%d, prog=%d", count, remoteProg)
+	}
+
+	// 3. 远端旧版 Worker 兼容测试 (返回纯文本 DELETED)
+	legacyServer := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/v1/fs/rm") {
+			rw.WriteHeader(http.StatusOK)
+			_, _ = rw.Write([]byte("DELETED"))
+			return
+		}
+		http.NotFound(rw, r)
+	}))
+	defer legacyServer.Close()
+
+	uLeg, _ := url.Parse(legacyServer.URL)
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "rm-legacy-node", Target: uLeg.Host})
+
+	count, err = cli.DeleteWithProgress(context.Background(), "rm-legacy-node", "D:/remote/old", true, nil)
+	if err != nil {
+		t.Fatalf("legacy DeleteWithProgress failed: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected count 0 for legacy worker, got %d", count)
+	}
+}
+
+
 // 验证任务全网并发发现与 Fast-path 熔断短路逻辑
 func TestClient_FindJobWorkerWithContext_FastPathConcurrent(t *testing.T) {
 	// Worker 1: 含有目标任务，立即返回

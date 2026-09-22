@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -1355,40 +1356,95 @@ func (c *Client) MakeDirWithContext(ctx context.Context, node, remotePath string
 	return nil
 }
 
+// FsRmProgressFunc 进度回调类型
+type FsRmProgressFunc = fsengine.FsRmProgressFunc
+
 func (c *Client) Delete(node, remotePath string, recursive bool) error {
 	return c.DeleteWithContext(context.Background(), node, remotePath, recursive)
 }
 
 func (c *Client) DeleteWithContext(ctx context.Context, node, remotePath string, recursive bool) error {
+	_, err := c.DeleteWithProgress(ctx, node, remotePath, recursive, nil)
+	return err
+}
+
+// DeleteWithProgress 安全删除文件或目录并支持流式项数统计与回调 (SSOT)
+func (c *Client) DeleteWithProgress(ctx context.Context, node, remotePath string, recursive bool, onProgress FsRmProgressFunc) (int64, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if node == "" {
 		cleanLocal, err := pathutil.NormalizeLocalPath(remotePath)
 		if err != nil {
-			return err
+			return 0, err
 		}
-		return fsengine.Remove(cleanLocal, recursive)
+		return fsengine.RemoveWithProgress(ctx, cleanLocal, recursive, onProgress)
 	}
 
 	rt, err := c.ResolveWorker(node, "")
 	if err != nil {
-		return err
+		return 0, err
 	}
 
-	path := fmt.Sprintf("/api/v1/fs/rm?path=%s&recursive=%t", url.QueryEscape(remotePath), recursive)
-	resp, err := c.doStreamRequestWithContext(ctx, rt, http.MethodPost, path, nil)
+	path := fmt.Sprintf("/api/v1/fs/rm?path=%s&recursive=%t&stream=true", url.QueryEscape(remotePath), recursive)
+	resp, err := c.doStreamRequestWithContext(ctx, rt, http.MethodPost, path, nil, func(req *http.Request) {
+		req.Header.Set("Accept", "application/x-ndjson")
+	})
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("delete failed (%d): %s", resp.StatusCode, string(body))
+		return 0, fmt.Errorf("delete failed (%d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
-	return nil
+
+	contentType := resp.Header.Get("Content-Type")
+	var finalCount int64
+
+	// 若远端支持 NDJSON 流式反馈
+	if strings.Contains(contentType, "application/x-ndjson") {
+		scanner := bufio.NewScanner(resp.Body)
+		buf := make([]byte, 64*1024)
+		scanner.Buffer(buf, 1024*1024)
+
+		for scanner.Scan() {
+			line := scanner.Bytes()
+			if len(bytes.TrimSpace(line)) == 0 {
+				continue
+			}
+			var ev protocol.FsRmEvent
+			if err := json.Unmarshal(line, &ev); err != nil {
+				continue
+			}
+			switch ev.Event {
+			case protocol.FsRmEventProgress:
+				finalCount = ev.RemovedCount
+				if onProgress != nil {
+					onProgress(finalCount)
+				}
+			case protocol.FsRmEventDone:
+				finalCount = ev.RemovedCount
+				if onProgress != nil {
+					onProgress(finalCount)
+				}
+				return finalCount, nil
+			case protocol.FsRmEventError:
+				return finalCount, errors.New(ev.Error)
+			}
+		}
+		if err := scanner.Err(); err != nil && !errors.Is(err, io.EOF) {
+			return finalCount, fmt.Errorf("stream read error: %w", err)
+		}
+		return finalCount, nil
+	}
+
+	// 兼容旧版 Worker (返回普通文本 DELETED)
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return 0, nil
 }
+
 
 func (c *Client) RelayCopy(srcNode, srcPath, dstNode, dstPath string, trackers ...*ProgressTracker) error {
 	return c.RelayCopyWithContext(context.Background(), srcNode, srcPath, dstNode, dstPath, trackers...)

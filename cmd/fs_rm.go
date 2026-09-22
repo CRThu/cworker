@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"cworker/pkg/client"
@@ -47,11 +48,12 @@ var rmCmd = &cobra.Command{
 		cli := client.NewClient()
 		startTime := time.Now()
 		interval := client.GetDefaultHeartbeatInterval()
+		isTTY := client.IsTerminal()
 
+		var removedCount int64
 		var stopHeartbeat chan struct{}
 		if rmRecursive {
 			stopHeartbeat = make(chan struct{})
-			isTTY := client.IsTerminal()
 			go func() {
 				ticker := time.NewTicker(interval)
 				defer ticker.Stop()
@@ -60,37 +62,72 @@ var rmCmd = &cobra.Command{
 					case <-stopHeartbeat:
 						return
 					case <-ticker.C:
+						count := atomic.LoadInt64(&removedCount)
 						elapsed := time.Since(startTime).Truncate(time.Second)
 						if isTTY {
-							fmt.Printf("\rDeleting '%s'... (elapsed %s)  ", targetName, elapsed)
+							if count > 0 {
+								sec := time.Since(startTime).Seconds()
+								speed := 0.0
+								if sec > 0.05 {
+									speed = float64(count) / sec
+								}
+								fmt.Printf("\rDeleting '%s'... %s items removed (%s items/s, elapsed %s)  ",
+									targetName, client.FormatCount(count), client.FormatCount(int64(speed)), elapsed)
+							} else {
+								fmt.Printf("\rDeleting '%s'... (elapsed %s)  ", targetName, elapsed)
+							}
 						} else {
-							fmt.Printf("[cworker] Deleting '%s' (elapsed %s)...\n", targetName, elapsed)
+							if count > 0 {
+								fmt.Printf("[cworker] Deleting '%s'... %s items removed (elapsed %s)...\n",
+									targetName, client.FormatCount(count), elapsed)
+							} else {
+								fmt.Printf("[cworker] Deleting '%s' (elapsed %s)...\n", targetName, elapsed)
+							}
 						}
 					}
 				}
 			}()
 		}
 
-		err := cli.DeleteWithContext(cmdContext(cmd), node, path, rmRecursive)
+		progressCb := func(count int64) {
+			atomic.StoreInt64(&removedCount, count)
+			if isTTY {
+				elapsed := time.Since(startTime).Truncate(time.Second)
+				sec := time.Since(startTime).Seconds()
+				speed := 0.0
+				if sec > 0.05 {
+					speed = float64(count) / sec
+				}
+				fmt.Printf("\rDeleting '%s'... %s items removed (%s items/s, elapsed %s)  ",
+					targetName, client.FormatCount(count), client.FormatCount(int64(speed)), elapsed)
+			}
+		}
+
+		finalCount, err := cli.DeleteWithProgress(cmdContext(cmd), node, path, rmRecursive, progressCb)
 		if stopHeartbeat != nil {
 			close(stopHeartbeat)
 		}
 
 		elapsed := time.Since(startTime)
+		hasPrintedTTY := isTTY && (elapsed >= interval || atomic.LoadInt64(&removedCount) > 0)
 
 		if err != nil {
-			if client.IsTerminal() && elapsed >= interval {
+			if hasPrintedTTY {
 				fmt.Println()
 			}
 			return fmt.Errorf("delete failed: %w", err)
 		}
 
-		if client.IsTerminal() && elapsed >= interval {
+		if hasPrintedTTY {
 			fmt.Println()
 		}
 
 		if elapsed >= 3*time.Second {
-			fmt.Printf("[OK] Deleted '%s' in %s\n", targetName, elapsed.Truncate(10*time.Millisecond))
+			if finalCount > 1 {
+				fmt.Printf("[OK] Deleted '%s' (%s items) in %s\n", targetName, client.FormatCount(finalCount), elapsed.Truncate(10*time.Millisecond))
+			} else {
+				fmt.Printf("[OK] Deleted '%s' in %s\n", targetName, elapsed.Truncate(10*time.Millisecond))
+			}
 		} else {
 			fmt.Printf("[OK] Deleted '%s'\n", targetName)
 		}

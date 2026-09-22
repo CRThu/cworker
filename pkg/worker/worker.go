@@ -1101,6 +1101,74 @@ func (w *Worker) handleFsRemove(rw http.ResponseWriter, r *http.Request) {
 	}
 
 	recursive := r.URL.Query().Get("recursive") == "true"
+	isStream := r.URL.Query().Get("stream") == "true" || strings.Contains(r.Header.Get("Accept"), "application/x-ndjson")
+
+	// 快速预检错误 (路径不存在或非空目录未加 -r)，避免写入 200 Header 后才报错
+	fi, err := os.Lstat(cleanPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			http.Error(rw, "path not found", http.StatusNotFound)
+			return
+		}
+		http.Error(rw, "stat failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if fi.IsDir() && !recursive {
+		f, err := os.Open(cleanPath)
+		if err == nil {
+			entries, _ := f.ReadDir(1)
+			_ = f.Close()
+			if len(entries) > 0 {
+				http.Error(rw, "path is a non-empty directory, requires recursive flag (-r)", http.StatusBadRequest)
+				return
+			}
+		}
+	}
+
+	if isStream {
+		rw.Header().Set("Content-Type", "application/x-ndjson")
+		rw.WriteHeader(http.StatusOK)
+		flusher, hasFlusher := rw.(http.Flusher)
+		if hasFlusher {
+			flusher.Flush()
+		}
+
+		enc := json.NewEncoder(rw)
+		finalCount, err := fsengine.RemoveWithProgress(r.Context(), cleanPath, recursive, func(count int64) {
+			if r.Context().Err() != nil {
+				return
+			}
+			_ = enc.Encode(protocol.FsRmEvent{
+				Event:        protocol.FsRmEventProgress,
+				RemovedCount: count,
+			})
+			if hasFlusher {
+				flusher.Flush()
+			}
+		})
+
+		if err != nil {
+			_ = enc.Encode(protocol.FsRmEvent{
+				Event: protocol.FsRmEventError,
+				Error: err.Error(),
+			})
+			if hasFlusher {
+				flusher.Flush()
+			}
+			return
+		}
+
+		_ = enc.Encode(protocol.FsRmEvent{
+			Event:        protocol.FsRmEventDone,
+			RemovedCount: finalCount,
+		})
+		if hasFlusher {
+			flusher.Flush()
+		}
+		return
+	}
+
+	// 传统非流式模式 (向后兼容)
 	if err := fsengine.Remove(cleanPath, recursive); err != nil {
 		if os.IsNotExist(err) {
 			http.Error(rw, "path not found", http.StatusNotFound)

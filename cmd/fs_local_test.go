@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -276,3 +277,150 @@ func TestCmd_Rm_Local_LargeHierarchy_WithFiles(t *testing.T) {
 		t.Fatalf("rootDir should have been completely removed, got err: %v", err)
 	}
 }
+
+// 验证在 TTY 模式下接收到 NDJSON 流式事件时，原地刷新已删除项数与速率并给出最终完成统计
+func TestCmd_Rm_Streaming_TTY(t *testing.T) {
+	tempProfile := t.TempDir()
+	t.Setenv("USERPROFILE", tempProfile)
+
+	trueVal := true
+	client.SetTerminalOverride(&trueVal)
+	defer client.SetTerminalOverride(nil)
+
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/v1/fs/rm") {
+			rw.Header().Set("Content-Type", "application/x-ndjson")
+			rw.WriteHeader(http.StatusOK)
+			flusher, _ := rw.(http.Flusher)
+			enc := json.NewEncoder(rw)
+
+			_ = enc.Encode(protocol.FsRmEvent{Event: protocol.FsRmEventProgress, RemovedCount: 250})
+			if flusher != nil {
+				flusher.Flush()
+			}
+			time.Sleep(10 * time.Millisecond)
+
+			_ = enc.Encode(protocol.FsRmEvent{Event: protocol.FsRmEventDone, RemovedCount: 1520})
+			if flusher != nil {
+				flusher.Flush()
+			}
+			return
+		}
+		http.NotFound(rw, r)
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	cli := client.NewClient()
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "rm-stream-tty", Target: u.Host})
+
+	rmCmd.Flags().Set("recursive", "true")
+	rmCmd.Flags().Set("yes", "true")
+	defer func() {
+		rmCmd.Flags().Set("recursive", "false")
+		rmCmd.Flags().Set("yes", "false")
+	}()
+
+	oldStdout := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+
+	err := rmCmd.RunE(rmCmd, []string{"rm-stream-tty:D:/huge_backup"})
+
+	_ = w.Close()
+	os.Stdout = oldStdout
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, r)
+	output := buf.String()
+
+	if err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+
+	// 核心断言 1: 必须包含 TTY 原位刷新的已删项数提示
+	if !strings.Contains(output, "items removed") {
+		t.Fatalf("expected 'items removed' in TTY output, got:\n%s", output)
+	}
+	if !strings.Contains(output, "\rDeleting 'rm-stream-tty:D:/huge_backup'") {
+		t.Fatalf("expected TTY carriage return prompt, got:\n%s", output)
+	}
+
+	// 核心断言 2: 必须包含最终完成信息
+	if !strings.Contains(output, "[OK] Deleted 'rm-stream-tty:D:/huge_backup'") {
+		t.Fatalf("expected success message, got:\n%s", output)
+	}
+}
+
+// 验证在非 TTY 管道模式下，长耗时低频心跳能够携带已删项数汇报
+func TestCmd_Rm_Streaming_NonTTY(t *testing.T) {
+	tempProfile := t.TempDir()
+	t.Setenv("USERPROFILE", tempProfile)
+
+	client.SetDefaultHeartbeatInterval(25 * time.Millisecond)
+	defer client.SetDefaultHeartbeatInterval(5 * time.Second)
+
+	falseVal := false
+	client.SetTerminalOverride(&falseVal)
+	defer client.SetTerminalOverride(nil)
+
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/v1/fs/rm") {
+			rw.Header().Set("Content-Type", "application/x-ndjson")
+			rw.WriteHeader(http.StatusOK)
+			flusher, _ := rw.(http.Flusher)
+			enc := json.NewEncoder(rw)
+
+			_ = enc.Encode(protocol.FsRmEvent{Event: protocol.FsRmEventProgress, RemovedCount: 880})
+			if flusher != nil {
+				flusher.Flush()
+			}
+			time.Sleep(35 * time.Millisecond)
+
+			_ = enc.Encode(protocol.FsRmEvent{Event: protocol.FsRmEventDone, RemovedCount: 1200})
+			if flusher != nil {
+				flusher.Flush()
+			}
+			return
+		}
+		http.NotFound(rw, r)
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	cli := client.NewClient()
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "rm-stream-nontty", Target: u.Host})
+
+	rmCmd.Flags().Set("recursive", "true")
+	rmCmd.Flags().Set("yes", "true")
+	defer func() {
+		rmCmd.Flags().Set("recursive", "false")
+		rmCmd.Flags().Set("yes", "false")
+	}()
+
+	oldStdout := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+
+	err := rmCmd.RunE(rmCmd, []string{"rm-stream-nontty:D:/agent_backup"})
+
+	_ = w.Close()
+	os.Stdout = oldStdout
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, r)
+	output := buf.String()
+
+	if err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+
+	// 核心断言 1: 非 TTY 管道模式必须包含心跳
+	if !strings.Contains(output, "[cworker] Deleting 'rm-stream-nontty:D:/agent_backup'") {
+		t.Fatalf("expected non-TTY heartbeat in output, got:\n%s", output)
+	}
+
+	// 核心断言 2: 必须输出成功完成标识
+	if !strings.Contains(output, "[OK] Deleted 'rm-stream-nontty:D:/agent_backup'") {
+		t.Fatalf("expected deleted success output, got:\n%s", output)
+	}
+}
+

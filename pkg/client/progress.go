@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -395,6 +396,25 @@ func FormatSpeed(bytesPerSec float64) string {
 	default:
 		return fmt.Sprintf("%.0f B/s", bytesPerSec)
 	}
+}
+
+// FormatCount 将整数格式化为带千位分隔符的字符串 (例如 15200 -> "15,200")
+func FormatCount(n int64) string {
+	in := strconv.FormatInt(n, 10)
+	sign := ""
+	if strings.HasPrefix(in, "-") {
+		sign = "-"
+		in = in[1:]
+	}
+	var out strings.Builder
+	l := len(in)
+	for i, c := range in {
+		if i > 0 && (l-i)%3 == 0 {
+			out.WriteByte(',')
+		}
+		out.WriteRune(c)
+	}
+	return sign + out.String()
 }
 
 func (p *ProgressTracker) maybeRender(force bool) {

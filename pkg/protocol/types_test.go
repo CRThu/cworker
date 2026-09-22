@@ -241,3 +241,56 @@ func TestProtocol_FsHashEventSerialization(t *testing.T) {
 	}
 }
 
+func TestProtocol_FsRmEventSerialization(t *testing.T) {
+	// 1. Progress event
+	progEv := FsRmEvent{
+		Event:        FsRmEventProgress,
+		RemovedCount: 1520,
+	}
+	data, err := json.Marshal(progEv)
+	if err != nil {
+		t.Fatalf("marshal progress event failed: %v", err)
+	}
+	var progDecoded FsRmEvent
+	if err := json.Unmarshal(data, &progDecoded); err != nil {
+		t.Fatalf("unmarshal progress event failed: %v", err)
+	}
+	if progDecoded.Event != FsRmEventProgress || progDecoded.RemovedCount != 1520 {
+		t.Fatalf("progress event mismatch: %+v", progDecoded)
+	}
+
+	// 2. Done event
+	doneEv := FsRmEvent{
+		Event:        FsRmEventDone,
+		RemovedCount: 8848,
+	}
+	data, err = json.Marshal(doneEv)
+	if err != nil {
+		t.Fatalf("marshal done event failed: %v", err)
+	}
+	var doneDecoded FsRmEvent
+	if err := json.Unmarshal(data, &doneDecoded); err != nil {
+		t.Fatalf("unmarshal done event failed: %v", err)
+	}
+	if doneDecoded.Event != FsRmEventDone || doneDecoded.RemovedCount != 8848 {
+		t.Fatalf("done event mismatch: %+v", doneDecoded)
+	}
+
+	// 3. Error event
+	errEv := FsRmEvent{
+		Event: FsRmEventError,
+		Error: "permission denied",
+	}
+	data, err = json.Marshal(errEv)
+	if err != nil {
+		t.Fatalf("marshal error event failed: %v", err)
+	}
+	var errDecoded FsRmEvent
+	if err := json.Unmarshal(data, &errDecoded); err != nil {
+		t.Fatalf("unmarshal error event failed: %v", err)
+	}
+	if errDecoded.Event != FsRmEventError || errDecoded.Error != "permission denied" {
+		t.Fatalf("error event mismatch: %+v", errDecoded)
+	}
+}
+

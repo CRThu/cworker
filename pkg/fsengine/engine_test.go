@@ -165,6 +165,83 @@ func TestFsEngine_MakeDirAndRemove(t *testing.T) {
 	}
 }
 
+func TestFsEngine_RemoveWithProgress_Details(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// 1. 测试单文件删除与项数统计
+	singleFile := filepath.Join(tmpDir, "single.txt")
+	_ = os.WriteFile(singleFile, []byte("hello"), 0644)
+	var singleProg int64
+	count, err := RemoveWithProgress(context.Background(), singleFile, false, func(c int64) {
+		singleProg = c
+	})
+	if err != nil {
+		t.Fatalf("RemoveWithProgress single file failed: %v", err)
+	}
+	if count != 1 || singleProg != 1 {
+		t.Fatalf("expected count 1 and singleProg 1, got count=%d, prog=%d", count, singleProg)
+	}
+
+	// 2. 测试复杂多层级目录 (包含 20 个文件与 5 个子目录，总计 25+1=26 项)
+	treeRoot := filepath.Join(tmpDir, "tree")
+	expectedItems := int64(1) // 根目录自身
+	for d := 0; d < 5; d++ {
+		sub := filepath.Join(treeRoot, fmt.Sprintf("sub_%d", d))
+		_ = os.MkdirAll(sub, 0755)
+		expectedItems++ // 子目录
+		for f := 0; f < 4; f++ {
+			filePath := filepath.Join(sub, fmt.Sprintf("f_%d.bin", f))
+			_ = os.WriteFile(filePath, []byte("data"), 0644)
+			expectedItems++ // 文件
+		}
+	}
+
+	var lastProg int64
+	count, err = RemoveWithProgress(context.Background(), treeRoot, true, func(c int64) {
+		lastProg = c
+	})
+	if err != nil {
+		t.Fatalf("RemoveWithProgress tree failed: %v", err)
+	}
+	if count != expectedItems {
+		t.Fatalf("expected %d items, got %d", expectedItems, count)
+	}
+	if lastProg != expectedItems {
+		t.Fatalf("expected lastProg %d, got %d", expectedItems, lastProg)
+	}
+	if _, err := os.Stat(treeRoot); !os.IsNotExist(err) {
+		t.Fatalf("treeRoot should be physically deleted")
+	}
+
+	// 3. 测试 Windows 只读文件自愈删除
+	roDir := filepath.Join(tmpDir, "ro_dir")
+	_ = os.MkdirAll(roDir, 0755)
+	roFile := filepath.Join(roDir, "readonly.txt")
+	_ = os.WriteFile(roFile, []byte("readonly"), 0444)
+	_ = os.Chmod(roFile, 0444) // 锁定为只读
+
+	count, err = RemoveWithProgress(context.Background(), roDir, true, nil)
+	if err != nil {
+		t.Fatalf("RemoveWithProgress readonly file failed: %v", err)
+	}
+	if count != 2 { // 1 file + 1 dir = 2
+		t.Fatalf("expected 2 items removed, got %d", count)
+	}
+
+	// 4. 测试 Context 取消中断
+	cancelDir := filepath.Join(tmpDir, "cancel_dir")
+	_ = os.MkdirAll(cancelDir, 0755)
+	for i := 0; i < 50; i++ {
+		_ = os.WriteFile(filepath.Join(cancelDir, fmt.Sprintf("file_%d.txt", i)), []byte("x"), 0644)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // 预先取消
+	_, err = RemoveWithProgress(ctx, cancelDir, true, nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got: %v", err)
+	}
+}
+
 func TestFsEngine_SaveStream(t *testing.T) {
 	tmpDir := t.TempDir()
 	targetFile := filepath.Join(tmpDir, "stream", "nested", "file.txt")

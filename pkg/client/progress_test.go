@@ -292,6 +292,30 @@ func TestFormatSizeAndSpeed_NegativeValues(t *testing.T) {
 	}
 }
 
+func TestFormatCount(t *testing.T) {
+	tests := []struct {
+		input    int64
+		expected string
+	}{
+		{0, "0"},
+		{5, "5"},
+		{999, "999"},
+		{1000, "1,000"},
+		{15200, "15,200"},
+		{1234567, "1,234,567"},
+		{-500, "-500"},
+		{-15200, "-15,200"},
+	}
+
+	for _, tt := range tests {
+		got := FormatCount(tt.input)
+		if got != tt.expected {
+			t.Errorf("FormatCount(%d) = %q, expected %q", tt.input, got, tt.expected)
+		}
+	}
+}
+
+
 func TestIsSafeRelativePath(t *testing.T) {
 	cases := []struct {
 		path string

@@ -196,4 +196,20 @@ type FsHashEvent struct {
 	Error       string          `json:"error,omitempty"`
 }
 
+// FsRmEventType 表示文件/目录删除流式事件类型
+type FsRmEventType string
+
+const (
+	FsRmEventProgress FsRmEventType = "progress" // 正在删除，报告已删除项数
+	FsRmEventDone     FsRmEventType = "done"     // 删除完成，报告总删除项数
+	FsRmEventError    FsRmEventType = "error"    // 删除中途出错
+)
+
+// FsRmEvent 远端文件/目录删除的 NDJSON 流式事件 (单向流 SSOT)
+type FsRmEvent struct {
+	Event        FsRmEventType `json:"event"`
+	RemovedCount int64         `json:"removed_count,omitempty"`
+	Error        string        `json:"error,omitempty"`
+}
+
 
