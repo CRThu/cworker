@@ -3,7 +3,6 @@ package cmd
 import (
 	"os"
 
-	"cworker/pkg/client"
 	"cworker/pkg/pathutil"
 	"cworker/pkg/protocol"
 	"github.com/spf13/cobra"
@@ -22,7 +21,7 @@ var catCmd = &cobra.Command{
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		node, path := pathutil.ParseNodePath(args[0])
-		cli := client.NewClient()
+		cli := newCmdClient()
 		opts := protocol.TextSliceOptions{
 			Tail:      catTail,
 			Head:      catHead,

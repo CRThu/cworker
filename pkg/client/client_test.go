@@ -467,7 +467,7 @@ func TestClient_ListNodes_OfflineNode(t *testing.T) {
 	}
 }
 
-// TestClient_ListNodes_ProxyImmunity 验证 ListNodes 严格免疫系统外部 HTTP_PROXY 环境变量干扰
+// TestClient_ListNodes_ProxyImmunity 验证 ListNodes 针对本地环回的直连保护以及 WithNoProxy 选项的生效
 func TestClient_ListNodes_ProxyImmunity(t *testing.T) {
 	// 强行注入无法访问的黑洞代理地址
 	t.Setenv("HTTP_PROXY", "http://127.0.0.1:59999")
@@ -488,6 +488,8 @@ func TestClient_ListNodes_ProxyImmunity(t *testing.T) {
 	defer server.Close()
 
 	u, _ := url.Parse(server.URL)
+
+	// 1. 默认客户端自动保护环回直连
 	cli := NewClient()
 	cli.dataDir = t.TempDir()
 
@@ -502,6 +504,55 @@ func TestClient_ListNodes_ProxyImmunity(t *testing.T) {
 	}
 	if len(nodes) != 1 || nodes[0].Status != protocol.NodeStatusOnline {
 		t.Fatalf("expected node to be ONLINE ignoring HTTP_PROXY, got: %+v", nodes)
+	}
+
+	// 2. 显式 WithNoProxy(true) 强制直连
+	cliNoProxy := NewClient(WithNoProxy(true))
+	cliNoProxy.dataDir = t.TempDir()
+	_ = cliNoProxy.SaveKnownNode(protocol.KnownNode{
+		Name:   "proxy-immune-node",
+		Target: u.Host,
+	})
+	nodesNoProxy, err := cliNoProxy.ListNodes()
+	if err != nil {
+		t.Fatalf("ListNodes with WithNoProxy failed: %v", err)
+	}
+	if len(nodesNoProxy) != 1 || nodesNoProxy[0].Status != protocol.NodeStatusOnline {
+		t.Fatalf("expected node to be ONLINE with WithNoProxy, got: %+v", nodesNoProxy)
+	}
+}
+
+// TestClient_WithProxy_Option 验证显式 WithProxy 成功接入代理
+func TestClient_WithProxy_Option(t *testing.T) {
+	proxyHit := false
+	proxyServer := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		proxyHit = true
+		rw.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(rw).Encode(protocol.NodeInfo{
+			Name:    "proxied-node",
+			Address: "proxy-forwarded:19000",
+			Status:  protocol.NodeStatusOnline,
+		})
+	}))
+	defer proxyServer.Close()
+
+	cli := NewClient(WithProxy(proxyServer.URL))
+	cli.dataDir = t.TempDir()
+
+	_ = cli.SaveKnownNode(protocol.KnownNode{
+		Name:   "proxied-node",
+		Target: "remote-worker.corp:19000",
+	})
+
+	nodes, err := cli.ListNodes()
+	if err != nil {
+		t.Fatalf("ListNodes with WithProxy failed: %v", err)
+	}
+	if !proxyHit {
+		t.Fatal("expected request to route through configured proxyServer, but proxy was not hit")
+	}
+	if len(nodes) != 1 || nodes[0].Name != "proxied-node" {
+		t.Fatalf("unexpected nodes: %+v", nodes)
 	}
 }
 
@@ -3247,6 +3298,130 @@ func TestClient_CleanJob_And_GetJobInfo_Errors(t *testing.T) {
 		t.Fatalf("expected 'mock query logs verified', got: %q", logsOut)
 	}
 }
+
+// 验证 DownloadToLocalFile 在网络传输中途断开 (模拟 Hijack 强制切断连接) 时，物理清除本地临时文件且不留任何 .cwsave-* 碎片
+func TestClient_DownloadToLocalFile_NetworkInterruptionCleansTempFile(t *testing.T) {
+	t.Setenv("USERPROFILE", t.TempDir())
+
+	// 模拟异常服务端：声明文件后，写了 50 字节突然强切连接
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		rw.Header().Set("X-File-Size", "1000")
+		rw.Header().Set("X-File-SHA256", "some-sha256")
+		rw.WriteHeader(http.StatusOK)
+		_, _ = rw.Write([]byte("short-corrupted-chunk-of-data"))
+		// 强行关闭底层连接模拟网络突然切断
+		if hj, ok := rw.(http.Hijacker); ok {
+			conn, _, _ := hj.Hijack()
+			if conn != nil {
+				_ = conn.Close()
+			}
+		}
+	}))
+	defer srv.Close()
+
+	cli := NewClient()
+	cli.dataDir = t.TempDir()
+	u, _ := url.Parse(srv.URL)
+	_ = cli.SaveKnownNode(protocol.KnownNode{
+		Name:   "interrupt-node",
+		Target: u.Host,
+	})
+
+	targetDir := t.TempDir()
+	targetFile := filepath.Join(targetDir, "download_interrupted.bin")
+
+	err := cli.DownloadToLocalFile(context.Background(), "interrupt-node", "remote_file.bin", targetFile, nil)
+	if err == nil {
+		t.Fatal("expected error on interrupted network stream, got nil")
+	}
+
+	// 1. 目标文件不得存在
+	if _, statErr := os.Stat(targetFile); !os.IsNotExist(statErr) {
+		t.Fatalf("target file should not exist, got: %v", statErr)
+	}
+
+	// 2. 目标目录下绝无任何 .cwsave-* 临时碎片
+	entries, err := os.ReadDir(targetDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".cwsave-") {
+			t.Fatalf("found leaked temporary file after network interruption: %s", e.Name())
+		}
+	}
+}
+
+// TestClient_ResolveTargetToURL 验证目标地址转换为合法 URL 的鲁棒性
+// 涵盖：IPv4、裸 IPv6、带中括号 IPv6、带中文网卡 Zone 的 RFC 6874 转义防崩溃，以及主机名动态解析
+func TestClient_ResolveTargetToURL(t *testing.T) {
+	cases := []struct {
+		target   string
+		expected string
+	}{
+		// 1. IPv4 地址 (直达或带端口)
+		{"192.168.1.100", "http://192.168.1.100:" + protocol.DefaultPortStr},
+		{"192.168.1.100:19000", "http://192.168.1.100:19000"},
+		{"127.0.0.1:8080", "http://127.0.0.1:8080"},
+
+		// 2. IPv6 标准包裹中括号
+		{"[fe80::1]:19000", "http://[fe80::1]:19000"},
+		{"[::1]:19000", "http://[::1]:19000"},
+
+		// 3. 裸 IPv6 地址 (自动中括号包裹)
+		{"::1", "http://[::1]:" + protocol.DefaultPortStr},
+		{"fe80::2ec6:62f6:bbcb:6eb4", "http://[fe80::2ec6:62f6:bbcb:6eb4]:" + protocol.DefaultPortStr},
+
+		// 4. 带有 Zone Identifier (如 Windows 中文网卡名) 的 IPv6 (RFC 6874 转义防御 invalid URL escape)
+		{"[fe80::1%eth0]:19000", "http://[fe80::1%25eth0]:19000"},
+		{"[fe80::2ec6:62f6:bbcb:6eb4%以太网]:19000", "http://[fe80::2ec6:62f6:bbcb:6eb4%25以太网]:19000"},
+		{"fe80::2ec6:62f6:bbcb:6eb4%以太网", "http://[fe80::2ec6:62f6:bbcb:6eb4%25以太网]:" + protocol.DefaultPortStr},
+
+		// 5. 局域网主机名 (回退原名或解析出的有效物理 IP)
+		{"unknown-virtual-host-12345:20000", "http://unknown-virtual-host-12345:20000"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.target, func(t *testing.T) {
+			got, err := resolveTargetToURL(tc.target)
+			if err != nil {
+				t.Fatalf("resolveTargetToURL(%q) unexpected err: %v", tc.target, err)
+			}
+			if got != tc.expected {
+				t.Errorf("resolveTargetToURL(%q) = %q, want %q", tc.target, got, tc.expected)
+			}
+			// 必须能成功通过 url.Parse，杜绝任何 invalid URL escape 报错
+			u, err := url.Parse(got)
+			if err != nil {
+				t.Fatalf("url.Parse(%q) failed: %v", got, err)
+			}
+			if u.Scheme != "http" {
+				t.Errorf("expected scheme http, got: %s", u.Scheme)
+			}
+		})
+	}
+
+	// 针对本地局域网真实主机名 (HARDWARE / carrot-workstation 等) 进行动态 DNS 解析与 URL 合法性断言
+	t.Run("DynamicHostResolution_Validation", func(t *testing.T) {
+		testHosts := []string{"HARDWARE", "HARDWARE:19000", "carrot-workstation:19000"}
+		for _, h := range testHosts {
+			got, err := resolveTargetToURL(h)
+			if err != nil {
+				t.Fatalf("resolveTargetToURL(%q) failed: %v", h, err)
+			}
+			u, err := url.Parse(got)
+			if err != nil {
+				t.Fatalf("url.Parse(%q) failed on resolved host %q: %v", got, h, err)
+			}
+			if u.Host == "" {
+				t.Fatalf("expected non-empty host for %q, got: %s", h, got)
+			}
+		}
+	})
+}
+
+
+
 
 
 

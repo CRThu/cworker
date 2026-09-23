@@ -231,7 +231,7 @@ func (c *Client) Transfer(ctx context.Context, opts TransferOptions, tracker *Pr
 		tracker.StartFile(pathutil.SafeBaseName(cleanLocalSrc))
 	}
 
-	err = c.LocalCopyFile(cleanLocalSrc, cleanLocalDst, tracker)
+	err = c.LocalCopyFileWithContext(ctx, cleanLocalSrc, cleanLocalDst, tracker)
 	if tracker != nil {
 		tracker.EndFile(pathutil.SafeBaseName(cleanLocalSrc))
 		if err == nil {

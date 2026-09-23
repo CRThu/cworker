@@ -7,12 +7,14 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"cworker/pkg/protocol"
 )
@@ -1275,6 +1277,116 @@ func TestFsEngine_HashStream_AbortMidway(t *testing.T) {
 		t.Fatalf("expected exactly 5 processed files before abort, got: %d", processedCount)
 	}
 }
+
+// 验证 SaveStreamWithValidatorContext 在传输中途被 Context 取消时，物理清除临时文件 (.cwsave-*) 绝无残留
+func TestFsEngine_SaveStreamWithValidatorContext_CancelCleansTempFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	targetFile := filepath.Join(tmpDir, "sub", "test_cancel.bin")
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// 模拟流：在读取第 2 块数据时触发 cancel
+	pr, pw := io.Pipe()
+	go func() {
+		defer pw.Close()
+		_, _ = pw.Write([]byte("chunk-1-data-before-cancel"))
+		time.Sleep(10 * time.Millisecond)
+		cancel() // 触发取消
+		time.Sleep(10 * time.Millisecond)
+		_, _ = pw.Write([]byte("chunk-2-data-after-cancel"))
+	}()
+
+	_, err := SaveStreamWithValidatorContext(ctx, targetFile, pr, nil)
+	if err == nil {
+		t.Fatal("expected error on cancelled context, got nil")
+	}
+
+	// 1. 验证目标文件未被提交
+	if _, statErr := os.Stat(targetFile); !os.IsNotExist(statErr) {
+		t.Fatalf("target file should not exist, but got err: %v", statErr)
+	}
+
+	// 2. 验证父目录下绝无任何 .cwsave-* 临时隐藏碎片
+	parentDir := filepath.Dir(targetFile)
+	entries, readErr := os.ReadDir(parentDir)
+	if readErr == nil {
+		for _, e := range entries {
+			if strings.Contains(e.Name(), ".cwsave-") {
+				t.Fatalf("found leftover temp file: %s", e.Name())
+			}
+		}
+	}
+}
+
+// 验证 CopyFileWithContext 在本地拷贝中途被取消时，临时文件自动清理
+func TestFsEngine_CopyFileWithContext_CancelCleansTempFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	srcFile := filepath.Join(tmpDir, "large_source.bin")
+	dstFile := filepath.Join(tmpDir, "dst_sub", "target.bin")
+
+	// 生成 2MB 测试文件
+	_ = os.WriteFile(srcFile, bytes.Repeat([]byte("X"), 2*1024*1024), 0644)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// 启动前或立即取消
+	cancel()
+
+	err := CopyFileWithContext(ctx, srcFile, dstFile, nil)
+	if err == nil {
+		t.Fatal("expected error on cancelled context, got nil")
+	}
+
+	// 目标文件不得存在
+	if _, statErr := os.Stat(dstFile); !os.IsNotExist(statErr) {
+		t.Fatalf("destination file should not exist, got: %v", statErr)
+	}
+
+	// 目标目录不得有 .cwsave 临时文件残留
+	dstDir := filepath.Dir(dstFile)
+	if entries, err := os.ReadDir(dstDir); err == nil {
+		for _, e := range entries {
+			if strings.Contains(e.Name(), ".cwsave-") {
+				t.Fatalf("found leftover temp file in destination: %s", e.Name())
+			}
+		}
+	}
+}
+
+// 验证 CopyDir 在并发复制过程中被 Context 中断，整个目录树下绝无任何 .cwsave-* 碎片
+func TestFsEngine_CopyDir_ContextCancellationCleansAllTempFiles(t *testing.T) {
+	srcDir := filepath.Join(t.TempDir(), "src")
+	dstDir := filepath.Join(t.TempDir(), "dst")
+	_ = os.MkdirAll(filepath.Join(srcDir, "sub1"), 0755)
+	_ = os.MkdirAll(filepath.Join(srcDir, "sub2"), 0755)
+
+	// 创建 30 个文件
+	for i := 1; i <= 30; i++ {
+		sub := "sub1"
+		if i > 15 {
+			sub = "sub2"
+		}
+		p := filepath.Join(srcDir, sub, fmt.Sprintf("file_%02d.dat", i))
+		_ = os.WriteFile(p, bytes.Repeat([]byte("DATA"), 1024*100), 0644)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// 5ms 后触发中断
+	time.AfterFunc(5*time.Millisecond, cancel)
+
+	_ = CopyDir(ctx, srcDir, dstDir, 4, nil)
+
+	// 遍历 dstDir 检查是否有任何 .cwsave-* 残留
+	_ = filepath.Walk(dstDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if strings.Contains(info.Name(), ".cwsave-") {
+			t.Fatalf("found orphaned temp file after CopyDir cancellation: %s", path)
+		}
+		return nil
+	})
+}
+
 
 
 

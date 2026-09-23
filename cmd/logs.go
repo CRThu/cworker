@@ -7,7 +7,6 @@ import (
 	"strings"
 	"syscall"
 
-	"cworker/pkg/client"
 	"cworker/pkg/protocol"
 	"github.com/spf13/cobra"
 )
@@ -36,7 +35,7 @@ var logsCmd = &cobra.Command{
 			jobID = rawTarget[idx+1:]
 		}
 
-		cli := client.NewClient()
+		cli := newCmdClient()
 
 		if logsFollow {
 			ctx, cancel := signal.NotifyContext(cmdContext(cmd), os.Interrupt, syscall.SIGTERM)

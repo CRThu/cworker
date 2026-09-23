@@ -6,7 +6,6 @@ import (
 	"os"
 	"strings"
 
-	"cworker/pkg/client"
 	"github.com/spf13/cobra"
 )
 
@@ -25,7 +24,7 @@ var cleanCmd = &cobra.Command{
 亦可批量清理已完成任务 (必须显式指定 --days <N> 或 --all)。正在运行（RUNNING）的任务受严格保护，绝不被清理。`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		cli := client.NewClient()
+		cli := newCmdClient()
 
 		// 模式 A：单任务精准清理 (cw clean [<node>:]<job_id>)
 		if len(args) == 1 {

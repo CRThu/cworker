@@ -10,10 +10,9 @@ import (
 	"syscall"
 	"time"
 
-	"cworker/pkg/client"
 	"cworker/pkg/protocol"
-	"cworker/pkg/ui"
 	"github.com/spf13/cobra"
+	"cworker/pkg/ui"
 )
 
 var (
@@ -28,7 +27,7 @@ var uiCmd = &cobra.Command{
 严格监听本地环回 127.0.0.1 (默认端口 19001)，提供全集群节点矩阵、任务生命周期治理、
 WebSocket 实时终端流式推流与全双工跨机文件高速互传等全套可视化治理能力。`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		cli := client.NewClient()
+		cli := newCmdClient()
 		srv := ui.NewServer(ui.Config{
 			BindAddr: "127.0.0.1",
 			Port:     uiPort,

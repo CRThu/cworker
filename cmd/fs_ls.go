@@ -5,7 +5,6 @@ import (
 	"os"
 	"text/tabwriter"
 
-	"cworker/pkg/client"
 	"cworker/pkg/pathutil"
 	"github.com/spf13/cobra"
 )
@@ -16,7 +15,7 @@ var lsCmd = &cobra.Command{
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		node, path := pathutil.ParseNodePath(args[0])
-		cli := client.NewClient()
+		cli := newCmdClient()
 		files, err := cli.ListDirWithContext(cmdContext(cmd), node, path)
 		if err != nil {
 			return err

@@ -22,10 +22,39 @@ import (
 	"time"
 
 	"cworker/pkg/fsengine"
+	"cworker/pkg/netutil"
 	"cworker/pkg/pathutil"
 	"cworker/pkg/protocol"
 	"nhooyr.io/websocket"
 )
+
+// ClientOption 客户端配置选项
+type ClientOption func(*clientConfig)
+
+type clientConfig struct {
+	proxyCfg netutil.ProxyConfig
+}
+
+// WithProxy 指定显式代理地址 (http://, https://, socks5://)
+func WithProxy(proxy string) ClientOption {
+	return func(c *clientConfig) {
+		c.proxyCfg.Proxy = proxy
+	}
+}
+
+// WithNoProxy 显式禁用所有代理 (强制物理直连)
+func WithNoProxy(noProxy bool) ClientOption {
+	return func(c *clientConfig) {
+		c.proxyCfg.NoProxy = noProxy
+	}
+}
+
+// WithProxyConfig 传入统一代理配置结构
+func WithProxyConfig(cfg netutil.ProxyConfig) ClientOption {
+	return func(c *clientConfig) {
+		c.proxyCfg = cfg
+	}
+}
 
 // Client 封装去中心化 CLI 与各 Worker 节点的动态 DNS 解析与直接鉴权交互
 type Client struct {
@@ -34,8 +63,13 @@ type Client struct {
 	streamClient *http.Client // Stream client: Timeout 0，无全局硬超时，由 Context 精确控制流式与大文件生命周期
 }
 
-// NewClient 实例化客户端
-func NewClient() *Client {
+// NewClient 实例化客户端 (默认遵循系统代理与分流规则，支持通过 ClientOption 显式控制)
+func NewClient(opts ...ClientOption) *Client {
+	var cfg clientConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
 	home, err := os.UserHomeDir()
 	if err != nil {
 		home = "."
@@ -43,9 +77,10 @@ func NewClient() *Client {
 	dataDir := filepath.Join(home, protocol.DefaultDataDirName)
 	_ = os.MkdirAll(dataDir, 0755)
 
-	// cworker 专用于局域网、本地环回与 Tailscale 点对点直连，必须显式隔离外部系统 HTTP 代理
+	proxyFunc, _ := netutil.ResolveProxyFunc(cfg.proxyCfg)
+
 	tr := &http.Transport{
-		Proxy: nil,
+		Proxy: proxyFunc,
 		DialContext: (&net.Dialer{
 			Timeout:   5 * time.Second,
 			KeepAlive: 30 * time.Second,
@@ -207,29 +242,52 @@ func resolveTargetToURL(target string) (string, error) {
 		port = p
 	}
 
-	// 实时动态 DNS 解析 (兼容 Tailscale MagicDNS、系统 mDNS 与传统 DNS)
-	ips, err := net.LookupHost(host)
-	if err != nil || len(ips) == 0 {
-		// 解析不通时尝试原样直连
-		if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
-			return fmt.Sprintf("http://[%s]:%s", host, port), nil
+	// 实时动态 DNS 解析 (优先提取物理 IPv4)
+	ips, _ := net.LookupHost(host)
+	// 若单标签短主机名 (非 IP、无冒号、无点) 未解析出 IPv4，通过 RFC 6762 标准局域网域名空间 (.local) 提取物理 IPv4
+	if !hasIPv4(ips) && !strings.Contains(host, ":") && !strings.Contains(host, ".") && net.ParseIP(host) == nil {
+		if localIps, _ := net.LookupHost(host + ".local"); len(localIps) > 0 {
+			ips = append(ips, localIps...)
 		}
-		return fmt.Sprintf("http://%s:%s", host, port), nil
 	}
 
-	// 取首个有效物理 IP (优先 IPv4)
-	chosenIP := ips[0]
-	for _, ip := range ips {
-		if strings.Contains(ip, ".") {
-			chosenIP = ip
-			break
+	// 选择目标地址: 优先 IPv4，其次 IPv6，解析失败回退原始 host
+	chosen := host
+	if len(ips) > 0 {
+		chosen = ips[0]
+		for _, ip := range ips {
+			if strings.Contains(ip, ".") {
+				chosen = ip
+				break
+			}
 		}
 	}
-	if strings.Contains(chosenIP, ":") && !strings.HasPrefix(chosenIP, "[") {
-		return fmt.Sprintf("http://[%s]:%s", chosenIP, port), nil
+
+	// 构造合规 URL: 若为 IPv6 地址包裹中括号，并对 Zone Identifier 按 RFC 6874 转义 % 为 %25 防崩溃
+	if strings.Contains(chosen, ":") && !strings.HasPrefix(chosen, "[") {
+		cleanIP := chosen
+		if idx := strings.Index(cleanIP, "%"); idx != -1 {
+			cleanIP = fmt.Sprintf("%s%%25%s", cleanIP[:idx], cleanIP[idx+1:])
+		}
+		return fmt.Sprintf("http://[%s]:%s", cleanIP, port), nil
 	}
-	return fmt.Sprintf("http://%s:%s", chosenIP, port), nil
+
+	return fmt.Sprintf("http://%s:%s", chosen, port), nil
 }
+
+func hasIPv4(ips []string) bool {
+	for _, ip := range ips {
+		if strings.Contains(ip, ".") {
+			return true
+		}
+	}
+	return false
+}
+
+
+
+
+
 
 // executeRequest 核心统一请求调度器 (SSOT: 负责鉴权 Token 注入、URL 拼接与 Content-Type 归一化)
 func (c *Client) executeRequest(ctx context.Context, rt *ResolvedTarget, method, path string, body io.Reader, httpClient *http.Client, headerMods ...func(req *http.Request)) (*http.Response, error) {
@@ -328,7 +386,8 @@ func (c *Client) ListNodesWithContext(ctx context.Context) ([]protocol.NodeInfo,
 						if node.Name != "" {
 							info.Name = node.Name
 						}
-						info.Address = strings.TrimPrefix(strings.TrimPrefix(rt.BaseURL, "http://"), "https://")
+						addr := strings.TrimPrefix(strings.TrimPrefix(rt.BaseURL, "http://"), "https://")
+						info.Address = strings.ReplaceAll(addr, "%25", "%")
 						mu.Lock()
 						list = append(list, info)
 						mu.Unlock()
@@ -899,7 +958,9 @@ func (c *Client) StreamLogsNode(ctx context.Context, node string, jobID string, 
 		wsURL += fmt.Sprintf("&token=%s", url.QueryEscape(rt.Token))
 	}
 
-	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	conn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
+		HTTPClient: c.httpClient,
+	})
 	if err != nil {
 		return fmt.Errorf("websocket connect worker %s failed: %w", rt.BaseURL, err)
 	}
@@ -1224,7 +1285,7 @@ func (c *Client) DownloadToLocalFile(ctx context.Context, node, remotePath, loca
 		r = NewCountingReader(resp.Body, tracker)
 	}
 
-	_, err = fsengine.SaveStreamWithValidator(cleanLocal, r, func(computedHash string) error {
+	_, err = fsengine.SaveStreamWithValidatorContext(ctx, cleanLocal, r, func(computedHash string) error {
 		expectedHash := strings.TrimSpace(resp.Header.Get("X-File-SHA256"))
 		if expectedHash == "" && resp.Trailer != nil {
 			expectedHash = strings.TrimSpace(resp.Trailer.Get("X-File-SHA256"))
@@ -2091,13 +2152,18 @@ concurrencyLoop:
 	return ctx.Err()
 }
 
-// LocalCopyFile 本地文件安全原子拷贝 (流式拷贝，同时计算 SHA-256 并原子写入)
-func (c *Client) LocalCopyFile(srcPath, dstPath string, tracker *ProgressTracker) error {
+// LocalCopyFileWithContext 本地文件安全原子拷贝 (流式拷贝，同时计算 SHA-256 并原子写入，支持 Context 取消与临时文件清理)
+func (c *Client) LocalCopyFileWithContext(ctx context.Context, srcPath, dstPath string, tracker *ProgressTracker) error {
 	var l fsengine.ProgressListener
 	if tracker != nil {
 		l = tracker
 	}
-	return fsengine.CopyFile(srcPath, dstPath, l)
+	return fsengine.CopyFileWithContext(ctx, srcPath, dstPath, l)
+}
+
+// LocalCopyFile 本地文件安全原子拷贝 (流式拷贝，同时计算 SHA-256 并原子写入)
+func (c *Client) LocalCopyFile(srcPath, dstPath string, tracker *ProgressTracker) error {
+	return c.LocalCopyFileWithContext(context.Background(), srcPath, dstPath, tracker)
 }
 
 // LocalCopyDir 本地目录递归并发拷贝

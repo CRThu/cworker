@@ -4,8 +4,27 @@ import (
 	"context"
 	"os"
 
+	"cworker/pkg/client"
 	"github.com/spf13/cobra"
 )
+
+var (
+	globalProxy   string
+	globalNoProxy bool
+)
+
+func init() {
+	RootCmd.PersistentFlags().StringVar(&globalProxy, "proxy", "", "显式指定 HTTP/HTTPS/SOCKS5 代理地址 (例如 http://127.0.0.1:7890)")
+	RootCmd.PersistentFlags().BoolVar(&globalNoProxy, "no-proxy", false, "显式禁用所有代理，强制物理直连")
+}
+
+// newCmdClient 统一根据全局命令行参数构造 Client 实例
+func newCmdClient() *client.Client {
+	return client.NewClient(
+		client.WithProxy(globalProxy),
+		client.WithNoProxy(globalNoProxy),
+	)
+}
 
 // cmdContext 安全提取 Cobra 命令的 Context，并在为 nil 时安全回退至 context.Background()
 func cmdContext(cmd *cobra.Command) context.Context {

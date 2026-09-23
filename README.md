@@ -187,6 +187,13 @@ cw ui
 
 ## 📖 命令行速查
 
+### 0. 全局代理与网络控制（所有子命令通用）
+| 参数 | 说明 |
+| :--- | :--- |
+| `--proxy <url>` | 显式指定 HTTP/HTTPS/SOCKS5 代理地址（例如 `--proxy http://127.0.0.1:7890` 或 `--proxy socks5://127.0.0.1:1080`） |
+| `--no-proxy` | 显式禁用所有代理，强制纯物理直连（解决注册表死代理残留，推荐高吞吐内网传输使用） |
+| *默认行为* | 默认遵循宿主系统代理（Windows 注册表 `Internet Settings` 优先并自动按 `ProxyOverride` 规则分流；未开启时平滑回退至环境变量；环回地址默认保护直连） |
+
 ### 1. 节点与账本管理
 | 命令 | 说明 |
 | :--- | :--- |
@@ -208,7 +215,7 @@ cw ui
 | `cw kill [<node>:]<job_id> [-n node]` | 终止任务并销毁整棵进程树（Win32 Job Object 内核治理，支持 `node:job_id` 定向查杀） |
 | `cw logs [<node>:]<job_id> [-f] [-n lines] [--head <n>] [-L <range>] [--all]` | 查看任务日志（默认 $\le$ 1MB 全量，超限截取末尾 100 行；支持 `-f` 跟随、行切片与全量输出） |
 | `cw ui [--port <port>] [--no-open]` | 启动本地 Web 控制台（严格监听 127.0.0.1，单文件内嵌 Svelte 5 SPA，提供节点管理、任务运维与文件互传） |
-| `cw update [-y] [--check] [--force] [--proxy <url>] [--mirror <url>]` | 从官方 GitHub Releases 拉包自升级；无锁热替换并重启服务；有运行中任务时严格拦截 |
+| `cw update [-y] [--check] [--force] [--proxy <url>] [--no-proxy] [--mirror <url>]` | 从官方 GitHub Releases 拉包自升级；无锁热替换并重启服务；有运行中任务时严格拦截 |
 | `cw version` / `cw -v` | 查看当前软件版本号、构建日期与 Go 运行环境 |
 
 ### 3. 跨机与本地文件治理

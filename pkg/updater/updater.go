@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"cworker/pkg/netutil"
 	"cworker/pkg/protocol"
 	"github.com/kardianos/service"
 	"golang.org/x/sys/windows/registry"
@@ -45,41 +46,43 @@ type ReleaseInfo struct {
 	Assets      []ReleaseAsset `json:"assets"`
 }
 
-// Updater 封装 GitHub 自动更新、网络探测与 Windows 原子替换引擎
+// Updater 封装 GitHub Releases 自升级器
 type Updater struct {
 	Repo       string
 	CurrentVer string
 	Proxy      string
+	NoProxy    bool
 	Mirror     string
 	Force      bool
 	httpClient *http.Client
 }
 
 // NewUpdater 实例化自升级器
-func NewUpdater(currentVer string, proxy string, mirror string, force bool) (*Updater, error) {
+func NewUpdater(currentVer string, proxy string, noProxy bool, mirror string, force bool) (*Updater, error) {
 	u := &Updater{
 		Repo:       DefaultRepo,
 		CurrentVer: currentVer,
 		Proxy:      proxy,
+		NoProxy:    noProxy,
 		Mirror:     mirror,
 		Force:      force,
 	}
 
-	proxyURL, err := DetectProxy(proxy)
+	proxyFunc, err := netutil.ResolveProxyFunc(netutil.ProxyConfig{
+		Proxy:   proxy,
+		NoProxy: noProxy,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("invalid proxy configuration: %w", err)
 	}
 
 	tr := &http.Transport{
-		Proxy: http.ProxyURL(proxyURL),
+		Proxy: proxyFunc,
 		DialContext: (&net.Dialer{
 			Timeout:   10 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
 		TLSHandshakeTimeout: 10 * time.Second,
-	}
-	if proxyURL == nil {
-		tr.Proxy = http.ProxyFromEnvironment
 	}
 
 	u.httpClient = &http.Client{
@@ -89,15 +92,11 @@ func NewUpdater(currentVer string, proxy string, mirror string, force bool) (*Up
 	return u, nil
 }
 
-// DetectProxy 级联探测代理：显式参数 -> 环境变量 -> Windows 注册表 Internet Settings
+// DetectProxy 级联探测代理（兼容旧接口与测试，统一基于 netutil）
 func DetectProxy(cliProxy string) (*url.URL, error) {
 	if cliProxy != "" {
-		if !strings.HasPrefix(cliProxy, "http://") && !strings.HasPrefix(cliProxy, "https://") && !strings.HasPrefix(cliProxy, "socks5://") {
-			cliProxy = "http://" + cliProxy
-		}
-		return url.Parse(cliProxy)
+		return netutil.ParseProxyURL(cliProxy)
 	}
-
 	for _, envKey := range []string{"HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"} {
 		if val := os.Getenv(envKey); val != "" {
 			if u, err := url.Parse(val); err == nil {

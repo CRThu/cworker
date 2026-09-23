@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -20,6 +21,7 @@ import (
 	"cworker/pkg/client"
 	"cworker/pkg/pathutil"
 	"cworker/pkg/protocol"
+	"github.com/spf13/cobra"
 )
 
 func TestCmd_Cp_SafeBaseName(t *testing.T) {
@@ -578,5 +580,57 @@ func TestCmd_Cp_LargeFile_Streaming(t *testing.T) {
 		t.Fatalf("expected dstFile size %d, got %d", targetSize, fi.Size())
 	}
 }
+
+// 验证当传输过程中被 Context 中断（模拟 Ctrl+C 信号）时，命令返回 130 退出码，且目标路径下绝无 .cwsave-* 临时文件残留
+func TestCmd_Cp_ContextCancel_CleansTempFilesAndReturnsExitCode130(t *testing.T) {
+	tempDir := t.TempDir()
+	srcDir := filepath.Join(tempDir, "src_tree")
+	dstDir := filepath.Join(tempDir, "dst_tree")
+	_ = os.MkdirAll(srcDir, 0755)
+
+	// 生成一批测试文件
+	for i := 1; i <= 20; i++ {
+		_ = os.WriteFile(filepath.Join(srcDir, fmt.Sprintf("file_%02d.dat", i)), bytes.Repeat([]byte("AB"), 1024*100), 0644)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// 启动后迅速取消
+	time.AfterFunc(10*time.Millisecond, cancel)
+
+	testCmd := &cobra.Command{
+		Use:  cpCmd.Use,
+		RunE: cpCmd.RunE,
+	}
+	testCmd.SetContext(ctx)
+	testCmd.Flags().AddFlagSet(cpCmd.Flags())
+	testCmd.Flags().Set("recursive", "true")
+	testCmd.Flags().Set("concurrency", "2")
+
+	err := testCmd.RunE(testCmd, []string{srcDir, dstDir})
+	if err == nil {
+		t.Fatal("expected error on cancelled context, got nil")
+	}
+
+	// 核心断言 1: 退出码必须严格为 130 (transfer interrupted by user)
+	if ec, ok := err.(*ExitError); ok {
+		if ec.Code != 130 {
+			t.Fatalf("expected exit code 130 on SIGINT/cancel, got %d", ec.Code)
+		}
+	} else {
+		t.Fatalf("expected *ExitError with code 130, got %T: %v", err, err)
+	}
+
+	// 核心断言 2: 目标目录下绝无任何 .cwsave-* 临时碎片残留
+	_ = filepath.Walk(dstDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if strings.Contains(info.Name(), ".cwsave-") {
+			t.Fatalf("found orphaned temp file after cp cancellation: %s", path)
+		}
+		return nil
+	})
+}
+
 
 

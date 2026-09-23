@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"text/tabwriter"
 
 	"cworker/pkg/client"
@@ -36,15 +38,16 @@ var diffCmd = &cobra.Command{
 		all, _ := cmd.Flags().GetBool("all")
 		limit, _ := cmd.Flags().GetInt("limit")
 
-		ctx := cmdContext(cmd)
+		sigCtx, stopSig := signal.NotifyContext(cmdContext(cmd), os.Interrupt, syscall.SIGTERM)
+		defer stopSig()
 
-		cli := client.NewClient()
+		cli := newCmdClient()
 
 		// 1. 并发获取源端与目标端的文件清单与哈希 (两端异步并行计算，加速一倍；支持极速熔断、统一聚合与 Agent 存活定时心跳)
 		tracker := client.NewProgressTracker(0, 0)
 		tracker.SetLabel("Hashed")
 
-		asyncCtx, cancel := context.WithCancel(ctx)
+		asyncCtx, cancel := context.WithCancel(sigCtx)
 		defer cancel()
 
 		var (
@@ -80,6 +83,11 @@ var diffCmd = &cobra.Command{
 			} else if client.IsTerminal() {
 				fmt.Println()
 			}
+		}
+
+		if sigCtx.Err() != nil {
+			fmt.Fprintln(os.Stderr, "\n[WARN] Diff interrupted by user.")
+			return &ExitError{Code: 130, Msg: "diff interrupted by user"}
 		}
 
 		if srcErr != nil {

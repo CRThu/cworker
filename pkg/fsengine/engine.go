@@ -614,8 +614,29 @@ func RemoveWithProgress(ctx context.Context, targetPath string, recursive bool, 
 }
 
 
-// SaveStreamWithValidator 将输入流原子落盘至指定目标文件，并在原子替换提交前执行校验回调 (SSOT)
-func SaveStreamWithValidator(dstPath string, r io.Reader, validator func(computedHash string) error) (string, error) {
+type contextReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (cr *contextReader) Read(p []byte) (int, error) {
+	if cr.ctx != nil {
+		if err := cr.ctx.Err(); err != nil {
+			return 0, err
+		}
+	}
+	return cr.r.Read(p)
+}
+
+// SaveStreamWithValidatorContext 将输入流原子落盘至指定目标文件，并在原子替换提交前执行校验回调 (支持 Context 取消安全熔断与清理, SSOT)
+func SaveStreamWithValidatorContext(ctx context.Context, dstPath string, r io.Reader, validator func(computedHash string) error) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+
 	cleanPath, err := pathutil.NormalizeLocalPath(dstPath)
 	if err != nil {
 		return "", err
@@ -647,11 +668,17 @@ func SaveStreamWithValidator(dstPath string, r io.Reader, validator func(compute
 	hasher := sha256.New()
 	destWriter := io.MultiWriter(destFile, hasher)
 
-	if _, err := io.Copy(destWriter, r); err != nil {
+	// 包装 Context 感知 Reader，确保中断信号瞬间响应
+	cr := &contextReader{ctx: ctx, r: r}
+	if _, err := io.Copy(destWriter, cr); err != nil {
 		return "", fmt.Errorf("write file failed: %w", err)
 	}
 	if err := destFile.Close(); err != nil {
 		return "", fmt.Errorf("flush dest file failed: %w", err)
+	}
+
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
 
 	computedHash := hex.EncodeToString(hasher.Sum(nil))
@@ -672,9 +699,14 @@ func SaveStreamWithValidator(dstPath string, r io.Reader, validator func(compute
 	return computedHash, nil
 }
 
-// SaveStream 将输入流原子落盘至指定目标文件，校验 SHA-256，并在出错时物理回滚清理临时文件
-func SaveStream(dstPath string, r io.Reader, expectedSha256 string) (string, error) {
-	return SaveStreamWithValidator(dstPath, r, func(computedHash string) error {
+// SaveStreamWithValidator 将输入流原子落盘至指定目标文件，并在原子替换提交前执行校验回调 (SSOT)
+func SaveStreamWithValidator(dstPath string, r io.Reader, validator func(computedHash string) error) (string, error) {
+	return SaveStreamWithValidatorContext(context.Background(), dstPath, r, validator)
+}
+
+// SaveStreamWithContext 将输入流原子落盘至指定目标文件，校验 SHA-256，并在出错或中断时物理回滚清理临时文件
+func SaveStreamWithContext(ctx context.Context, dstPath string, r io.Reader, expectedSha256 string) (string, error) {
+	return SaveStreamWithValidatorContext(ctx, dstPath, r, func(computedHash string) error {
 		if expectedSha256 != "" && !strings.EqualFold(expectedSha256, computedHash) {
 			return fmt.Errorf("%w: expected %s, got %s", ErrHashMismatch, expectedSha256, computedHash)
 		}
@@ -682,8 +714,20 @@ func SaveStream(dstPath string, r io.Reader, expectedSha256 string) (string, err
 	})
 }
 
-// CopyFile 本地单文件安全原子拷贝 (计算 SHA-256 校验并支持进度追踪)
-func CopyFile(srcPath, dstPath string, tracker ProgressListener) error {
+// SaveStream 将输入流原子落盘至指定目标文件，校验 SHA-256，并在出错时物理回滚清理临时文件
+func SaveStream(dstPath string, r io.Reader, expectedSha256 string) (string, error) {
+	return SaveStreamWithContext(context.Background(), dstPath, r, expectedSha256)
+}
+
+// CopyFileWithContext 本地单文件安全原子拷贝 (支持 Context 中断安全熔断与清理)
+func CopyFileWithContext(ctx context.Context, srcPath, dstPath string, tracker ProgressListener) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	cleanSrc, err := pathutil.NormalizeLocalPath(srcPath)
 	if err != nil {
 		return err
@@ -712,8 +756,13 @@ func CopyFile(srcPath, dstPath string, tracker ProgressListener) error {
 		r = &countingReader{r: srcFile, tracker: tracker}
 	}
 
-	_, err = SaveStream(cleanDst, r, "")
+	_, err = SaveStreamWithContext(ctx, cleanDst, r, "")
 	return err
+}
+
+// CopyFile 本地单文件安全原子拷贝 (计算 SHA-256 校验并支持进度追踪)
+func CopyFile(srcPath, dstPath string, tracker ProgressListener) error {
+	return CopyFileWithContext(context.Background(), srcPath, dstPath, tracker)
 }
 
 // CopyDir 本地目录并发递归拷贝 (空目录守恒)
@@ -841,7 +890,7 @@ concurrencyLoop:
 				st.StartFile(entry.relPath)
 				defer st.EndFile(entry.relPath)
 			}
-			if err := CopyFile(srcF, dstF, tracker); err != nil {
+			if err := CopyFileWithContext(ctx, srcF, dstF, tracker); err != nil {
 				errMu.Lock()
 				if firstErr == nil {
 					firstErr = fmt.Errorf("copy '%s' failed: %w", entry.relPath, err)

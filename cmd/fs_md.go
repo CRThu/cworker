@@ -3,7 +3,6 @@ package cmd
 import (
 	"fmt"
 
-	"cworker/pkg/client"
 	"cworker/pkg/pathutil"
 	"github.com/spf13/cobra"
 )
@@ -14,7 +13,7 @@ var mdCmd = &cobra.Command{
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		node, path := pathutil.ParseNodePath(args[0])
-		cli := client.NewClient()
+		cli := newCmdClient()
 		if err := cli.MakeDirWithContext(cmdContext(cmd), node, path); err != nil {
 			return fmt.Errorf("mkdir failed: %w", err)
 		}

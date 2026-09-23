@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"os/signal"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"cworker/pkg/client"
@@ -45,7 +47,7 @@ var rmCmd = &cobra.Command{
 			}
 		}
 
-		cli := client.NewClient()
+		cli := newCmdClient()
 		startTime := time.Now()
 		interval := client.GetDefaultHeartbeatInterval()
 		isTTY := client.IsTerminal()
@@ -103,13 +105,24 @@ var rmCmd = &cobra.Command{
 			}
 		}
 
-		finalCount, err := cli.DeleteWithProgress(cmdContext(cmd), node, path, rmRecursive, progressCb)
+		sigCtx, stopSig := signal.NotifyContext(cmdContext(cmd), os.Interrupt, syscall.SIGTERM)
+		defer stopSig()
+
+		finalCount, err := cli.DeleteWithProgress(sigCtx, node, path, rmRecursive, progressCb)
 		if stopHeartbeat != nil {
 			close(stopHeartbeat)
 		}
 
 		elapsed := time.Since(startTime)
 		hasPrintedTTY := isTTY && (elapsed >= interval || atomic.LoadInt64(&removedCount) > 0)
+
+		if sigCtx.Err() != nil {
+			if hasPrintedTTY {
+				fmt.Println()
+			}
+			fmt.Fprintf(os.Stderr, "[WARN] Removal interrupted by user (%s items deleted).\n", client.FormatCount(finalCount))
+			return &ExitError{Code: 130, Msg: "removal interrupted by user"}
+		}
 
 		if err != nil {
 			if hasPrintedTTY {

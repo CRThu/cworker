@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"strings"
 
-	"cworker/pkg/client"
 	"cworker/pkg/protocol"
 	"github.com/spf13/cobra"
 )
@@ -26,7 +25,7 @@ var killCmd = &cobra.Command{
 			jobID = rawTarget[idx+1:]
 		}
 
-		cli := client.NewClient()
+		cli := newCmdClient()
 		var info *protocol.JobInfo
 		var err error
 

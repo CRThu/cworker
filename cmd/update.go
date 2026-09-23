@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"cworker/pkg/updater"
 	"github.com/spf13/cobra"
@@ -16,7 +18,6 @@ var (
 	updateYes    bool
 	updateCheck  bool
 	updateForce  bool
-	updateProxy  string
 	updateMirror string
 )
 
@@ -29,13 +30,14 @@ var updateCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		fmt.Println("Checking for updates from github.com/crthu/cworker...")
 
-		up, err := updater.NewUpdater(Version, updateProxy, updateMirror, updateForce)
+		up, err := updater.NewUpdater(Version, globalProxy, globalNoProxy, updateMirror, updateForce)
 		if err != nil {
 			return fmt.Errorf("init updater failed: %w", err)
 		}
 
-		ctx := cmdContext(cmd)
-		rel, err := up.FetchLatestRelease(ctx)
+		sigCtx, stopSig := signal.NotifyContext(cmdContext(cmd), os.Interrupt, syscall.SIGTERM)
+		defer stopSig()
+		rel, err := up.FetchLatestRelease(sigCtx)
 		if err != nil {
 			return fmt.Errorf("check latest release failed: %w", err)
 		}
@@ -80,7 +82,10 @@ var updateCmd = &cobra.Command{
 		}
 
 		// 检查运行中活跃任务冲突
-		if err := up.CheckRunningJobs(ctx); err != nil {
+		if err := up.CheckRunningJobs(sigCtx); err != nil {
+			if sigCtx.Err() != nil {
+				return &ExitError{Code: 130, Msg: "update interrupted by user"}
+			}
 			return err
 		}
 
@@ -109,7 +114,7 @@ var updateCmd = &cobra.Command{
 		// 流式下载并显示进度
 		fmt.Printf("Downloading %s...\n", asset.Name)
 		var lastPercent int = -1
-		bytesData, shaSum, err := up.DownloadAsset(ctx, asset, func(downloaded, total int64) {
+		bytesData, shaSum, err := up.DownloadAsset(sigCtx, asset, func(downloaded, total int64) {
 			if total > 0 {
 				pct := int(float64(downloaded) / float64(total) * 100)
 				if pct != lastPercent {
@@ -119,12 +124,16 @@ var updateCmd = &cobra.Command{
 			}
 		})
 		fmt.Println() // 换行
+		if sigCtx.Err() != nil {
+			fmt.Fprintln(os.Stderr, "\n[WARN] Update interrupted by user.")
+			return &ExitError{Code: 130, Msg: "update interrupted by user"}
+		}
 		if err != nil {
 			return fmt.Errorf("download asset failed: %w", err)
 		}
 
 		// SHA-256 强校验 (若 Release 提供了 checksums.txt 或 *.sha256)
-		if err := up.VerifyChecksum(ctx, rel.Assets, asset.Name, shaSum); err != nil {
+		if err := up.VerifyChecksum(sigCtx, rel.Assets, asset.Name, shaSum); err != nil {
 			return fmt.Errorf("checksum verification failed: %w", err)
 		}
 		fmt.Printf("Verified SHA-256 hash successfully (%s...)\n", shaSum[:12])
@@ -177,7 +186,6 @@ func init() {
 	updateCmd.Flags().BoolVarP(&updateYes, "yes", "y", false, "跳过交互式二次确认")
 	updateCmd.Flags().BoolVar(&updateCheck, "check", false, "仅检查是否有最新版本，不执行下载与替换")
 	updateCmd.Flags().BoolVar(&updateForce, "force", false, "强制更新（忽略活跃任务冲突或强制重新覆盖）")
-	updateCmd.Flags().StringVar(&updateProxy, "proxy", "", "显式指定 HTTP/HTTPS/SOCKS5 代理 (例如 --proxy http://127.0.0.1:7890)")
 	updateCmd.Flags().StringVar(&updateMirror, "mirror", "", "指定 GitHub 镜像加速前缀 (例如 --mirror https://ghproxy.net/)")
 	RootCmd.AddCommand(updateCmd)
 }

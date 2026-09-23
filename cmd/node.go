@@ -10,7 +10,6 @@ import (
 	"strings"
 	"text/tabwriter"
 
-	"cworker/pkg/client"
 	"cworker/pkg/protocol"
 	"github.com/spf13/cobra"
 )
@@ -42,7 +41,7 @@ func runNodeList(ctx ...context.Context) error {
 	if len(ctx) > 0 && ctx[0] != nil {
 		c = ctx[0]
 	}
-	cli := client.NewClient()
+	cli := newCmdClient()
 	nodes, err := cli.ListNodesWithContext(c)
 	if err != nil {
 		return err
@@ -137,7 +136,7 @@ var nodeAddCmd = &cobra.Command{
 			fmt.Printf("[WARN] Note: No security token configured for '%s'. Unauthenticated requests will be rejected with 401.\n", name)
 		}
 
-		cli := client.NewClient()
+		cli := newCmdClient()
 		err := cli.SaveKnownNode(protocol.KnownNode{
 			Name:   name,
 			Target: target,
@@ -158,7 +157,7 @@ var nodeRmCmd = &cobra.Command{
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		name := args[0]
-		cli := client.NewClient()
+		cli := newCmdClient()
 		if err := cli.RemoveKnownNode(name); err != nil {
 			return fmt.Errorf("remove node failed: %w", err)
 		}

@@ -38,13 +38,16 @@ description: >-
 - **Text Slicing & 1MB Truncation (`cw cat` & `cw logs`)**:
   - Content $\le$ 1MB outputs in full; content $>$ 1MB automatically truncates to the last 100 lines with an override notice.
   - Flags: `-n/--tail <N>` (last N lines), `--head <N>` (first N lines), `-L/--lines <start:end>` (line range), `--all` (full output).
-- **`cw ui` is a Foreground Blocking Server**: `cw ui [--port <p>] [--no-open]` runs the embedded local Web console on 127.0.0.1. Do NOT execute it synchronously in non-daemon agent subshells as it blocks indefinitely; advise users to run it in a separate terminal or launch it as a background daemon process.
-- **401 Unauthorized Recovery**: If a command returns 401, the target node's token changed or is missing. Fetch the token via `cw show` on that node. You can either update the node configuration via `cw node add <node> <target> --token <token>`, or dispatch directly with `cw run -n <node> --token <token> ...` (the client will automatically persist valid tokens upon successful handshake).
+- **Global System Proxy & Direct Connection (`--proxy` / `--no-proxy`)**:
+  - All `cw` commands default to following host system proxy rules (Windows registry `Internet Settings` priority, matching `ProxyOverride` bypass lists, and fallback to `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`). Loopback addresses (`127.0.0.1`, `localhost`) are strictly protected from routing loops.
+  - Use `--no-proxy` to force pure direct connection (recommended for high-bandwidth LAN transfers or dead Windows proxy registry recovery).
+  - Use `--proxy <url>` (HTTP/HTTPS/SOCKS5) to explicitly tunnel commands to specific remote/bastion nodes.
 
 ## 2. CLI Reference
 
 | Action | Command | Output / Notes |
 | :--- | :--- | :--- |
+| **Global Proxy Flags** | `cw [--proxy <url>] [--no-proxy] <cmd>` | All subcommands inherit proxy routing & direct override flags |
 | **Cluster Health** | `cw nodes` | Status (`ONLINE`/`OFFLINE`), Version, OS, CPU%, Free/Total RAM, Job count |
 | **Local Identity** | `cw show [--refresh]` | Displays machine name, IP addresses, service state, token |
 | **Add Node** | `cw node add <name> [target] [--token <t>]` | Registers remote node to cluster (auto-infers `:19000`) |
@@ -63,7 +66,7 @@ description: >-
 | **Remove** | `cw rm -r -y [<node>:]<path>` | Non-interactive recursive deletion on remote or local |
 | **Web Console** | `cw ui [--port <p>] [--no-open]` | Local Web console (127.0.0.1; foreground blocking server; embedded Svelte SPA) |
 | **Service Control**| `cw service <start\|stop\|status>` | Manages background service (requires Admin) |
-| **Update** | `cw update [-y] [--check] [--force] [--proxy <url>] [--mirror <url>]` | Self-update from GitHub (`crthu/cworker`); auto detects registry proxy; atomic rename-replace |
+| **Update** | `cw update [-y] [--check] [--force] [--proxy <url>] [--no-proxy] [--mirror <url>]` | Self-update from GitHub (`crthu/cworker`); auto detects registry proxy; atomic rename-replace |
 | **Version** | `cw -v` / `cw version` | Outputs version, build date, Go runtime |
 
 ## 3. Core Agent Workflows

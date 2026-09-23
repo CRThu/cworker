@@ -2,6 +2,9 @@ package cmd
 
 import (
 	"fmt"
+	"os"
+	"os/signal"
+	"syscall"
 
 	"cworker/pkg/client"
 	"cworker/pkg/pathutil"
@@ -30,9 +33,10 @@ var cpCmd = &cobra.Command{
 			concurrency = 8
 		}
 
-		ctx := cmdContext(cmd)
+		sigCtx, stopSig := signal.NotifyContext(cmdContext(cmd), os.Interrupt, syscall.SIGTERM)
+		defer stopSig()
 
-		cli := client.NewClient()
+		cli := newCmdClient()
 		tracker := client.NewProgressTracker(1, 0)
 
 		opts := client.TransferOptions{
@@ -44,7 +48,11 @@ var cpCmd = &cobra.Command{
 			Concurrency: concurrency,
 		}
 
-		if err := cli.Transfer(ctx, opts, tracker); err != nil {
+		if err := cli.Transfer(sigCtx, opts, tracker); err != nil {
+			if sigCtx.Err() != nil {
+				fmt.Fprintln(os.Stderr, "\n[WARN] Transfer interrupted by user, cleaning up temporary files...")
+				return &ExitError{Code: 130, Msg: "transfer interrupted by user"}
+			}
 			return err
 		}
 

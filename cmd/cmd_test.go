@@ -21,7 +21,11 @@ import (
 	"cworker/pkg/protocol"
 	"cworker/pkg/updater"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 
+	"github.com/spf13/cobra"
 	"nhooyr.io/websocket"
 )
 
@@ -1085,7 +1089,8 @@ func TestCmd_Update_ExecutionFlow(t *testing.T) {
 	updateYes = false
 	updateForce = false
 	updateMirror = server.URL
-	updateProxy = ""
+	globalProxy = ""
+	globalNoProxy = false
 
 	out, err := captureStdout(func() error {
 		return updateCmd.RunE(updateCmd, []string{})
@@ -1135,7 +1140,8 @@ func TestCmd_Update_ProbeRedirectAndEOF(t *testing.T) {
 	updateYes = false
 	updateForce = false
 	updateMirror = server.URL
-	updateProxy = ""
+	globalProxy = ""
+	globalNoProxy = false
 
 	out, err := captureStdout(func() error {
 		return updateCmd.RunE(updateCmd, []string{})
@@ -1984,6 +1990,188 @@ func TestLogsCmd_PrefixAndAll(t *testing.T) {
 	err := logsCmd.RunE(logsCmd, []string{"prefix-log-worker:job-all-test"})
 	if err != nil {
 		t.Fatalf("logsCmd prefix with --all failed: %v", err)
+	}
+}
+
+// TestCmd_AllCommandsInheritProxyFlags 递归遍历 RootCmd 下的所有命令与子命令，断言均继承了 --proxy 与 --no-proxy 标志
+func TestCmd_AllCommandsInheritProxyFlags(t *testing.T) {
+	var checkCmd func(c *cobra.Command)
+	checkedCount := 0
+
+	checkCmd = func(c *cobra.Command) {
+		checkedCount++
+		// 校验 proxy 标志 (c.Flag 会沿命令树向上检索包括 PersistentFlags 的所有可用标志)
+		proxyFlag := c.Flag("proxy")
+		if proxyFlag == nil {
+			t.Errorf("Command '%s' does not have '--proxy' flag", c.CommandPath())
+		}
+		// 校验 no-proxy 标志
+		noProxyFlag := c.Flag("no-proxy")
+		if noProxyFlag == nil {
+			t.Errorf("Command '%s' does not have '--no-proxy' flag", c.CommandPath())
+		}
+
+		for _, sub := range c.Commands() {
+			checkCmd(sub)
+		}
+	}
+
+	checkCmd(RootCmd)
+	if checkedCount < 10 {
+		t.Fatalf("expected at least 10 commands checked, got %d", checkedCount)
+	}
+	t.Logf("Successfully verified %d commands inherit --proxy and --no-proxy flags", checkedCount)
+}
+
+// TestCmd_ASTArchitectureRule_NoDirectNewClient 静态分析 cmd 包内所有源码，确保无任何业务命令绕过统一代理解析器
+func TestCmd_ASTArchitectureRule_NoDirectNewClient(t *testing.T) {
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatalf("glob failed: %v", err)
+	}
+
+	fset := token.NewFileSet()
+	for _, file := range files {
+		// 跳过 root.go (newCmdClient 单点权威实现所在地) 与测试文件
+		if file == "root.go" || strings.HasSuffix(file, "_test.go") {
+			continue
+		}
+
+		node, err := parser.ParseFile(fset, file, nil, parser.AllErrors)
+		if err != nil {
+			t.Fatalf("parse file %s failed: %v", file, err)
+		}
+
+		ast.Inspect(node, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+
+			// 检查形如 client.NewClient() 的调用
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+
+			ident, ok := sel.X.(*ast.Ident)
+			if ok && ident.Name == "client" && sel.Sel.Name == "NewClient" {
+				t.Errorf("Architecture Rule Violation: file '%s' line %d calls client.NewClient() directly. Must use newCmdClient()!",
+					file, fset.Position(call.Pos()).Line)
+			}
+			return true
+		})
+	}
+}
+
+// TestCmd_NewCmdClient_ProxyAndNoProxyWiring 验证 newCmdClient 准确将全局参数注入至 Transport
+func TestCmd_NewCmdClient_ProxyAndNoProxyWiring(t *testing.T) {
+	origProxy := globalProxy
+	origNoProxy := globalNoProxy
+	defer func() {
+		globalProxy = origProxy
+		globalNoProxy = origNoProxy
+	}()
+
+	// 1. 测试显式 --proxy
+	globalProxy = "http://127.0.0.1:8888"
+	globalNoProxy = false
+	cliProxy := newCmdClient()
+	if cliProxy == nil {
+		t.Fatal("expected non-nil client")
+	}
+
+	// 2. 测试显式 --no-proxy (即使配置了 proxy 也强制物理直连)
+	globalProxy = "http://127.0.0.1:8888"
+	globalNoProxy = true
+	cliNoProxy := newCmdClient()
+	if cliNoProxy == nil {
+		t.Fatal("expected non-nil client")
+	}
+
+	// 3. 测试默认系统代理缺省
+	globalProxy = ""
+	globalNoProxy = false
+	cliDefault := newCmdClient()
+	if cliDefault == nil {
+		t.Fatal("expected non-nil client")
+	}
+}
+
+// TestCmd_RootCmd_FlagParsing_ProxyAndNoProxy 验证命令行对 --proxy 与 --no-proxy 的解析
+func TestCmd_RootCmd_FlagParsing_ProxyAndNoProxy(t *testing.T) {
+	origProxy := globalProxy
+	origNoProxy := globalNoProxy
+	defer func() {
+		globalProxy = origProxy
+		globalNoProxy = origNoProxy
+	}()
+
+	// 模拟传参
+	err := RootCmd.PersistentFlags().Parse([]string{"--proxy", "http://10.1.2.3:8080", "--no-proxy"})
+	if err != nil {
+		t.Fatalf("parse flags failed: %v", err)
+	}
+
+	if globalProxy != "http://10.1.2.3:8080" {
+		t.Errorf("expected globalProxy 'http://10.1.2.3:8080', got '%s'", globalProxy)
+	}
+	if !globalNoProxy {
+		t.Errorf("expected globalNoProxy to be true")
+	}
+}
+
+// TestCmd_Subcommands_ExecutionWithProxyFlags 验证主要业务子命令在传入 --proxy 与 --no-proxy 时的执行与参数接收
+func TestCmd_Subcommands_ExecutionWithProxyFlags(t *testing.T) {
+	origProxy := globalProxy
+	origNoProxy := globalNoProxy
+	defer func() {
+		globalProxy = origProxy
+		globalNoProxy = origNoProxy
+	}()
+
+	tempDir := t.TempDir()
+	t.Setenv("USERPROFILE", tempDir)
+
+	// 1. 测试 cw ps --no-proxy
+	RootCmd.SetArgs([]string{"ps", "--no-proxy"})
+	err := RootCmd.Execute()
+	if err != nil {
+		t.Fatalf("RootCmd.Execute 'ps --no-proxy' failed: %v", err)
+	}
+	if !globalNoProxy {
+		t.Errorf("expected globalNoProxy true after 'ps --no-proxy'")
+	}
+
+	// 2. 测试 cw node ls --proxy http://127.0.0.1:8888
+	RootCmd.SetArgs([]string{"node", "ls", "--proxy", "http://127.0.0.1:8888"})
+	err = RootCmd.Execute()
+	if err != nil {
+		t.Fatalf("RootCmd.Execute 'node ls --proxy ...' failed: %v", err)
+	}
+	if globalProxy != "http://127.0.0.1:8888" {
+		t.Errorf("expected globalProxy 'http://127.0.0.1:8888', got '%s'", globalProxy)
+	}
+
+	// 3. 测试 cw update --no-proxy --check (自升级命令继承顶层 --no-proxy)
+	mockServer := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		rw.Header().Set("Location", "/https://github.com/crthu/cworker/releases/download/v9.9.9/cw.exe")
+		rw.WriteHeader(http.StatusFound)
+	}))
+	defer mockServer.Close()
+
+	origMirror := updateMirror
+	updateMirror = mockServer.URL
+	defer func() { updateMirror = origMirror }()
+
+	globalNoProxy = false
+	updateCheck = true
+	defer func() { updateCheck = false }()
+
+	RootCmd.SetArgs([]string{"update", "--no-proxy", "--check"})
+	_ = RootCmd.Execute()
+	if !globalNoProxy {
+		t.Errorf("expected globalNoProxy true after 'update --no-proxy --check'")
 	}
 }
 

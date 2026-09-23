@@ -8,7 +8,6 @@ import (
 	"strings"
 	"syscall"
 
-	"cworker/pkg/client"
 	"cworker/pkg/protocol"
 	"github.com/spf13/cobra"
 )
@@ -33,7 +32,7 @@ var runCmd = &cobra.Command{
 		}
 
 		rawCommand := strings.Join(args, " ")
-		cli := client.NewClient()
+		cli := newCmdClient()
 
 		info, err := cli.RunJobWithContext(cmdContext(cmd), protocol.RunJobRequest{
 			Name:              runJobName,

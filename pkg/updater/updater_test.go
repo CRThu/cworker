@@ -114,7 +114,7 @@ func TestVerifyChecksum(t *testing.T) {
 	}))
 	defer server.Close()
 
-	up, _ := NewUpdater("1.0.0", "", "", false)
+	up, _ := NewUpdater("1.0.0", "", false, "", false)
 
 	assets := []ReleaseAsset{
 		{Name: "cw-windows-amd64.exe", BrowserDownloadURL: "http://example.com/cw.exe"},
@@ -218,7 +218,7 @@ func TestUpdater_ProbeLatestRelease_Redirect(t *testing.T) {
 	}))
 	defer server.Close()
 
-	up, err := NewUpdater("1.0.0", "", "", false)
+	up, err := NewUpdater("1.0.0", "", false, "", false)
 	if err != nil {
 		t.Fatalf("NewUpdater failed: %v", err)
 	}
@@ -259,7 +259,7 @@ func TestUpdater_FetchLatestRelease(t *testing.T) {
 	}))
 	defer server.Close()
 
-	up, _ := NewUpdater("1.0.0", "", "", false)
+	up, _ := NewUpdater("1.0.0", "", false, "", false)
 	// 用 mirror 前缀将请求重定向至本地 mock server
 	up.Mirror = server.URL + "/"
 
@@ -288,7 +288,7 @@ func TestUpdater_DownloadAsset(t *testing.T) {
 	}))
 	defer server.Close()
 
-	up, _ := NewUpdater("1.0.0", "", "", false)
+	up, _ := NewUpdater("1.0.0", "", false, "", false)
 
 	asset := &ReleaseAsset{
 		Name:               "cw-windows-amd64.exe",
@@ -340,13 +340,13 @@ func TestExtractExeFromZip(t *testing.T) {
 
 func TestUpdater_CheckRunningJobs(t *testing.T) {
 	// 1. 当 force 为 true 时，不发起任何网络请求，直接放行
-	upForce, _ := NewUpdater("1.0.0", "", "", true)
+	upForce, _ := NewUpdater("1.0.0", "", false, "", true)
 	if err := upForce.CheckRunningJobs(context.Background()); err != nil {
 		t.Fatalf("expected nil when force is true, got: %v", err)
 	}
 
 	// 2. 当没有 worker 在运行时 (端口连接拒绝)，静默放行
-	upNoWorker, _ := NewUpdater("1.0.0", "", "", false)
+	upNoWorker, _ := NewUpdater("1.0.0", "", false, "", false)
 	if err := upNoWorker.CheckRunningJobs(context.Background()); err != nil {
 		t.Fatalf("expected nil when worker is offline, got: %v", err)
 	}
@@ -397,7 +397,7 @@ func TestVerifyChecksum_EdgeCases(t *testing.T) {
 	}))
 	defer server.Close()
 
-	up, _ := NewUpdater("1.0.0", "", "", false)
+	up, _ := NewUpdater("1.0.0", "", false, "", false)
 	assets := []ReleaseAsset{
 		{Name: "cw.exe.sha256", BrowserDownloadURL: server.URL},
 	}
@@ -480,7 +480,7 @@ func TestUpdater_DownloadAsset_TamperedChecksumFails(t *testing.T) {
 	}))
 	defer server.Close()
 
-	up, _ := NewUpdater("1.0.0", "", "", true)
+	up, _ := NewUpdater("1.0.0", "", false, "", true)
 	release := &ReleaseInfo{
 		TagName: "v1.1.0",
 		Assets: []ReleaseAsset{
@@ -530,7 +530,7 @@ func TestUpdater_CheckRunningJobs_ActiveJobs_Aborts(t *testing.T) {
 	defer func() { _ = srv.Close() }()
 
 	// 1. 未传 force 时，必须被硬拦截并报错
-	up, _ := NewUpdater("1.0.0", "", "", false)
+	up, _ := NewUpdater("1.0.0", "", false, "", false)
 	err = up.CheckRunningJobs(context.Background())
 	if err == nil {
 		t.Fatal("expected CheckRunningJobs to abort when active jobs > 0")
@@ -540,9 +540,27 @@ func TestUpdater_CheckRunningJobs_ActiveJobs_Aborts(t *testing.T) {
 	}
 
 	// 2. 传入 force 时，必须放行
-	upForce, _ := NewUpdater("1.0.0", "", "", true)
+	upForce, _ := NewUpdater("1.0.0", "", false, "", true)
 	if err := upForce.CheckRunningJobs(context.Background()); err != nil {
 		t.Fatalf("expected CheckRunningJobs to succeed when force is true, got: %v", err)
+	}
+}
+
+func TestUpdater_NoProxy_Option(t *testing.T) {
+	up, err := NewUpdater("1.0.0", "http://127.0.0.1:9999", true, "", false)
+	if err != nil {
+		t.Fatalf("NewUpdater failed: %v", err)
+	}
+	if !up.NoProxy {
+		t.Fatal("expected NoProxy to be true")
+	}
+	// 当 NoProxy 为 true 时，底层 Transport.Proxy 必须为 nil 物理直连
+	tr, ok := up.httpClient.Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("expected http.Transport")
+	}
+	if tr.Proxy != nil {
+		t.Fatal("expected tr.Proxy to be nil under NoProxy=true")
 	}
 }
 

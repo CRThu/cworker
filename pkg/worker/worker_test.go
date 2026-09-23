@@ -1313,15 +1313,18 @@ func TestWorker_FsUpload_InterruptCleansTempFile(t *testing.T) {
 		t.Fatalf("expected 500 on interrupted stream, got %d", rec.Code)
 	}
 
-	// 确认目标目录下没有任何残留的 .cwupload- 临时文件
+	// 确认目标目录下没有任何残留的 .cwsave- 临时文件，且目标文件未被提交
 	entries, err := os.ReadDir(tempDir)
 	if err != nil {
 		t.Fatalf("readdir failed: %v", err)
 	}
 	for _, e := range entries {
-		if strings.Contains(e.Name(), ".cwupload-") {
+		if strings.Contains(e.Name(), ".cwsave-") || strings.Contains(e.Name(), ".cwupload-") {
 			t.Fatalf("temporary upload file leaked on interrupt: %s", e.Name())
 		}
+	}
+	if _, statErr := os.Stat(targetFilePath); !os.IsNotExist(statErr) {
+		t.Fatalf("target file should not exist on interrupted upload, got err: %v", statErr)
 	}
 }
 

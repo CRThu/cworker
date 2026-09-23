@@ -973,7 +973,7 @@ func (w *Worker) handleFsUpload(rw http.ResponseWriter, r *http.Request) {
 	}
 
 	expectedHash := strings.TrimSpace(r.Header.Get("X-File-SHA256"))
-	computedHash, err := fsengine.SaveStream(cleanPath, r.Body, expectedHash)
+	computedHash, err := fsengine.SaveStreamWithContext(r.Context(), cleanPath, r.Body, expectedHash)
 	if err != nil {
 		if errors.Is(err, fsengine.ErrDestinationIsDir) || errors.Is(err, fsengine.ErrHashMismatch) {
 			http.Error(rw, err.Error(), http.StatusBadRequest)
