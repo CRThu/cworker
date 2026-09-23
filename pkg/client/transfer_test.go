@@ -449,3 +449,57 @@ func TestClient_Transfer_RemoteTopologies(t *testing.T) {
 		t.Fatalf("relayed dir file mismatch on node-b: %v", val)
 	}
 }
+
+// TestClient_Transfer_RemoteError_NoFalseFallbackToFile 验证远端探测遇到网络/服务器异常时，立即暴露真实底层错误，严禁盲目降级走入单文件下载导致误报“请使用 -r”
+func TestClient_Transfer_RemoteError_NoFalseFallbackToFile(t *testing.T) {
+	downloadHit := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/fs/ls" {
+			// 模拟远端目录列表网络中断或内部 500 异常
+			http.Error(w, "connection reset / internal server glitch", http.StatusInternalServerError)
+			return
+		}
+		if r.URL.Path == "/api/v1/fs/download" {
+			downloadHit = true
+			http.Error(w, "path is a directory, use recursive copy (-r)", http.StatusBadRequest)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	cli := NewClient()
+	cli.dataDir = t.TempDir()
+
+	_ = cli.SaveKnownNode(protocol.KnownNode{
+		Name:   "glitch-node",
+		Target: strings.TrimPrefix(srv.URL, "http://"),
+		Token:  "test-tok",
+	})
+
+	ctx := context.Background()
+	tempDir := t.TempDir()
+
+	// 用户明确传入了 Recursive: true
+	err := cli.Transfer(ctx, TransferOptions{
+		SrcNode:   "glitch-node",
+		SrcPath:   "D:/some/remote/dir",
+		DstPath:   filepath.Join(tempDir, "local_dst"),
+		Recursive: true,
+	}, nil)
+
+	if err == nil {
+		t.Fatal("expected error when remote ls failed, got nil")
+	}
+
+	// 核心断言 1：必须直接返回真实网络/服务端底层错误，严禁掩盖
+	if !strings.Contains(err.Error(), "connection reset / internal server glitch") && !strings.Contains(err.Error(), "500") {
+		t.Fatalf("expected real underlying error, got: %v", err)
+	}
+
+	// 核心断言 2：绝不应向下穿透调用 /api/v1/fs/download 假装为单文件下载
+	if downloadHit {
+		t.Fatal("security/architecture violation: client falsely fell through to /api/v1/fs/download on remote ls failure")
+	}
+}
+

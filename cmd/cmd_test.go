@@ -2089,7 +2089,7 @@ func TestCmd_NewCmdClient_ProxyAndNoProxyWiring(t *testing.T) {
 		t.Fatal("expected non-nil client")
 	}
 
-	// 3. 测试默认系统代理缺省
+	// 3. 测试默认行为：集群客户端默认纯物理直连 (无代理)
 	globalProxy = ""
 	globalNoProxy = false
 	cliDefault := newCmdClient()

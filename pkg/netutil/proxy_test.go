@@ -197,3 +197,47 @@ func TestIsBypassedByOverride(t *testing.T) {
 		}
 	}
 }
+
+func TestResolveClusterProxyFunc(t *testing.T) {
+	// 1. 默认缺省：必须为 nil, nil (物理直连，无代理)
+	fnDefault, err := ResolveClusterProxyFunc(ProxyConfig{})
+	if err != nil {
+		t.Fatalf("unexpected error for default cluster proxy: %v", err)
+	}
+	if fnDefault != nil {
+		t.Fatalf("expected nil proxy func for default cluster config, got non-nil")
+	}
+
+	// 2. 显式 NoProxy：必须为 nil, nil
+	fnNoProxy, err := ResolveClusterProxyFunc(ProxyConfig{NoProxy: true, Proxy: "http://127.0.0.1:8888"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if fnNoProxy != nil {
+		t.Fatalf("expected nil proxy func for NoProxy=true, got non-nil")
+	}
+
+	// 3. 显式传入 Proxy：解析成功并返回指定代理
+	fnExplicit, err := ResolveClusterProxyFunc(ProxyConfig{Proxy: "http://127.0.0.1:8888"})
+	if err != nil {
+		t.Fatalf("unexpected error for explicit proxy: %v", err)
+	}
+	if fnExplicit == nil {
+		t.Fatalf("expected non-nil proxy func for explicit proxy, got nil")
+	}
+	req, _ := http.NewRequest(http.MethodGet, "http://worker:19000", nil)
+	u, err := fnExplicit(req)
+	if err != nil {
+		t.Fatalf("proxy func error: %v", err)
+	}
+	if u == nil || u.Host != "127.0.0.1:8888" {
+		t.Fatalf("expected proxy host 127.0.0.1:8888, got %v", u)
+	}
+
+	// 4. 非法 Proxy 地址返回错误
+	_, err = ResolveClusterProxyFunc(ProxyConfig{Proxy: "http://"})
+	if err == nil {
+		t.Fatalf("expected error for invalid proxy url, got nil")
+	}
+}
+

@@ -77,7 +77,9 @@ func NewClient(opts ...ClientOption) *Client {
 	dataDir := filepath.Join(home, protocol.DefaultDataDirName)
 	_ = os.MkdirAll(dataDir, 0755)
 
-	proxyFunc, _ := netutil.ResolveProxyFunc(cfg.proxyCfg)
+	// 集群节点间通信（RPC、日志与文件传输）默认物理直连（无代理），天然绝缘 Tailscale CGNAT 劫持、死代理残留与大文件代理内存缓冲；
+	// 仅当用户显式指定有效 Proxy 且未传 NoProxy 时，才走定向代理穿透
+	proxyFunc, _ := netutil.ResolveClusterProxyFunc(cfg.proxyCfg)
 
 	tr := &http.Transport{
 		Proxy: proxyFunc,
@@ -242,47 +244,37 @@ func resolveTargetToURL(target string) (string, error) {
 		port = p
 	}
 
-	// 实时动态 DNS 解析 (优先提取物理 IPv4)
-	ips, _ := net.LookupHost(host)
-	// 若单标签短主机名 (非 IP、无冒号、无点) 未解析出 IPv4，通过 RFC 6762 标准局域网域名空间 (.local) 提取物理 IPv4
-	if !hasIPv4(ips) && !strings.Contains(host, ":") && !strings.Contains(host, ".") && net.ParseIP(host) == nil {
-		if localIps, _ := net.LookupHost(host + ".local"); len(localIps) > 0 {
-			ips = append(ips, localIps...)
+	// 实时动态 DNS 解析 (兼容 Tailscale MagicDNS 与传统局域网 DNS)
+	ips, err := net.LookupHost(host)
+	if err != nil || len(ips) == 0 {
+		// 解析不通时尝试原样直连
+		if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
+			return fmt.Sprintf("http://[%s]:%s", host, port), nil
 		}
+		return fmt.Sprintf("http://%s:%s", host, port), nil
 	}
 
-	// 选择目标地址: 优先 IPv4，其次 IPv6，解析失败回退原始 host
-	chosen := host
-	if len(ips) > 0 {
-		chosen = ips[0]
-		for _, ip := range ips {
-			if strings.Contains(ip, ".") {
-				chosen = ip
-				break
-			}
+	// 取首个有效物理 IP (优先 IPv4)
+	chosenIP := ips[0]
+	for _, ip := range ips {
+		if strings.Contains(ip, ".") {
+			chosenIP = ip
+			break
 		}
 	}
 
 	// 构造合规 URL: 若为 IPv6 地址包裹中括号，并对 Zone Identifier 按 RFC 6874 转义 % 为 %25 防崩溃
-	if strings.Contains(chosen, ":") && !strings.HasPrefix(chosen, "[") {
-		cleanIP := chosen
+	if strings.Contains(chosenIP, ":") && !strings.HasPrefix(chosenIP, "[") {
+		cleanIP := chosenIP
 		if idx := strings.Index(cleanIP, "%"); idx != -1 {
 			cleanIP = fmt.Sprintf("%s%%25%s", cleanIP[:idx], cleanIP[idx+1:])
 		}
 		return fmt.Sprintf("http://[%s]:%s", cleanIP, port), nil
 	}
 
-	return fmt.Sprintf("http://%s:%s", chosen, port), nil
+	return fmt.Sprintf("http://%s:%s", chosenIP, port), nil
 }
 
-func hasIPv4(ips []string) bool {
-	for _, ip := range ips {
-		if strings.Contains(ip, ".") {
-			return true
-		}
-	}
-	return false
-}
 
 
 
@@ -373,11 +365,12 @@ func (c *Client) ListNodesWithContext(ctx context.Context) ([]protocol.NodeInfo,
 				return
 			}
 
-			// 统一走 doRequestWithContext：复用 Proxy: nil 隔离系统代理，设定 3000ms 探活超时以覆盖 Tailscale/异地冷启动打洞 (受父 ctx 约束)
+			// 单节点健康探测统一由 3000ms 超时硬约束
 			probeCtx, cancel := context.WithTimeout(ctx, 3000*time.Millisecond)
 			defer cancel()
 
 			resp, err := c.doRequestWithContext(probeCtx, rt, http.MethodGet, "/api/v1/health", nil)
+
 			if err == nil {
 				defer resp.Body.Close()
 				if resp.StatusCode == http.StatusOK {

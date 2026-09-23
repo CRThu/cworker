@@ -68,10 +68,10 @@
       * `--head <N>`：读取开头 N 行（早停断流）；
       * `-L, --lines <start:end>`：读取区间切片（如 `-L 100:200`）；
       * `--all`：输出完整内容。
-13. **全局系统代理遵循与 `--proxy` / `--no-proxy` 调度规范**：
-    * **默认缺省行为**：`cw` 所有子命令（无论是集群通信、文件传输还是自升级）默认遵循宿主系统代理与规则分流。系统优先读取 Windows 注册表 `Internet Settings`（`ProxyEnable` 与 `ProxyServer`），并自动校验 `ProxyOverride` 直连规则（`<local>`、局域网段、通配符等）；若注册表未开启，则平滑降级回退至标准环境变量（`HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY`）；环回地址（`localhost`、`127.0.0.1`、`::1`）默认享受强制物理直连保护，避免本地通信死锁；
-    * **强制物理直连（`--no-proxy`）**：在局域网内进行 GB 级别海量文件传输（`cw cp`），或在 Windows 出现代理客户端异常退出导致注册表死代理残留时，**可显式附加 `--no-proxy`**（例如 `cw --no-proxy cp ...` 或 `cw update --no-proxy`），彻底断开所有代理隧道直连目标机器；
-    * **定向代理穿透（`--proxy <url>`）**：若需跨公网或跳板机调度海外/隔离区 Worker，可通过全局持久标志指定特定代理（支持 HTTP/HTTPS/SOCKS5，例如 `cw --proxy socks5://127.0.0.1:10808 run ...`）。
+13. **网络拓扑与代理调度规范（集群默认直连，update 智能代理）**：
+    * **集群节点通信（默认纯物理直连）**：`cw run`、`cw ps`、`cw cp`、`cw logs` 等所有集群节点交互**默认彻底物理直连（强制无代理）**，不读取系统代理或环境变量。天然免疫 Tailscale CGNAT（`100.*`）误劫持、避免跨机大文件传输爆代理内存、防止 Windows 注册表死代理残留导致内网通信瘫痪；
+    * **定向代理穿透（`--proxy <url>`）**：若需跨公网或跳板机调度海外/隔离区 Worker，可通过全局持久标志指定特定代理（支持 HTTP/HTTPS/SOCKS5，例如 `cw --proxy socks5://127.0.0.1:10808 run ...`）；
+    * **公网自升级（`cw update` 智能系统代理）**：面向 GitHub Releases，默认遵循 Windows 注册表 `Internet Settings`（`ProxyEnable` 与 `ProxyServer`）及环境变量代理；若需强制直连可传 `--no-proxy`。
 
 ---
 

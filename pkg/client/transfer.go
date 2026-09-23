@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"cworker/pkg/fsengine"
 	"cworker/pkg/pathutil"
 )
 
@@ -23,6 +24,18 @@ func (e *ErrDirectoryWithoutRecursive) Error() string {
 		return fmt.Sprintf("omitting directory '%s:%s' (use -r to copy recursively)", e.Node, e.Path)
 	}
 	return fmt.Sprintf("omitting directory '%s' (use -r to copy recursively)", e.Path)
+}
+
+// isPathIsFileError 判定错误是否源于目标路径存在但为单文件 (而非目录)
+func isPathIsFileError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, fsengine.ErrPathIsFile) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "path is a file") || strings.Contains(msg, "not a directory")
 }
 
 // TransferOptions 封装单向/双向/跨机/本地中继文件与目录传输的完整参数契约
@@ -57,6 +70,9 @@ func (c *Client) Transfer(ctx context.Context, opts TransferOptions, tracker *Pr
 	// 1. 远端到远端中继传输
 	if srcNode != "" && dstNode != "" {
 		_, lsErr := c.ListDirWithContext(ctx, srcNode, srcPath)
+		if lsErr != nil && !isPathIsFileError(lsErr) {
+			return lsErr
+		}
 		isSrcDir := lsErr == nil
 
 		if isSrcDir {
@@ -158,6 +174,9 @@ func (c *Client) Transfer(ctx context.Context, opts TransferOptions, tracker *Pr
 
 		// 探测源端是否为目录
 		_, lsErr := c.ListDirWithContext(ctx, srcNode, srcPath)
+		if lsErr != nil && !isPathIsFileError(lsErr) {
+			return lsErr
+		}
 		isSrcDir := lsErr == nil
 
 		if isSrcDir {

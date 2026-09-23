@@ -3420,6 +3420,45 @@ func TestClient_ResolveTargetToURL(t *testing.T) {
 	})
 }
 
+func TestClient_ClusterProxyDefaultAndExplicit(t *testing.T) {
+	t.Setenv("USERPROFILE", t.TempDir())
+
+	// 1. 验证默认缺省行为：集群通信默认强制物理直连 (Proxy == nil)
+	cliDefault := NewClient()
+	trDefault, ok := cliDefault.httpClient.Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("expected http.Transport for httpClient")
+	}
+	if trDefault.Proxy != nil {
+		t.Fatal("expected nil Proxy for default cluster client (direct physical connection required)")
+	}
+
+	// 2. 验证显式指定 --proxy：能够成功构造定向代理穿透
+	cliExplicit := NewClient(WithProxy("http://127.0.0.1:8888"))
+	trExplicit, ok := cliExplicit.httpClient.Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("expected http.Transport for httpClient")
+	}
+	if trExplicit.Proxy == nil {
+		t.Fatal("expected non-nil Proxy for explicit WithProxy")
+	}
+	req, _ := http.NewRequest(http.MethodGet, "http://worker:19000", nil)
+	u, err := trExplicit.Proxy(req)
+	if err != nil || u == nil || u.Host != "127.0.0.1:8888" {
+		t.Fatalf("expected proxy host '127.0.0.1:8888', got: %v (err: %v)", u, err)
+	}
+
+	// 3. 验证显式 WithNoProxy：即使传入 Proxy 地址也强制物理直连
+	cliNoProxy := NewClient(WithProxy("http://127.0.0.1:8888"), WithNoProxy(true))
+	trNoProxy, ok := cliNoProxy.httpClient.Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("expected http.Transport for httpClient")
+	}
+	if trNoProxy.Proxy != nil {
+		t.Fatal("expected nil Proxy when WithNoProxy=true")
+	}
+}
+
 
 
 

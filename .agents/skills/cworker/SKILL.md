@@ -38,16 +38,16 @@ description: >-
 - **Text Slicing & 1MB Truncation (`cw cat` & `cw logs`)**:
   - Content $\le$ 1MB outputs in full; content $>$ 1MB automatically truncates to the last 100 lines with an override notice.
   - Flags: `-n/--tail <N>` (last N lines), `--head <N>` (first N lines), `-L/--lines <start:end>` (line range), `--all` (full output).
-- **Global System Proxy & Direct Connection (`--proxy` / `--no-proxy`)**:
-  - All `cw` commands default to following host system proxy rules (Windows registry `Internet Settings` priority, matching `ProxyOverride` bypass lists, and fallback to `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`). Loopback addresses (`127.0.0.1`, `localhost`) are strictly protected from routing loops.
-  - Use `--no-proxy` to force pure direct connection (recommended for high-bandwidth LAN transfers or dead Windows proxy registry recovery).
-  - Use `--proxy <url>` (HTTP/HTTPS/SOCKS5) to explicitly tunnel commands to specific remote/bastion nodes.
+- **Network Topology & Proxy Rules (Direct by Default for Cluster, System Proxy for Update)**:
+  - **Cluster Commands (Default Direct Connection)**: All cluster communications (`cw run`, `cw ps`, `cw cp`, `cw logs`, `cw kill`, `cw cat`, `cw rm`, `cw diff`, `cw node`) **strictly default to pure physical direct connection (no proxy)**. Bypasses Windows registry settings and environment variables entirely, immune to Tailscale CGNAT (`100.*`) hijacking, dead Windows registry proxies, and memory exhaustion during large file transfers.
+  - **Explicit Proxy Tunneling (`--proxy <url>`)**: Pass `--proxy <url>` (HTTP/HTTPS/SOCKS5) to explicitly tunnel commands across DMZs or jumpboxes to isolated remote nodes.
+  - **Self-Update (`cw update`)**: Targets public GitHub Releases and **defaults to following host system proxy rules** (Windows registry `Internet Settings` priority, fallback to environment variables, then direct). Pass `--no-proxy` to force direct connection or `--mirror <url>` for mirror acceleration.
 
 ## 2. CLI Reference
 
 | Action | Command | Output / Notes |
 | :--- | :--- | :--- |
-| **Global Proxy Flags** | `cw [--proxy <url>] [--no-proxy] <cmd>` | All subcommands inherit proxy routing & direct override flags |
+| **Global Proxy Flags** | `cw [--proxy <url>] [--no-proxy] <cmd>` | Cluster commands default to direct connection; use `--proxy` to tunnel; `update` defaults to system proxy |
 | **Cluster Health** | `cw nodes` | Status (`ONLINE`/`OFFLINE`), Version, OS, CPU%, Free/Total RAM, Job count |
 | **Local Identity** | `cw show [--refresh]` | Displays machine name, IP addresses, service state, token |
 | **Add Node** | `cw node add <name> [target] [--token <t>]` | Registers remote node to cluster (auto-infers `:19000`) |

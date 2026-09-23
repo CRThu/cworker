@@ -17,7 +17,7 @@ type ProxyConfig struct {
 	NoProxy bool   // 显式禁用所有代理 (强制物理直连)
 }
 
-// ResolveProxyFunc 根据统一配置解析出 http.Transport 使用的 Proxy 函数
+// ResolveProxyFunc (亦作 ResolveSystemProxyFunc) 根据统一配置解析出公网访问 (如自升级) 使用的 Proxy 函数
 // 优先级法则：
 // 1. NoProxy == true: 最高优先级，返回 nil (http.Transport.Proxy = nil，彻底物理直连)
 // 2. Proxy != "": 用户显式指定代理，返回 http.ProxyURL(...)
@@ -43,6 +43,22 @@ func ResolveProxyFunc(cfg ProxyConfig) (func(*http.Request) (*url.URL, error), e
 
 	// 优先级 3: 默认缺省级联探测 (Windows 注册表优先 -> 环境变量降级 -> 直连)
 	return defaultProxyResolver, nil
+}
+
+// ResolveClusterProxyFunc 解析集群节点间通信（RPC、日志与点对点文件传输）使用的 Proxy 函数
+// 设计契约（第一性原理与内网/Tailscale 特化）：
+// 1. 默认缺省：彻底物理直连 (nil, nil)，天然免疫 Tailscale CGNAT (100.*) 劫持、死代理残留与大文件传输缓冲
+// 2. NoProxy == true: 彻底物理直连 (nil, nil)
+// 3. Proxy != "": 仅当用户显式指定代理地址时，才构造定向代理穿透
+func ResolveClusterProxyFunc(cfg ProxyConfig) (func(*http.Request) (*url.URL, error), error) {
+	if cfg.NoProxy || strings.TrimSpace(cfg.Proxy) == "" {
+		return nil, nil
+	}
+	parsedURL, err := ParseProxyURL(cfg.Proxy)
+	if err != nil {
+		return nil, fmt.Errorf("invalid cluster proxy url '%s': %w", cfg.Proxy, err)
+	}
+	return http.ProxyURL(parsedURL), nil
 }
 
 // ParseProxyURL 解析代理字符串，自动补全协议前缀并验证
