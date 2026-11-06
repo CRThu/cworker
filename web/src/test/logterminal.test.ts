@@ -11,8 +11,8 @@ describe('LogTerminal real-time log streaming and retention', () => {
     url: string;
     onopen: (() => void) | null = null;
     onmessage: ((e: { data: string }) => void) | null = null;
-    onclose: (() => void) | null = null;
-    onerror: ((e: any) => void) | null = null;
+    onclose: ((event?: any) => void) | null = null;
+    onerror: ((e?: any) => void) | null = null;
     readyState = 0; // CONNECTING
 
     constructor(url: string) {
@@ -24,15 +24,19 @@ describe('LogTerminal real-time log streaming and retention', () => {
       }, 0);
     }
 
-    close() {
+    close(code = 1000) {
       this.readyState = 3; // CLOSED
-      if (this.onclose) this.onclose();
+      if (this.onclose) this.onclose({ code });
     }
   }
 
   beforeEach(() => {
     MockWebSocket.instances = [];
     (globalThis as any).WebSocket = MockWebSocket;
+    (globalThis as any).fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      text: () => Promise.resolve(''),
+    });
   });
 
   it('should connect to websocket stream and display incoming text with ANSI colors', async () => {
@@ -246,6 +250,124 @@ describe('LogTerminal real-time log streaming and retention', () => {
 
     await fireEvent.keyDown(window, { key: 'Escape' });
     expect(closed).toBe(false);
+  });
+
+  it('should automatically reconnect with backoff when websocket stream is interrupted on RUNNING job', async () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = render(LogTerminal, {
+        props: {
+          open: true,
+          jobId: 'job-recon-1',
+          status: 'RUNNING',
+        },
+      });
+
+      await vi.advanceTimersByTimeAsync(10);
+      expect(MockWebSocket.instances.length).toBe(1);
+      const ws1 = MockWebSocket.instances[0];
+
+      // 接收初始日志
+      ws1.onmessage?.({ data: 'Initial streaming output line 1\n' });
+      await vi.advanceTimersByTimeAsync(10);
+      expect(container.querySelector('.terminal-body')?.textContent).toContain('Initial streaming output line 1');
+
+      // 模拟网络闪断/异常断开 (code 1006)
+      ws1.readyState = 3;
+      ws1.onclose?.({ code: 1006 } as any);
+      await vi.advanceTimersByTimeAsync(10);
+
+      // 验证断开状态提示与平滑留存 (不闪烁白屏，日志依然留存)
+      expect(container.querySelector('.footer-hint')?.textContent).toContain('连接已断开');
+      expect(container.querySelector('.footer-hint')?.textContent).toContain('秒后自动重试');
+      expect(container.querySelector('.terminal-body')?.textContent).toContain('Initial streaming output line 1');
+
+      // 前进 1050ms 触发第一次退避重连
+      await vi.advanceTimersByTimeAsync(1050);
+      expect(MockWebSocket.instances.length).toBe(2);
+      const ws2 = MockWebSocket.instances[1];
+
+      // 等待 ws2 建立连接
+      await vi.advanceTimersByTimeAsync(10);
+      expect(container.querySelector('.footer-hint')?.textContent).toBe('实时传输中');
+
+      // ws2 推送最新日志
+      ws2.onmessage?.({ data: 'Reconnected updated output line 2\n' });
+      await vi.advanceTimersByTimeAsync(10);
+      expect(container.querySelector('.terminal-body')?.textContent).toContain('Reconnected updated output line 2');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('should immediately trigger reconnect on browser window online event without waiting for timer', async () => {
+    const { container } = render(LogTerminal, {
+      props: {
+        open: true,
+        jobId: 'job-recon-online',
+        status: 'RUNNING',
+      },
+    });
+
+    await new Promise(r => setTimeout(r, 10));
+    expect(MockWebSocket.instances.length).toBe(1);
+    const ws1 = MockWebSocket.instances[0];
+
+    // 发送初始日志
+    ws1.onmessage?.({ data: 'Initial line for online test\n' });
+    await new Promise(r => setTimeout(r, 10));
+
+    // 模拟连接异常断开
+    ws1.readyState = 3;
+    ws1.onclose?.({ code: 1006 } as any);
+    await new Promise(r => setTimeout(r, 10));
+
+    expect(container.querySelector('.footer-hint')?.textContent).toContain('连接已断开');
+
+    // 模拟浏览器恢复网络触发 online 事件
+    window.dispatchEvent(new Event('online'));
+    await new Promise(r => setTimeout(r, 20));
+
+    // 验证无需等待数秒定时器，立即发起第 2 次重连
+    expect(MockWebSocket.instances.length).toBe(2);
+    expect(container.querySelector('.footer-hint')?.textContent).toBe('实时传输中');
+  });
+
+  it('should cancel reconnect timer and stop retrying when drawer is closed', async () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = render(LogTerminal, {
+        props: {
+          open: true,
+          jobId: 'job-recon-cancel',
+          status: 'RUNNING',
+        },
+      });
+
+      await vi.advanceTimersByTimeAsync(10);
+      expect(MockWebSocket.instances.length).toBe(1);
+      const ws1 = MockWebSocket.instances[0];
+      ws1.onmessage?.({ data: 'Running output\n' });
+      await vi.advanceTimersByTimeAsync(10);
+
+      // 异常断开
+      ws1.readyState = 3;
+      ws1.onclose?.({ code: 1006 } as any);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(container.querySelector('.footer-hint')?.textContent).toContain('自动重试');
+
+      // 关闭抽屉 (点击右上角关闭按钮)
+      const closeBtn = container.querySelector('.close-btn') as HTMLElement;
+      expect(closeBtn).not.toBeNull();
+      await fireEvent.click(closeBtn);
+      await vi.advanceTimersByTimeAsync(10);
+
+      // 即使推进 5 秒，也不会发起任何新的重连
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(MockWebSocket.instances.length).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

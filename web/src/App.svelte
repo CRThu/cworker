@@ -98,6 +98,14 @@
       isBackendConnected = true;
       backendErrorMsg = null;
 
+      // 若实时日志抽屉处于打开状态，同步更新当前查看任务的最新运行状态
+      if (isTerminalOpen && terminalJobId) {
+        const curJob = jobs.find(j => j.id === terminalJobId);
+        if (curJob && curJob.status && curJob.status !== terminalJobStatus) {
+          terminalJobStatus = curJob.status;
+        }
+      }
+
       // 更新历史走势点队列
       nodes.forEach(n => {
         const cpu = n.status === 'ONLINE' && n.metrics ? n.metrics.cpu_percent : 0;

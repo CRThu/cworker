@@ -1,4 +1,4 @@
-<!-- web/src/lib/components/LogTerminal.svelte - 实时流式终端抽屉 (全套 SVG 矢量图标，支持断开保持与重新加载) -->
+<!-- web/src/lib/components/LogTerminal.svelte - 实时流式终端抽屉 (全套 SVG 矢量图标，支持断开保持、弹性自动重连与重新加载) -->
 <script lang="ts">
   import { onMount, onDestroy, createEventDispatcher } from 'svelte';
   import { Terminal, RotateCcw, Trash2, Download, X } from 'lucide-svelte';
@@ -20,17 +20,76 @@
   let wsStatus = '未连接';
   let isConnected = false;
 
+  // 弹性重连状态机
+  let reconnectTimer: any = null;
+  let reconnectAttempts = 0;
+  let isManualClose = false;
+  let needsBufferReset = false;
+
   $: if (open && jobId) {
-    connectWs();
+    isManualClose = false;
+    connectWs(false);
   } else if (!open) {
     disconnectWs();
   }
 
-  function connectWs() {
-    disconnectWs();
-    rawBuffer = '';
-    renderedHtml = '';
-    wsStatus = '连接中...';
+  $: if (status && status !== 'RUNNING') {
+    // 任务状态终态（如 COMPLETED/FAILED/STOPPED），取消重连定时器
+    clearReconnectTimer();
+  }
+
+  function clearReconnectTimer() {
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+  }
+
+  function scheduleReconnect(customPrefix?: string) {
+    if (!open || !jobId || isManualClose) return;
+    if (status !== 'RUNNING' && rawBuffer.trim()) return;
+
+    clearReconnectTimer();
+
+    // 指数退避调度 (1s -> 2s -> 3s -> 最大 5s)
+    const delays = [1000, 2000, 3000, 5000];
+    const delay = delays[Math.min(reconnectAttempts, delays.length - 1)];
+    reconnectAttempts++;
+
+    const sec = Math.round(delay / 1000);
+    const prefix = customPrefix || '连接已断开';
+    wsStatus = `${prefix}，${sec} 秒后自动重试...`;
+
+    reconnectTimer = setTimeout(() => {
+      if (!open || isManualClose) return;
+      connectWs(true);
+    }, delay);
+  }
+
+  function connectWs(isReconnect = false) {
+    // 关闭已有连接但保持 isManualClose 为 false
+    if (ws) {
+      try {
+        if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+          ws.close();
+        }
+      } catch (_) {}
+      ws = null;
+    }
+    clearReconnectTimer();
+    isConnected = false;
+
+    if (!isReconnect) {
+      rawBuffer = '';
+      renderedHtml = '';
+      needsBufferReset = false;
+      reconnectAttempts = 0;
+      wsStatus = '连接中...';
+    } else {
+      // 重连模式：保持已渲染内容避免白屏闪烁，待第一包新推流数据到达时原子重置
+      needsBufferReset = true;
+      wsStatus = '正在重连...';
+    }
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const params = new URLSearchParams();
@@ -42,10 +101,17 @@
       ws = new WebSocket(wsUrl);
       ws.onopen = () => {
         isConnected = true;
+        reconnectAttempts = 0;
+        clearReconnectTimer();
         wsStatus = '实时传输中';
       };
 
       ws.onmessage = (event) => {
+        if (needsBufferReset) {
+          rawBuffer = '';
+          renderedHtml = '';
+          needsBufferReset = false;
+        }
         const text = event.data;
         rawBuffer += text;
         renderedHtml += ansiToHtml(text);
@@ -58,25 +124,43 @@
 
       ws.onclose = async () => {
         isConnected = false;
-        // 若 WebSocket 未接收到任何日志，自动通过 REST API 回退拉取完整历史日志
+        if (isManualClose || !open) return;
+
+        // 若任务已处于终态
+        if (status !== 'RUNNING') {
+          if (!rawBuffer.trim()) {
+            await fetchFallbackLogs();
+          } else {
+            wsStatus = '传输完毕';
+          }
+          return;
+        }
+
+        // 任务仍处于 RUNNING 状态，但推流连接关闭 (网络闪断、连接中断或服务重启)
         if (!rawBuffer.trim()) {
           await fetchFallbackLogs();
+          if (wsStatus.startsWith('加载失败')) {
+            scheduleReconnect(wsStatus);
+          } else {
+            scheduleReconnect();
+          }
         } else {
-          wsStatus = status === 'RUNNING' ? '连接已断开' : '传输完毕';
+          wsStatus = '连接已断开';
+          scheduleReconnect();
         }
       };
 
       ws.onerror = async () => {
         isConnected = false;
-        // 连接异常时同样尝试通过 REST 回退拉取
-        if (!rawBuffer.trim()) {
-          await fetchFallbackLogs();
-        } else {
-          wsStatus = status === 'RUNNING' ? '连接异常中断' : '连接断开';
-        }
+        if (isManualClose || !open) return;
+        // 浏览器标准下 onerror 之后通常触发 onclose；若部分测试 mock 未派发 onclose 则兜底调度
       };
     } catch (e: any) {
-      fetchFallbackLogs();
+      if (!isManualClose && open) {
+        fetchFallbackLogs().then(() => {
+          scheduleReconnect();
+        });
+      }
     }
   }
 
@@ -97,7 +181,7 @@
       if (text) {
         rawBuffer = text;
         renderedHtml = ansiToHtml(text);
-        wsStatus = '已加载完整日志';
+        wsStatus = status === 'RUNNING' ? '已加载完整日志' : '传输完毕';
         if (autoScroll && outputEl) {
           requestAnimationFrame(() => {
             if (outputEl) outputEl.scrollTop = outputEl.scrollHeight;
@@ -112,13 +196,27 @@
   }
 
   function disconnectWs() {
+    isManualClose = true;
+    clearReconnectTimer();
+    reconnectAttempts = 0;
     if (ws) {
-      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
-        ws.close();
-      }
+      try {
+        if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+          ws.close();
+        }
+      } catch (_) {}
       ws = null;
     }
     isConnected = false;
+  }
+
+  function handleOnline() {
+    // 监听网络恢复事件，快速触发重连
+    if (open && jobId && !isConnected && (status === 'RUNNING' || !rawBuffer.trim())) {
+      clearReconnectTimer();
+      reconnectAttempts = 0;
+      connectWs(true);
+    }
   }
 
   function handleClear() {
@@ -127,9 +225,11 @@
   }
 
   function handleReload() {
+    clearReconnectTimer();
+    reconnectAttempts = 0;
     rawBuffer = '';
     renderedHtml = '';
-    connectWs();
+    connectWs(false);
   }
 
   function handleDownload() {
@@ -160,7 +260,7 @@
   });
 </script>
 
-<svelte:window on:keydown={handleKeydown} />
+<svelte:window on:keydown={handleKeydown} on:online={handleOnline} />
 
 {#if open}
   <div class="terminal-modal-overlay" role="presentation" on:click|self={handleClose} on:keydown={(e) => e.key === 'Escape' && handleClose()}>
