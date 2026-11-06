@@ -1668,6 +1668,87 @@ func TestRunCmd_WaitAndClean(t *testing.T) {
 	}
 }
 
+func TestFormatCommandLine_Comprehensive(t *testing.T) {
+	// 1. 空参数
+	if res := formatCommandLine([]string{}); res != "" {
+		t.Errorf("expected empty string, got: %s", res)
+	}
+
+	// 2. 单个整句命令 (原样保留，不额外加外层双引号)
+	if res := formatCommandLine([]string{"git status"}); res != "git status" {
+		t.Errorf("expected 'git status', got: %s", res)
+	}
+	if res := formatCommandLine([]string{`python -c "print('ok')"`}); res != `python -c "print('ok')"` {
+		t.Errorf("expected preserved command, got: %s", res)
+	}
+
+	// 3. 多个平铺参数或 -- 隔离参数 (带空格参数自动补充双引号)
+	args := []string{"git", "commit", "-m", "fix: resolve memory leak"}
+	expected := `git commit -m "fix: resolve memory leak"`
+	if res := formatCommandLine(args); res != expected {
+		t.Errorf("expected %s, got: %s", expected, res)
+	}
+
+	// 4. 路径带空格与末尾反斜杠
+	argsPath := []string{"python", "run.py", "--dir", `C:\Program Files\data\`}
+	expectedPath := `python run.py --dir "C:\Program Files\data\\"`
+	if res := formatCommandLine(argsPath); res != expectedPath {
+		t.Errorf("expected %s, got: %s", expectedPath, res)
+	}
+
+	// 5. 空字符串参数
+	argsEmpty := []string{"echo", ""}
+	expectedEmpty := `echo ""`
+	if res := formatCommandLine(argsEmpty); res != expectedEmpty {
+		t.Errorf("expected %s, got: %s", expectedEmpty, res)
+	}
+}
+
+func TestRunCmd_ShellFlagAndStructuredQuotes(t *testing.T) {
+	t.Setenv("USERPROFILE", t.TempDir())
+	var receivedReq protocol.RunJobRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/jobs/run" {
+			_ = json.NewDecoder(r.Body).Decode(&receivedReq)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(protocol.JobInfo{
+				ID:   "job-shell-test",
+				Node: "mock-worker",
+				PID:  5678,
+			})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	cli := client.NewClient()
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "mock-worker", Target: u.Host})
+
+	runNodeName = "mock-worker"
+	runShell = "pwsh"
+	runWait = false
+	defer func() {
+		runNodeName = ""
+		runShell = "cmd"
+	}()
+
+	// 模拟执行 cw run -n mock-worker -s pwsh -- git commit -m "fix: resolve memory leak"
+	err := runCmd.RunE(runCmd, []string{"git", "commit", "-m", "fix: resolve memory leak"})
+	if err != nil {
+		t.Fatalf("runCmd failed: %v", err)
+	}
+
+	if receivedReq.Shell != "pwsh" {
+		t.Errorf("expected shell 'pwsh', got: %s", receivedReq.Shell)
+	}
+	expectedCmd := `git commit -m "fix: resolve memory leak"`
+	if receivedReq.Command != expectedCmd {
+		t.Errorf("expected command %s, got: %s", expectedCmd, receivedReq.Command)
+	}
+}
+
 func TestCleanCmd_SingleJob(t *testing.T) {
 	t.Setenv("USERPROFILE", t.TempDir())
 	var cleanedJob string

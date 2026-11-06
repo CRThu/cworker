@@ -5,9 +5,9 @@ import "time"
 // 核心系统契约与协议常量 (SSOT 单一事实来源)
 const (
 	// Version 当前软件系统发布版本契约 (SSOT 单一事实来源)
-	Version = "1.9.1"
+	Version = "1.10.0"
 	// BuildDate 构建与发布日期契约 (SSOT 单一事实来源)
-	BuildDate = "2026-09-23"
+	BuildDate = "2026-11-06"
 	// DefaultPort Worker 默认监听端口
 	DefaultPort = 19000
 	// DefaultPortStr Worker 默认监听端口字符串形式
@@ -88,6 +88,7 @@ type RunJobRequest struct {
 	Name              string `json:"name"`
 	Node              string `json:"node"`
 	Command           string `json:"command"`
+	Shell             string `json:"shell,omitempty"` // 执行外壳: 空或 "cmd" (默认), "pwsh", "powershell", "bash"
 	Dir               string `json:"dir"`
 	KillOnDisconnect  bool   `json:"kill_on_disconnect,omitempty"`
 	CleanOnDisconnect bool   `json:"clean_on_disconnect,omitempty"`

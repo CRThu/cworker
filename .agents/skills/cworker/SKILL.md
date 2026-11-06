@@ -31,6 +31,12 @@ description: >-
 - **Execution Modes (`cw run`)**:
   - **Async Long-running (Default)**: `cw run` returns immediately with a `job-<hex>` handle. Do not block; poll status with `cw ps` or inspect output with `cw logs <job_id>`.
   - **Foreground Sync with Auto-cleanup (Recommended for Probing: `-wc`)**: Use `cw run -wc "<cmd>"` (or `-w --clean`) for immediate tasks (e.g. `git status`, environment probing, short scripts). It streams output live, propagates the remote ExitCode directly to the CLI, and auto-destroys the job and log files upon exit without polluting `cw ps`.
+  - **Argument Pass-through (`--`) & Escaping Defense**: For commands with embedded double quotes, spaces, or overlapping flags (e.g. `-n`, `-c`, `--help`), **prefer passing arguments after `--`**: `cw run [flags] -- <cmd> [args...]`. Arguments after `--` are safely preserved without flag collision and internal quotes do not require backslash escaping.
+  - **Multi-Shell Support (`-s, --shell`)**:
+    - `cmd` (default): Fast (2ms startup), wrapped in defensive quotes for CMD quote preservation, 100% compatible with `%PATH%`, `dir`, `echo`, `&&`.
+    - `pwsh` / `powershell`: For PowerShell cmdlets and pipelines (`|`); automatically sets `$ErrorActionPreference = 'Stop'`, UTF-8 console output, and exit code propagation.
+    - `bash`: For WSL / Git Bash / Linux environments.
+    - *Local Terminal Note*: When passing pipeline characters (`|`, `>`, `&&`) from local interactive shells, enclose the command in quotes (e.g. `cw run --shell pwsh "Get-Process | Select-Object -First 3"`) to prevent the local shell from prematurely intercepting the pipeline.
 - **Process Tree Cleanup**: `cw kill <job_id>` uses Win32 Job Objects to terminate the entire process hierarchy without leaving orphan processes. On `-w` synchronous runs, keyboard interrupts (Ctrl+C) automatically terminate the remote process tree and clean up.
 - **`cw clean` MUST include `-y`**:
   - **Single Job Cleanup**: `cw clean [<node>:]<job_id> -y` deletes the specific finished job record and logs.
@@ -52,7 +58,7 @@ description: >-
 | **Local Identity** | `cw show [--refresh]` | Displays machine name, IP addresses, service state, token |
 | **Add Node** | `cw node add <name> [target] [--token <t>]` | Registers remote node to cluster (auto-infers `:19000`) |
 | **Remove Node** | `cw node rm <name>` | Unregisters node from cluster |
-| **Dispatch / Exec** | `cw run [-w] [-c] [-n <node>] "<cmd>"` | Default: async job. Use `-wc` for foreground sync execution, live streaming, exit code alignment & auto-cleanup |
+| **Dispatch / Exec** | `cw run [-w] [-c] [-s <shell>] [-n <node>] [--] <cmd>` | Default: async job. Use `-wc` for foreground sync execution, live streaming, exit code alignment & auto-cleanup; use `--` for clean arg pass-through; `-s` sets shell (`cmd`/`pwsh`/`powershell`/`bash`) |
 | **List Jobs** | `cw ps [-n <node>] [--all] [--limit <n>]` | Lists jobs across cluster or node (`RUNNING` pinned to top, default 20 recent, `--all` shows all) |
 | **Clean Jobs** | `cw clean [<node>:]<job_id> [-y]` / `cw clean <--days <n> \| --all> -y` | Cleans specific job or batches of finished jobs; deletes disk logs; protects RUNNING tasks |
 | **Read Logs** | `cw logs [<node>:]<job_id> [-n <lines>] [--head <n>] [-L <range>] [--all]` | Reads logs (1MB auto-guard; supports tail, head, range & --all); supports direct node targeting |
@@ -76,6 +82,13 @@ description: >-
 # Execute immediate command synchronously with auto-cleanup (zero leftovers in cw ps)
 cw run -n desktop-4090 -wc "nvidia-smi"
 cw run -n desktop-4090 -wc --dir "D:/workspace" "git status"
+
+# Pass complex arguments or arguments with embedded quotes safely using --
+cw run -n desktop-4090 -wc -- git commit -m "fix: resolve memory leak"
+cw run -n desktop-4090 -wc -- python train.py -n 10 --input "C:\Program Files\data.csv"
+
+# Dispatch PowerShell pipeline command
+cw run -n desktop-4090 -wc --shell pwsh "Get-Process | Select-Object -First 3"
 ```
 
 ### Pattern 2: Async Dispatch & Poll

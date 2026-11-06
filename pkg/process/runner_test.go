@@ -342,3 +342,116 @@ func TestManagedJob_KillOnDisconnect_Accessors(t *testing.T) {
 		t.Errorf("nil job CleanOnDisconnect() should return false")
 	}
 }
+
+func TestBuildShellCmd_Structures(t *testing.T) {
+	// 验证各外壳类型的命令行结构
+	reqCMD := protocol.RunJobRequest{Command: `echo "hello world"`, Shell: "cmd"}
+	cCMD, err := buildShellCmd(reqCMD)
+	if err != nil {
+		t.Fatalf("buildShellCmd cmd failed: %v", err)
+	}
+	if cCMD.Path == "" && len(cCMD.Args) == 0 {
+		t.Errorf("expected valid cmd command")
+	}
+	if cCMD.SysProcAttr == nil || !strings.Contains(cCMD.SysProcAttr.CmdLine, `cmd.exe /c "echo "hello world""`) {
+		t.Errorf("expected SysProcAttr.CmdLine wrapped with quotes, got: %v", cCMD.SysProcAttr)
+	}
+	if !cCMD.SysProcAttr.HideWindow {
+		t.Errorf("expected HideWindow to be true")
+	}
+
+	reqPWSH := protocol.RunJobRequest{Command: `Get-Process | Select-Object -First 1`, Shell: "pwsh"}
+	cPWSH, err := buildShellCmd(reqPWSH)
+	if err == nil {
+		if !strings.Contains(cPWSH.Args[0], "pwsh") {
+			t.Errorf("expected pwsh executable, got: %s", cPWSH.Args[0])
+		}
+		if !cPWSH.SysProcAttr.HideWindow {
+			t.Errorf("expected HideWindow to be true")
+		}
+	} else {
+		// pwsh 未安装场景应给出清晰引导
+		if !strings.Contains(err.Error(), "pwsh") {
+			t.Errorf("expected clear guidance on missing pwsh, got: %v", err)
+		}
+	}
+
+	reqPS := protocol.RunJobRequest{Command: `Get-Process | Select-Object -First 1`, Shell: "powershell"}
+	cPS, err := buildShellCmd(reqPS)
+	if err != nil {
+		t.Fatalf("buildShellCmd powershell failed: %v", err)
+	}
+	if !strings.Contains(cPS.Args[0], "powershell") {
+		t.Errorf("expected powershell executable, got: %s", cPS.Args[0])
+	}
+	if !cPS.SysProcAttr.HideWindow {
+		t.Errorf("expected HideWindow to be true")
+	}
+
+	// 验证不支持的外壳强类型报错
+	reqInvalid := protocol.RunJobRequest{Command: `echo test`, Shell: "zsh"}
+	_, errInvalid := buildShellCmd(reqInvalid)
+	if errInvalid == nil || !strings.Contains(errInvalid.Error(), "unsupported shell 'zsh'") {
+		t.Errorf("expected unsupported shell error, got: %v", errInvalid)
+	}
+}
+
+func TestManagedJob_ShellExecution_PowerShellAndCMD(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "cworker_shell_test_*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// 1. 测试 cmd 外壳保留内部双引号
+	reqCMD := protocol.RunJobRequest{
+		Name:    "cmd-quotes",
+		Command: `echo "cworker_cmd_quotes_ok"`,
+		Shell:   "cmd",
+	}
+	jobCMD, err := StartJob(reqCMD, "test-job-cmd", "local-node", tempDir)
+	if err != nil {
+		t.Fatalf("StartJob cmd failed: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	infoCMD := jobCMD.GetInfo()
+	if infoCMD.Status != protocol.JobStatusCompleted || infoCMD.ExitCode != 0 {
+		t.Errorf("jobCMD status = %s, code = %d", infoCMD.Status, infoCMD.ExitCode)
+	}
+	contentCMD, _ := os.ReadFile(filepath.Join(tempDir, "jobs", "test-job-cmd", "output.log"))
+	if !strings.Contains(string(contentCMD), `"cworker_cmd_quotes_ok"`) {
+		t.Errorf("expected output to preserve double quotes, got: %s", string(contentCMD))
+	}
+
+	// 2. 测试 powershell 外壳管道与真实退出码
+	reqPS := protocol.RunJobRequest{
+		Name:    "ps-pipeline",
+		Command: `Get-Process | Select-Object -First 1`,
+		Shell:   "powershell",
+	}
+	jobPS, err := StartJob(reqPS, "test-job-ps", "local-node", tempDir)
+	if err != nil {
+		t.Fatalf("StartJob powershell failed: %v", err)
+	}
+	time.Sleep(1000 * time.Millisecond)
+	infoPS := jobPS.GetInfo()
+	if infoPS.Status != protocol.JobStatusCompleted || infoPS.ExitCode != 0 {
+		t.Errorf("jobPS status = %s, code = %d", infoPS.Status, infoPS.ExitCode)
+	}
+
+	// 3. 测试 powershell 错误守卫防假阳性退出码
+	reqPSFail := protocol.RunJobRequest{
+		Name:    "ps-fail",
+		Command: `Get-Item nonexistent_file_cworker_fail_12345`,
+		Shell:   "powershell",
+	}
+	jobPSFail, err := StartJob(reqPSFail, "test-job-ps-fail", "local-node", tempDir)
+	if err != nil {
+		t.Fatalf("StartJob powershell fail test failed: %v", err)
+	}
+	time.Sleep(1000 * time.Millisecond)
+	infoPSFail := jobPSFail.GetInfo()
+	if infoPSFail.Status != protocol.JobStatusFailed || infoPSFail.ExitCode == 0 {
+		t.Errorf("expected powershell error to yield FAILED with non-zero exit code, got status=%s code=%d", infoPSFail.Status, infoPSFail.ExitCode)
+	}
+}

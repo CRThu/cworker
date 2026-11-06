@@ -8,7 +8,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"cworker/pkg/logstream"
@@ -121,8 +123,14 @@ func StartJob(req protocol.RunJobRequest, jobID string, nodeName string, logRoot
 		return nil, fmt.Errorf("failed to create job object: %w", err)
 	}
 
-	// 3. 构建并启动 Windows 子进程 (通过 cmd.exe /c 保持原生环境支持)
-	cmd := exec.Command("cmd.exe", "/c", req.Command)
+	// 3. 构建并启动 Windows 子进程 (根据 Shell 契约多外壳调度，默认 cmd 加固原生环境支持)
+	cmd, err := buildShellCmd(req)
+	if err != nil {
+		jobObj.Close()
+		logFile.Close()
+		broadcaster.Close()
+		return nil, fmt.Errorf("build shell command failed: %w", err)
+	}
 	if req.Dir != "" {
 		cmd.Dir = req.Dir
 	}
@@ -326,4 +334,58 @@ func (j *ManagedJob) HasWatchdogConnected() bool {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	return j.watchdogConnected
+}
+
+// buildShellCmd 根据请求中的 Shell 契约构建目标子进程并进行前置有效性核验
+// - cmd (默认/空): Windows 原生 CMD (2ms 秒启)，加装双引号安全闭合，设置 HideWindow 静默无窗
+// - pwsh: 现代 PowerShell 7+，若系统未安装给出明确引导 (建议切换 powershell)；注入 try-catch 控制台安全编码与退出码对齐
+// - powershell: Windows 内置 PowerShell 5.1，注入执行策略绕过、try-catch 控制台安全编码与退出码对齐
+// - bash: WSL / Git Bash / Linux 环境支持，若缺失给出明确引导
+func buildShellCmd(req protocol.RunJobRequest) (*exec.Cmd, error) {
+	shell := strings.ToLower(strings.TrimSpace(req.Shell))
+	if shell == "" {
+		shell = "cmd"
+	}
+
+	var cmd *exec.Cmd
+	switch shell {
+	case "cmd":
+		cmd = exec.Command("cmd.exe")
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			CmdLine:    fmt.Sprintf(`cmd.exe /c "%s"`, req.Command),
+			HideWindow: true,
+		}
+		return cmd, nil
+
+	case "pwsh":
+		if _, err := exec.LookPath("pwsh"); err != nil {
+			return nil, fmt.Errorf("specified shell 'pwsh' not found in system PATH (please install PowerShell 7+ or use '--shell powershell' for Windows built-in PowerShell)")
+		}
+		// 使用 try-catch 保护 Console 编码与管道输出编码，防御无 Console (如 Windows 服务 Session 0) 环境下的 IOException
+		wrapped := fmt.Sprintf(`$ErrorActionPreference = 'Stop'; try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}; %s; if ($LASTEXITCODE) { exit $LASTEXITCODE }`, req.Command)
+		cmd = exec.Command("pwsh", "-NoProfile", "-NonInteractive", "-Command", wrapped)
+		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+		return cmd, nil
+
+	case "powershell":
+		if _, err := exec.LookPath("powershell"); err != nil {
+			return nil, fmt.Errorf("built-in shell 'powershell' not found in system PATH: %w", err)
+		}
+		// 使用 try-catch 保护 Console 编码与管道输出编码，防御无 Console (如 Windows 服务 Session 0) 环境下的 IOException
+		wrapped := fmt.Sprintf(`$ErrorActionPreference = 'Stop'; try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}; %s; if ($LASTEXITCODE) { exit $LASTEXITCODE }`, req.Command)
+		cmd = exec.Command("powershell", "-ExecutionPolicy", "Bypass", "-NoProfile", "-NonInteractive", "-Command", wrapped)
+		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+		return cmd, nil
+
+	case "bash":
+		if _, err := exec.LookPath("bash"); err != nil {
+			return nil, fmt.Errorf("specified shell 'bash' not found in system PATH (please install Git for Windows or WSL, or use default 'cmd')")
+		}
+		cmd = exec.Command("bash", "-c", req.Command)
+		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+		return cmd, nil
+
+	default:
+		return nil, fmt.Errorf("unsupported shell '%s' (supported shells: cmd, pwsh, powershell, bash)", req.Shell)
+	}
 }

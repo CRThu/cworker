@@ -36,6 +36,7 @@ export interface JobInfo {
   name: string;
   node: string;
   command: string;
+  shell?: string;
   dir?: string;
   status: JobStatus;
   pid: number;

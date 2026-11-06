@@ -6,7 +6,7 @@
 
 [![Platform](https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011%20%2F%20Server-0078D6?logo=windows&logoColor=white)](#-快速开始)
 [![Go](https://img.shields.io/badge/Go-1.21+-00ADD8?logo=go&logoColor=white)](https://golang.org)
-[![Single Binary](https://img.shields.io/badge/Binary-~7.8MB%20Standalone-orange)](#-构建与开发)
+[![Single Binary](https://img.shields.io/badge/Binary-~8MB%20Standalone-orange)](#-构建与开发)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
 <p align="center">
@@ -48,6 +48,7 @@
 - 🔓 **原生物理环境（零沙盒损耗）**：运行于宿主物理操作系统，全盘路径透明直达，硬件 GPU、CUDA 与物理外设 100% 直通。
 - 🛡️ **Win32 Job Object 内核进程治理**：子孙进程全归入 Windows 作业对象管辖，`cw kill` 由系统内核彻底连根查杀整棵进程树，杜绝孤儿后台进程泄漏。
 - ⚡ **异步长程常驻与即时同步执行**：默认毫秒级异步派发任务；亦支持前台同步直出（`-w`，退出码严格对齐）与即时自毁清理（`-wc`），零垃圾残留。
+- 🐚 **多 Shell 调度与参数零损耗**：默认 CMD 极速秒启（加装双引号安全闭合防护，彻底消除引号被吞缺陷）；原生支持 PowerShell 管道（`-s pwsh` / `-s powershell`，加装退出码守卫）；支持 `--` 隔离透传复杂参数。
 - 🚀 **全域流式文件治理与切片**：跨机与本地全打通的 `cp`（流式 SHA-256 核验）、`diff`（变动条目排查）与 `cat`（常数内存行切片，超 1MB 自动截取末尾 100 行）。
 - 🖥️ **内嵌可视化 Web 控制台**：单二进制内嵌 Svelte 5 SPA，`cw ui` 秒级启动本地面板（127.0.0.1），提供集群监控、流式日志终端与文件互传。
 - 📦 **Windows 系统服务托管**：一键部署为 Windows 系统服务（`cw service install`），开机自启、无终端弹窗打扰，崩溃 1000ms 自动重启。
@@ -170,6 +171,12 @@ cw node
 # 2. 派发后台任务 (支持指定工作目录 --dir 与任务名 --name)
 cw run -n desktop-4090 --dir "D:\projects\ml" "python train.py --epochs 100"
 
+# 2.1 复杂参数透传 (通过 -- 隔离，完美保留带空格参数与内部双引号)
+cw run -n desktop-4090 -wc -- git commit -m "fix: resolve memory leak"
+
+# 2.2 调度复杂 PowerShell 管道 (--shell pwsh 原生支持)
+cw run -n desktop-4090 -wc --shell pwsh "Get-Process | Select-Object -First 3"
+
 # 3. 查看全集群任务状态与 CPU / 内存开销
 cw ps
 
@@ -209,7 +216,7 @@ cw ui
 ### 2. 任务调度与进程控制
 | 命令 | 说明 |
 | :--- | :--- |
-| `cw run [-n node] [-w] [-c] [--dir dir] [--name name] [--token xxx] <cmd>` | 派发任务；默认异步后台执行；`-w` 同步阻塞并对齐 ExitCode，`-c` 执行完自毁清理（合写即 `-wc`） |
+| `cw run [-n node] [-w] [-c] [-s shell] [--dir dir] [--name name] [--token xxx] [--] <cmd>` | 派发任务；默认异步后台执行；`-w` 同步阻塞并对齐 ExitCode，`-c` 执行完自毁清理（合写即 `-wc`）；`-s, --shell` 指定外壳（`cmd`(默认)、`pwsh`、`powershell`、`bash`）；支持 `--` 隔离透传复杂参数与内部双引号 |
 | `cw ps [-n node] [--all] [--limit <n>]` | 查询任务运行状态与资源占用；`RUNNING` 优先置顶，默认展示最近 20 条，`--all` 展开全部 |
 | `cw clean [[<node>:]<job_id>] [--days <n> \| --all] [-n node] [-y]` | 清理已终态任务及其磁盘日志；支持单任务精准清理与批量清空；正在运行的任务严格受保护 |
 | `cw kill [<node>:]<job_id> [-n node]` | 终止任务并销毁整棵进程树（Win32 Job Object 内核治理，支持 `node:job_id` 定向查杀） |
@@ -323,7 +330,7 @@ build.bat all
 仓库本地内置了供 AI Agent（如 Claude Code、OpenCode、Cursor、Codex、Antigravity 等）直接使用的技能定义与调用约束：
 
 * 📘 **技能定义**：[`.agents/skills/cworker/SKILL.md`](.agents/skills/cworker/SKILL.md)
-* 📜 **调用约束与避坑准则**：[AGENTS.md](AGENTS.md)（含任务异步轮询规范、`cw rm -r -y` 高危防交互死锁说明）
+* 📜 **调用约束与避坑准则**：[AGENTS.md](AGENTS.md)（含任务异步轮询规范、`--` 参数隔离透传、`cw rm -r -y` 高危防交互死锁说明）
 
 ---
 

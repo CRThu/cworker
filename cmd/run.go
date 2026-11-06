@@ -17,6 +17,7 @@ var (
 	runJobName  string
 	runDir      string
 	runToken    string
+	runShell    string
 	runWait     bool
 	runClean    bool
 )
@@ -31,13 +32,14 @@ var runCmd = &cobra.Command{
 			return fmt.Errorf("flag '-c / --clean' requires '-w / --wait' (ephemeral clean is only permitted during synchronous execution)")
 		}
 
-		rawCommand := strings.Join(args, " ")
+		rawCommand := formatCommandLine(args)
 		cli := newCmdClient()
 
 		info, err := cli.RunJobWithContext(cmdContext(cmd), protocol.RunJobRequest{
 			Name:              runJobName,
 			Node:              runNodeName,
 			Command:           rawCommand,
+			Shell:             runShell,
 			Dir:               runDir,
 			KillOnDisconnect:  runWait,
 			CleanOnDisconnect: runClean,
@@ -103,6 +105,73 @@ func init() {
 	runCmd.Flags().StringVar(&runToken, "token", "", "远端 Worker 认证 Token (首次连接传入自动记忆)")
 	runCmd.Flags().BoolVarP(&runWait, "wait", "w", false, "前台同步阻塞执行并实时流式输出日志，进程退出码严格对齐")
 	runCmd.Flags().BoolVarP(&runClean, "clean", "c", false, "任务执行完毕后自动物理清理临时任务及日志 (必须搭配 -w/-wait)")
+	runCmd.Flags().StringVarP(&runShell, "shell", "s", "cmd", "指定执行外壳: cmd (默认), pwsh, powershell, bash")
 	RootCmd.AddCommand(runCmd)
+}
+
+// formatCommandLine 权威重构命令行参数
+// 1. 若仅有 1 个参数，说明用户传入的是整句单字符串命令（如 cw run "git status"），原样保留；
+// 2. 若有多个参数（平铺参数或通过 -- 隔离的参数），使用 Windows 标准参数规范对含空格、制表符或双引号的参数安全添加引号与转义，
+//    彻底消除直接 strings.Join 导致的参数边界崩溃与引号丢失缺陷。
+func formatCommandLine(args []string) string {
+	if len(args) == 0 {
+		return ""
+	}
+	if len(args) == 1 {
+		return args[0]
+	}
+	escaped := make([]string, len(args))
+	for i, arg := range args {
+		escaped[i] = escapeArg(arg)
+	}
+	return strings.Join(escaped, " ")
+}
+
+// escapeArg 遵循微软 MSDN 标准规范 (ms880421) 转义 Windows 命令行参数
+func escapeArg(s string) string {
+	if len(s) == 0 {
+		return `""`
+	}
+	// 检查是否首尾已是双引号且长度 >= 2
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		return s
+	}
+	needsQuotes := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == ' ' || c == '\t' || c == '"' {
+			needsQuotes = true
+			break
+		}
+	}
+	if !needsQuotes {
+		return s
+	}
+
+	var b strings.Builder
+	b.Grow(len(s) + 8)
+	b.WriteByte('"')
+	slashes := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch c {
+		default:
+			slashes = 0
+			b.WriteByte(c)
+		case '\\':
+			slashes++
+			b.WriteByte(c)
+		case '"':
+			for ; slashes > 0; slashes-- {
+				b.WriteByte('\\')
+			}
+			b.WriteString(`\"`)
+		}
+	}
+	for ; slashes > 0; slashes-- {
+		b.WriteByte('\\')
+	}
+	b.WriteByte('"')
+	return b.String()
 }
 
