@@ -28,6 +28,11 @@
   import type { OverviewData, NodeInfo, KnownNode, JobInfo } from './lib/types';
 
   let currentTab: 'nodes' | 'jobs' | 'files' = 'nodes';
+  let hasVisitedFiles = false;
+
+  $: if (currentTab === 'files' && !hasVisitedFiles) {
+    hasVisitedFiles = true;
+  }
 
   // 全局数据状态
   let overview: OverviewData | null = null;
@@ -366,8 +371,11 @@
           on:viewLogs={handleViewLogs}
           on:killJob={handleOpenKill}
         />
-      {:else}
-        <DualPaneFiles {nodes} />
+      {/if}
+      {#if hasVisitedFiles}
+        <div class="tab-pane-files" class:hidden={currentTab !== 'files'}>
+          <DualPaneFiles {nodes} />
+        </div>
       {/if}
     </div>
   </main>
@@ -699,6 +707,16 @@
     flex-direction: column;
     min-height: 0;
     overflow-y: auto;
+  }
+  .tab-pane-files {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+    height: 100%;
+  }
+  .tab-pane-files.hidden {
+    display: none !important;
   }
   .toast-container {
     position: fixed;

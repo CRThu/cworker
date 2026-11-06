@@ -173,9 +173,23 @@ func TestCmd_Nodes(t *testing.T) {
 	if !strings.Contains(outStr, "v1.6.1") || !strings.Contains(outStr, "Windows 10 22H2") {
 		t.Errorf("expected output to contain 'v1.6.1' and 'Windows 10 22H2', got:\n%s", outStr)
 	}
-	// 验证离线/老版本节点包含 '-' 占位符
+	// 验证离线/老版本节点包含 '-' 占位符，且 CPU 和 MEM 绝不误显 0.0% 或 0M / 0M
 	if !strings.Contains(outStr, "offline-worker-2") || !strings.Contains(outStr, "-") {
 		t.Errorf("expected output to contain offline node with '-' placeholder, got:\n%s", outStr)
+	}
+	for _, line := range strings.Split(outStr, "\n") {
+		if strings.Contains(line, "offline-worker-2") {
+			if strings.Contains(line, "0.0%") || strings.Contains(line, "0M / 0M") {
+				t.Errorf("offline node should not display '0.0%%' or '0M / 0M', got line: %s", line)
+			}
+			parts := strings.Fields(line)
+			// 表头: NAME STATUS VERSION OS ADDRESS CPU MEM JOBS
+			if len(parts) >= 8 {
+				if parts[5] != "-" || parts[6] != "-" {
+					t.Errorf("expected offline node CPU and MEM to be '-', got CPU=%s, MEM=%s in line: %s", parts[5], parts[6], line)
+				}
+			}
+		}
 	}
 }
 
@@ -1287,6 +1301,7 @@ func TestCmd_NodeListFormatting(t *testing.T) {
 	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "node-legacy", Target: u.Host, Token: "tok-legacy"})
 	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "node-small", Target: u.Host, Token: "tok-small"})
 	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "node-overflow", Target: u.Host, Token: "tok-overflow"})
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "node-offline", Target: "127.0.0.1:59998"})
 
 	origStdout := os.Stdout
 	r, w, _ := os.Pipe()
@@ -1344,6 +1359,21 @@ func TestCmd_NodeListFormatting(t *testing.T) {
 	}
 	if !strings.Contains(out, "0.0G / 2.0G") {
 		t.Fatalf("expected '0.0G / 2.0G' for overflow node, got:\n%s", out)
+	}
+
+	// 6. node-offline: 离线节点指标必须优雅回退为 '-'，严禁误显 0.0% 或 0M / 0M
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "node-offline") {
+			if strings.Contains(line, "0.0%") || strings.Contains(line, "0M / 0M") {
+				t.Fatalf("offline node metrics should not be '0.0%%' or '0M / 0M', got line:\n%s", line)
+			}
+			parts := strings.Fields(line)
+			if len(parts) >= 8 {
+				if parts[5] != "-" || parts[6] != "-" {
+					t.Fatalf("expected offline node CPU and MEM to be '-', got CPU=%s, MEM=%s in line:\n%s", parts[5], parts[6], line)
+				}
+			}
+		}
 	}
 }
 

@@ -125,4 +125,44 @@ describe('App component task dispatch integration', () => {
       expect(errorToast?.textContent).toContain('部分节点启动失败 (1): worker-2: node offline');
     });
   });
+
+  it('should keep DualPaneFiles mounted and retain state when switching between tabs without unmounting', async () => {
+    const { container, getByText } = render(App);
+
+    // 初始状态位于 "节点" 视图，文件管理器尚未初次挂载
+    expect(container.querySelector('.tab-pane-files')).toBeNull();
+
+    // 1. 点击切换到 "文件" 视图 (Tab 3)
+    await fireEvent.click(getByText('文件'));
+
+    // 此时文件管理器挂载，且不具备 hidden 类
+    const filesPane = container.querySelector('.tab-pane-files');
+    expect(filesPane).not.toBeNull();
+    expect(filesPane?.classList.contains('hidden')).toBe(false);
+
+    // 修改右侧路径输入框模拟用户切换到 F 盘特定路径
+    const rightPathInput = container.querySelector('#right-node-select')
+      ?.closest('.file-pane')
+      ?.querySelector('.pane-path-input') as HTMLInputElement;
+    expect(rightPathInput).not.toBeNull();
+    await fireEvent.input(rightPathInput, { target: { value: 'F:/custom/remote/dir' } });
+    expect(rightPathInput.value).toBe('F:/custom/remote/dir');
+
+    // 2. 切换回 "节点" 视图 (Tab 1)
+    await fireEvent.click(getByText('节点'));
+
+    // 验证文件管理器仍然保存在 DOM 树中（防止重新挂载丢失状态），仅添加 hidden 隐藏类
+    expect(container.querySelector('.tab-pane-files')).not.toBeNull();
+    expect(container.querySelector('.tab-pane-files')?.classList.contains('hidden')).toBe(true);
+
+    // 3. 再次切换回 "文件" 视图 (Tab 3)
+    await fireEvent.click(getByText('文件'));
+
+    // 验证 hidden 类被移除，且之前输入的 F:/ 路径依然完好保存
+    expect(container.querySelector('.tab-pane-files')?.classList.contains('hidden')).toBe(false);
+    const rightPathAfterSwitch = container.querySelector('#right-node-select')
+      ?.closest('.file-pane')
+      ?.querySelector('.pane-path-input') as HTMLInputElement;
+    expect(rightPathAfterSwitch.value).toBe('F:/custom/remote/dir');
+  });
 });

@@ -30,7 +30,9 @@ func TestManagedJob_StartAndComplete(t *testing.T) {
 	}
 
 	// 等待命令执行结束
-	time.Sleep(300 * time.Millisecond)
+	if !job.WaitExit(5 * time.Second) {
+		t.Fatalf("job timed out waiting for exit")
+	}
 
 	info := job.GetInfo()
 	if info.Status != protocol.JobStatusCompleted {
@@ -104,7 +106,9 @@ func TestManagedJob_Failed(t *testing.T) {
 		t.Fatalf("StartJob failed: %v", err)
 	}
 
-	time.Sleep(300 * time.Millisecond)
+	if !job.WaitExit(5 * time.Second) {
+		t.Fatalf("job timed out waiting for exit")
+	}
 	info := job.GetInfo()
 	if info.Status != protocol.JobStatusFailed {
 		t.Errorf("job status = %s, want FAILED", info.Status)
@@ -183,7 +187,9 @@ func TestManagedJob_Broadcaster_And_WorkDir(t *testing.T) {
 		t.Fatal("expected non-nil broadcaster")
 	}
 
-	time.Sleep(300 * time.Millisecond)
+	if !job.WaitExit(5 * time.Second) {
+		t.Fatalf("job timed out waiting for exit")
+	}
 	info := job.GetInfo()
 	if info.Status != protocol.JobStatusCompleted {
 		t.Errorf("job status = %s, want COMPLETED", info.Status)
@@ -413,7 +419,9 @@ func TestManagedJob_ShellExecution_PowerShellAndCMD(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StartJob cmd failed: %v", err)
 	}
-	time.Sleep(300 * time.Millisecond)
+	if !jobCMD.WaitExit(5 * time.Second) {
+		t.Fatalf("jobCMD timed out waiting for exit")
+	}
 	infoCMD := jobCMD.GetInfo()
 	if infoCMD.Status != protocol.JobStatusCompleted || infoCMD.ExitCode != 0 {
 		t.Errorf("jobCMD status = %s, code = %d", infoCMD.Status, infoCMD.ExitCode)
@@ -433,7 +441,9 @@ func TestManagedJob_ShellExecution_PowerShellAndCMD(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StartJob powershell failed: %v", err)
 	}
-	time.Sleep(1000 * time.Millisecond)
+	if !jobPS.WaitExit(15 * time.Second) {
+		t.Fatalf("jobPS timed out waiting for exit")
+	}
 	infoPS := jobPS.GetInfo()
 	if infoPS.Status != protocol.JobStatusCompleted || infoPS.ExitCode != 0 {
 		t.Errorf("jobPS status = %s, code = %d", infoPS.Status, infoPS.ExitCode)
@@ -449,7 +459,9 @@ func TestManagedJob_ShellExecution_PowerShellAndCMD(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StartJob powershell fail test failed: %v", err)
 	}
-	time.Sleep(1000 * time.Millisecond)
+	if !jobPSFail.WaitExit(15 * time.Second) {
+		t.Fatalf("jobPSFail timed out waiting for exit")
+	}
 	infoPSFail := jobPSFail.GetInfo()
 	if infoPSFail.Status != protocol.JobStatusFailed || infoPSFail.ExitCode == 0 {
 		t.Errorf("expected powershell error to yield FAILED with non-zero exit code, got status=%s code=%d", infoPSFail.Status, infoPSFail.ExitCode)

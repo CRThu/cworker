@@ -56,23 +56,30 @@ func runNodeList(ctx ...context.Context) error {
 	fmt.Fprintln(w, "NAME\tSTATUS\tVERSION\tOS\tADDRESS\tCPU\tMEM\tJOBS")
 	for _, n := range nodes {
 		var cpuStr string
-		if n.Metrics.CPUCores > 0 {
-			usedPercent := int(math.Round(n.Metrics.CPUPercent * float64(n.Metrics.CPUCores)))
-			totalPercent := n.Metrics.CPUCores * 100
-			cpuStr = fmt.Sprintf("%d%% / %d%%", usedPercent, totalPercent)
-		} else {
-			cpuStr = fmt.Sprintf("%.1f%%", n.Metrics.CPUPercent)
-		}
-
-		var memUsedMB uint64
-		if n.Metrics.MemTotalMB > n.Metrics.MemFreeMB {
-			memUsedMB = n.Metrics.MemTotalMB - n.Metrics.MemFreeMB
-		}
 		var memStr string
-		if n.Metrics.MemTotalMB >= 1024 {
-			memStr = fmt.Sprintf("%.1fG / %.1fG", float64(memUsedMB)/1024.0, float64(n.Metrics.MemTotalMB)/1024.0)
+
+		// 仅在线节点具备真实系统度量数据，离线节点优雅回退为 '-' 占位符避免误显 0.0% / 0M
+		if n.Status == protocol.NodeStatusOnline {
+			if n.Metrics.CPUCores > 0 {
+				usedPercent := int(math.Round(n.Metrics.CPUPercent * float64(n.Metrics.CPUCores)))
+				totalPercent := n.Metrics.CPUCores * 100
+				cpuStr = fmt.Sprintf("%d%% / %d%%", usedPercent, totalPercent)
+			} else {
+				cpuStr = fmt.Sprintf("%.1f%%", n.Metrics.CPUPercent)
+			}
+
+			var memUsedMB uint64
+			if n.Metrics.MemTotalMB > n.Metrics.MemFreeMB {
+				memUsedMB = n.Metrics.MemTotalMB - n.Metrics.MemFreeMB
+			}
+			if n.Metrics.MemTotalMB >= 1024 {
+				memStr = fmt.Sprintf("%.1fG / %.1fG", float64(memUsedMB)/1024.0, float64(n.Metrics.MemTotalMB)/1024.0)
+			} else {
+				memStr = fmt.Sprintf("%dM / %dM", memUsedMB, n.Metrics.MemTotalMB)
+			}
 		} else {
-			memStr = fmt.Sprintf("%dM / %dM", memUsedMB, n.Metrics.MemTotalMB)
+			cpuStr = "-"
+			memStr = "-"
 		}
 
 		verStr := n.Version
