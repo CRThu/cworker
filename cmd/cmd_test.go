@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1695,6 +1696,92 @@ func TestRunCmd_WaitAndClean(t *testing.T) {
 	}
 	if !cleanCalled {
 		t.Fatal("expected clean API to be called on --clean")
+	}
+}
+
+func TestRunCmd_StreamError_WaitConvergence(t *testing.T) {
+	t.Setenv("USERPROFILE", t.TempDir())
+	var cleanCalled bool
+	var pollCount int
+	var mu sync.Mutex
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/jobs/run":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(protocol.JobInfo{
+				ID:   "job-stream-err-test",
+				Node: "mock-worker",
+				PID:  5678,
+			})
+		case "/api/v1/jobs/stream":
+			// 模拟 WebSocket 握手或流建立失败
+			http.Error(w, "stream dial failed", http.StatusInternalServerError)
+		case "/api/v1/jobs/ps":
+			mu.Lock()
+			pollCount++
+			currentCount := pollCount
+			mu.Unlock()
+
+			w.Header().Set("Content-Type", "application/json")
+			if currentCount <= 2 {
+				// 前两次轮询返回 RUNNING
+				_ = json.NewEncoder(w).Encode([]protocol.JobInfo{
+					{
+						ID:       "job-stream-err-test",
+						Node:     "mock-worker",
+						Status:   protocol.JobStatusRunning,
+						ExitCode: 0,
+					},
+				})
+			} else {
+				// 随后收敛为终态 COMPLETED
+				_ = json.NewEncoder(w).Encode([]protocol.JobInfo{
+					{
+						ID:       "job-stream-err-test",
+						Node:     "mock-worker",
+						Status:   protocol.JobStatusCompleted,
+						ExitCode: 0,
+					},
+				})
+			}
+		case "/api/v1/jobs/clean":
+			mu.Lock()
+			cleanCalled = true
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(protocol.CleanJobsResponse{CleanedCount: 1, FreedBytes: 256})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	cli := client.NewClient()
+	_ = cli.SaveKnownNode(protocol.KnownNode{Name: "mock-worker", Target: u.Host})
+
+	runNodeName = "mock-worker"
+	runWait = true
+	runClean = true
+	defer func() {
+		runNodeName = ""
+		runWait = false
+		runClean = false
+	}()
+
+	err := runCmd.RunE(runCmd, []string{"echo", "stream_err_wait"})
+	if err != nil {
+		t.Fatalf("expected runCmd to succeed after state convergence, got: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if pollCount < 2 {
+		t.Fatalf("expected polling convergence to run multiple times, got pollCount: %d", pollCount)
+	}
+	if !cleanCalled {
+		t.Fatal("expected clean API to be called after reaching terminal state")
 	}
 }
 

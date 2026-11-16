@@ -3372,10 +3372,11 @@ func TestClient_ResolveTargetToURL(t *testing.T) {
 		{"::1", "http://[::1]:" + protocol.DefaultPortStr},
 		{"fe80::2ec6:62f6:bbcb:6eb4", "http://[fe80::2ec6:62f6:bbcb:6eb4]:" + protocol.DefaultPortStr},
 
-		// 4. 带有 Zone Identifier (如 Windows 中文网卡名) 的 IPv6 (RFC 6874 转义防御 invalid URL escape)
-		{"[fe80::1%eth0]:19000", "http://[fe80::1%25eth0]:19000"},
-		{"[fe80::2ec6:62f6:bbcb:6eb4%以太网]:19000", "http://[fe80::2ec6:62f6:bbcb:6eb4%25以太网]:19000"},
-		{"fe80::2ec6:62f6:bbcb:6eb4%以太网", "http://[fe80::2ec6:62f6:bbcb:6eb4%25以太网]:" + protocol.DefaultPortStr},
+		// 4. 带有 Zone Identifier 的 IPv6 (RFC 6874 标准转义与中文网卡索引归一化防二次编码崩溃)
+		{"[fe80::1%eth0]:19000", ""}, // 验证合法解析与 http.NewRequest 校验，动态匹配
+		{"[fe80::2ec6:62f6:bbcb:6eb4%以太网]:19000", ""},
+		{"fe80::2ec6:62f6:bbcb:6eb4%以太网", ""},
+		{"[fe80::1%253]:19000", "http://[fe80::1%253]:19000"},
 
 		// 5. 局域网主机名 (回退原名或解析出的有效物理 IP)
 		{"unknown-virtual-host-12345:20000", "http://unknown-virtual-host-12345:20000"},
@@ -3387,7 +3388,7 @@ func TestClient_ResolveTargetToURL(t *testing.T) {
 			if err != nil {
 				t.Fatalf("resolveTargetToURL(%q) unexpected err: %v", tc.target, err)
 			}
-			if got != tc.expected {
+			if tc.expected != "" && got != tc.expected {
 				t.Errorf("resolveTargetToURL(%q) = %q, want %q", tc.target, got, tc.expected)
 			}
 			// 必须能成功通过 url.Parse，杜绝任何 invalid URL escape 报错
@@ -3397,6 +3398,15 @@ func TestClient_ResolveTargetToURL(t *testing.T) {
 			}
 			if u.Scheme != "http" {
 				t.Errorf("expected scheme http, got: %s", u.Scheme)
+			}
+			// 严格二次校验：模拟真实 HTTP / WebSocket 客户端握手流程 (u.String() -> http.NewRequest)
+			// 防御 Go 在序列化非 ASCII Zone 时引入二次十六进制编码 (%E4)，触发底层 url.Parse 拒绝
+			_, reqErr := http.NewRequest(http.MethodGet, u.String(), nil)
+			if reqErr != nil {
+				t.Fatalf("http.NewRequest(%q) failed: %v", u.String(), reqErr)
+			}
+			if strings.Contains(u.String(), "%E4") {
+				t.Fatalf("u.String() contains illegal non-ASCII URL escape %%E4: %s", u.String())
 			}
 		})
 	}
@@ -3418,6 +3428,35 @@ func TestClient_ResolveTargetToURL(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestClient_NormalizeZoneIdentifier 验证 IPv6 Zone 归一化算法对纯数字、中文友好名及未知网卡名的安全治理
+func TestClient_NormalizeZoneIdentifier(t *testing.T) {
+	// 1. 纯数字 Index (如 "3", "%3", "%253") 权威保留
+	if got := normalizeZoneIdentifier("3"); got != "3" {
+		t.Errorf("expected '3', got: %q", got)
+	}
+	if got := normalizeZoneIdentifier("%3"); got != "3" {
+		t.Errorf("expected '3', got: %q", got)
+	}
+	if got := normalizeZoneIdentifier("%253"); got != "3" {
+		t.Errorf("expected '3', got: %q", got)
+	}
+
+	// 2. ASCII 网卡名 (如 "eth0") 原样保留或转数字
+	if got := normalizeZoneIdentifier("eth0"); got == "" {
+		t.Errorf("expected non-empty for ASCII eth0, got empty")
+	}
+
+	// 3. 空输入
+	if got := normalizeZoneIdentifier(""); got != "" {
+		t.Errorf("expected empty for empty zone, got: %q", got)
+	}
+
+	// 4. 不存在的非 ASCII 乱码网卡名必须安全回退为空（杜绝非法转义破坏 URL）
+	if got := normalizeZoneIdentifier("不存在的虚拟网卡999"); got != "" {
+		t.Errorf("expected empty for unresolvable non-ASCII zone, got: %q", got)
+	}
 }
 
 func TestClient_ClusterProxyDefaultAndExplicit(t *testing.T) {

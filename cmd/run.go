@@ -7,6 +7,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"cworker/pkg/protocol"
 	"github.com/spf13/cobra"
@@ -72,16 +73,46 @@ var runCmd = &cobra.Command{
 			return &ExitError{Code: 130, Msg: "interrupted by user"}
 		}
 
-		// 查询任务终态 ExitCode
-		exitCode := 0
+		// 若日志流异常断开，输出告警提示用户
+		if streamErr != nil {
+			fmt.Fprintf(os.Stderr, "[WARN] Log stream disconnected: %v\n", streamErr)
+		}
+
+		// 查询任务最新状态
 		finalInfo, qErr := cli.GetJobInfoWithContext(cmdContext(cmd), info.Node, info.ID)
-		if qErr == nil && finalInfo != nil {
+
+		// 若实时日志流提前结束或异常中断，但远端任务仍在执行中 (RUNNING)，
+		// 启动状态轮询收敛等待终态，严格捍卫 -w 前台同步阻塞契约，并杜绝 -c 误触发 409 活跃任务保护
+		if qErr == nil && finalInfo != nil && finalInfo.Status == protocol.JobStatusRunning {
+			pollTicker := time.NewTicker(200 * time.Millisecond)
+			defer pollTicker.Stop()
+			for finalInfo != nil && finalInfo.Status == protocol.JobStatusRunning {
+				select {
+				case <-sigCtx.Done():
+					fmt.Fprintln(os.Stderr, "\n[WARN] Execution interrupted, terminating remote process tree...")
+					_, _ = cli.KillJobNode(info.Node, info.ID)
+					if runClean {
+						_, _ = cli.CleanJobWithContext(context.Background(), info.Node, info.ID)
+					}
+					return &ExitError{Code: 130, Msg: "interrupted by user"}
+				case <-pollTicker.C:
+					updatedInfo, err := cli.GetJobInfoWithContext(sigCtx, info.Node, info.ID)
+					if err == nil && updatedInfo != nil {
+						finalInfo = updatedInfo
+					}
+				}
+			}
+		}
+
+		// 终态 ExitCode 判定契约
+		exitCode := 0
+		if finalInfo != nil && finalInfo.Status != protocol.JobStatusRunning {
 			exitCode = finalInfo.ExitCode
 		} else if streamErr != nil {
 			exitCode = 1
 		}
 
-		// 若开启了 -c，执行完自动物理销毁远端临时任务及日志
+		// 若开启了 -c，执行完自动物理销毁远端临时任务及日志 (此时任务已达终态，绝不触发 409)
 		if runClean {
 			_, cleanErr := cli.CleanJobWithContext(context.Background(), info.Node, info.ID)
 			if cleanErr != nil && !strings.Contains(cleanErr.Error(), "400") {

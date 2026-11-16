@@ -234,6 +234,82 @@ func (c *Client) ResolveWorker(targetName string, explicitToken string) (*Resolv
 	}, nil
 }
 
+// normalizeZoneIdentifier 权威归一化 IPv6 Zone Identifier (Scope ID)：
+// 1. 若网卡名为非 ASCII (如 Windows 中文系统的 "以太网"、"本地连接" 等)，
+//    查表将其转换为纯数字 Interface Index (如 "3")；
+// 2. 纯数字符合 RFC 6874 (ZoneID = 1*(unreserved / pct-encoded)) 且为纯 ASCII，
+//    彻底杜绝 Go net/url 及各类第三方 WebSocket / HTTP 库在 u.String() 时
+//    因非 ASCII 字符二次 URL 编码生成 "%E4" 等十六进制序列，进而触发 "invalid URL escape" 的致命崩溃；
+// 3. 若查表未命中且包含非 ASCII 字符，安全剥离该 Zone ID 回退为纯 IPv6 直连，防御 URL 解析瘫痪。
+func normalizeZoneIdentifier(zone string) string {
+	zone = strings.TrimSpace(zone)
+	if zone == "" {
+		return ""
+	}
+	// 剔除可能已存在的 RFC 6874 转义前缀 %25 或 %
+	zone = strings.TrimPrefix(zone, "%25")
+	zone = strings.TrimPrefix(zone, "%")
+
+	// 若已经是纯数字（如 "3"），原生合规，直接返回
+	isNumeric := true
+	for i := 0; i < len(zone); i++ {
+		if zone[i] < '0' || zone[i] > '9' {
+			isNumeric = false
+			break
+		}
+	}
+	if isNumeric && zone != "" {
+		return zone
+	}
+
+	// 查表本地网络接口：匹配友好别名或名称，转换为其纯数字 Index
+	if ifaces, err := net.Interfaces(); err == nil {
+		for _, iface := range ifaces {
+			if strings.EqualFold(iface.Name, zone) {
+				return strconv.Itoa(iface.Index)
+			}
+		}
+	}
+
+	// 检验是否仍包含非 ASCII 字符
+	for i := 0; i < len(zone); i++ {
+		if zone[i] > 127 {
+			// 存在本地无法解析的非 ASCII 字符，回退为空以剥离该 Zone，杜绝 URL 崩溃
+			return ""
+		}
+	}
+
+	return zone
+}
+
+// formatIPv6Host 将 IPv6 主机地址规范化包装为中括号格式并合规处理 Zone Identifier
+func formatIPv6Host(ipStr string) string {
+	ipStr = strings.TrimSpace(ipStr)
+	// 去除已有中括号
+	ipStr = strings.TrimPrefix(ipStr, "[")
+	ipStr = strings.TrimSuffix(ipStr, "]")
+
+	// 分离 IP 本体与 Zone Identifier (% 或 %25)
+	var ipPart, zonePart string
+	if idx := strings.Index(ipStr, "%25"); idx != -1 {
+		ipPart = ipStr[:idx]
+		zonePart = ipStr[idx+3:]
+	} else if idx := strings.Index(ipStr, "%"); idx != -1 {
+		ipPart = ipStr[:idx]
+		zonePart = ipStr[idx+1:]
+	} else {
+		ipPart = ipStr
+	}
+
+	if zonePart != "" {
+		normalizedZone := normalizeZoneIdentifier(zonePart)
+		if normalizedZone != "" {
+			return fmt.Sprintf("[%s%%25%s]", ipPart, normalizedZone)
+		}
+	}
+	return fmt.Sprintf("[%s]", ipPart)
+}
+
 func resolveTargetToURL(target string) (string, error) {
 	target = strings.TrimSpace(target)
 	host := target
@@ -247,9 +323,9 @@ func resolveTargetToURL(target string) (string, error) {
 	// 实时动态 DNS 解析 (兼容 Tailscale MagicDNS 与传统局域网 DNS)
 	ips, err := net.LookupHost(host)
 	if err != nil || len(ips) == 0 {
-		// 解析不通时尝试原样直连
-		if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
-			return fmt.Sprintf("http://[%s]:%s", host, port), nil
+		// 解析不通或本身是 IP 字面量：直接按统一格式化规则构造
+		if strings.Contains(host, ":") {
+			return fmt.Sprintf("http://%s:%s", formatIPv6Host(host), port), nil
 		}
 		return fmt.Sprintf("http://%s:%s", host, port), nil
 	}
@@ -263,13 +339,9 @@ func resolveTargetToURL(target string) (string, error) {
 		}
 	}
 
-	// 构造合规 URL: 若为 IPv6 地址包裹中括号，并对 Zone Identifier 按 RFC 6874 转义 % 为 %25 防崩溃
-	if strings.Contains(chosenIP, ":") && !strings.HasPrefix(chosenIP, "[") {
-		cleanIP := chosenIP
-		if idx := strings.Index(cleanIP, "%"); idx != -1 {
-			cleanIP = fmt.Sprintf("%s%%25%s", cleanIP[:idx], cleanIP[idx+1:])
-		}
-		return fmt.Sprintf("http://[%s]:%s", cleanIP, port), nil
+	// 构造合规 URL: 若为 IPv6 地址包裹中括号，并按 RFC 6874 标准转义 Zone Identifier
+	if strings.Contains(chosenIP, ":") {
+		return fmt.Sprintf("http://%s:%s", formatIPv6Host(chosenIP), port), nil
 	}
 
 	return fmt.Sprintf("http://%s:%s", chosenIP, port), nil
